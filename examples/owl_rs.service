@@ -1,0 +1,16 @@
+[Unit]
+Description=Native Rust AirDrop control service (idle until send/receive)
+After=NetworkManager.service bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+# Replace /path/to/owl_rs and USER before use. This example is not installed by just.
+ExecStart=/path/to/owl_rs/target/release/owl_rs daemon --owner USER --name owl-rs
+ExecStop=/path/to/owl_rs/target/release/owl_rs stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

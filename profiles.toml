@@ -1,0 +1,67 @@
+# How owl_rs runs AWDL on each kernel Wi-Fi driver, named as in
+# /sys/class/net/<iface>/device/driver. An unlisted driver uses profiles.default
+# and requires --allow-untested. Use --profiles PATH to try a custom TOML file.
+#
+# tested: true means tested hardware; false requires --allow-untested.
+# mode:
+#   shared: AWDL shares the AP's channel and Wi-Fi stays connected.
+#   exclusive: Wi-Fi is disconnected for the session, for cards that cannot
+#     inject or hear AWDL while associated. Works without an AP and only
+#     reconnects a previously connected station.
+# mon_mac:
+#   station: the monitor carries the station's MAC, used by the AWDL runtime.
+#   own: the monitor uses a separate locally administered MAC derived from the
+#     station's MAC. The runtime uses the monitor's actual address.
+# reconnect: reconnect after deleting the monitor interface, for drivers whose
+#   station stops receiving afterward.
+# mt76_pm: disable mt76 runtime power management and deep sleep for the session,
+#   then restore the saved settings during cleanup.
+# exclusive_backend:
+#   ibss: join AWDL's BSSID on owlibss0 and inject through a passive monitor.
+#   active-monitor: an active monitor ACKs unicast; the existing station becomes
+#     a passive monitor for tuning. Requires hardware support and mon_mac=station.
+#   Ignored in shared mode. There is no automatic fallback between backends.
+# Hardware and observed behavior are documented below as comments, not fields.
+
+# MediaTek MT7925 (Framework 13). Injects while associated, sending from the
+# station's MAC; the station ACKs the phone's unicast. Without a reconnect, the
+# station stops receiving 3-165 s after a monitor interface is deleted.
+[profiles.mt7925e]
+tested = true
+mode = "shared"
+mon_mac = "station"
+reconnect = true
+mt76_pm = true
+exclusive_backend = "ibss"
+
+# Intel AX201, kernel 6.8. Associated, the firmware passes up no AWDL frames.
+# Starts no ad-hoc cell on 5 GHz, so runs on channel 6: a 2.4 MB photo from an
+# iPhone in 17 s, to it in 10.5 s. The AX200 and AX211 are untested.
+[profiles.iwlwifi]
+tested = true
+mode = "exclusive"
+mon_mac = "station"
+reconnect = false
+mt76_pm = false
+exclusive_backend = "ibss"
+
+# MediaTek MT7612U USB (0e8d:7612), kernel 7.2.9. Active monitor plus the existing
+# station as a passive monitor; channel 6 is preferred for discovery. Images
+# transferred in both directions; sending uses BLE wake-up.
+[profiles.mt76x2u]
+tested = true
+mode = "exclusive"
+mon_mac = "station"
+reconnect = false
+mt76_pm = false
+exclusive_backend = "active-monitor"
+
+# Any other card. Needs monitor-mode injection while associated, and an AP on
+# channel 6, 44 or 149.
+[profiles.default]
+tested = false
+mode = "shared"
+mon_mac = "station"
+reconnect = true
+mt76_pm = false
+exclusive_backend = "ibss"
