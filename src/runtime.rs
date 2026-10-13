@@ -4,6 +4,7 @@ use crate::{
     engine::{Config, Engine, Event},
     netlink::Netlink,
     protocol::{MAX_FRAME, Mac},
+    rate::Rate,
 };
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -530,7 +531,7 @@ fn injection_result(result: Result<(), pcap::Error>, errno: Errno) -> Result<boo
 struct PendingPacket {
     ethernet: Vec<u8>,
     queued_us: i64,
-    encoded: Option<Vec<u8>>,
+    encoded: Option<(Rate, Vec<u8>)>,
 }
 enum Transmission {
     Sent,
@@ -558,14 +559,31 @@ impl PendingPacket {
         if !engine.send_ready(dst, now) {
             return Ok(Transmission::WaitForSlot);
         }
-        if self.encoded.is_none() {
-            let Ok(encoded) = engine.data_frame(&self.ethernet) else {
+        let rate = engine.data_rate(dst);
+        if let Some((previous, bytes)) = &mut self.encoded {
+            if *previous != rate {
+                // A retune/capability update must not reuse an over-wide PHY header.
+                // Preserve the queued packet's 802.11/AWDL sequence numbers.
+                let old_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+                let Ok(header) = crate::protocol::radiotap_tx(
+                    rate,
+                    engine.config.fixed_radio && !dst.multicast(),
+                    false,
+                ) else {
+                    return Ok(Transmission::Invalid);
+                };
+                bytes.splice(..old_len, header);
+                *previous = rate;
+            }
+        } else {
+            let Ok(encoded) = engine.data_frame(&self.ethernet, rate) else {
                 return Ok(Transmission::Invalid);
             };
-            self.encoded = Some(encoded);
+            self.encoded = Some((rate, encoded));
         }
         // Both Ethernet bytes and AWDL sequence numbers survive backpressure.
-        Ok(if send(self.encoded.as_ref().expect("encoded packet"))? {
+        let (_, bytes) = self.encoded.as_ref().expect("encoded packet");
+        Ok(if send(bytes)? {
             Transmission::Sent
         } else {
             Transmission::QueueFull
@@ -607,7 +625,7 @@ mod tests {
     use super::*;
     use crate::{
         channel::{SLOT_US, SLOTS, Sequence, Strategy},
-        protocol::{self, Advertisement, Election, Rate},
+        protocol::{self, Advertisement, Election},
     };
 
     #[test]
@@ -689,6 +707,53 @@ mod tests {
                 .transmit(&mut engine, SLOT_US * SLOTS as i64 + 10_000, |bytes| {
                     assert_eq!(bytes, attempts[0]);
                     injection_result(Ok(()), Errno::EAGAIN)
+                })
+                .unwrap(),
+            Transmission::Sent
+        ));
+        // Retuning while a VHT packet is backpressured updates only radiotap.
+        let caps = protocol::BandCapabilities {
+            ht: Some(protocol::HtCapabilities {
+                cap_info: 0x6e,
+                ampdu_params: 3,
+                rx_mask: [255, 255, 0, 0],
+                tx_mask: Some([255, 255, 0, 0]),
+            }),
+            vht: Some(protocol::VhtCapabilities {
+                cap_info: 1 << 5,
+                rx_mcs_map: 0xfffa,
+                tx_mcs_map: 0xfffa,
+                rx_highest: 0,
+                tx_highest: 0,
+            }),
+        };
+        let definition = crate::channel::ChannelDefinition::new(149, 80).unwrap();
+        engine.config.rate = "vht9-nss2-bw80-sgi".parse().unwrap();
+        engine.config.capabilities.ghz5 = caps.clone();
+        engine.peers.get_mut(&peer).unwrap().capabilities = caps;
+        engine.peers.get_mut(&peer).unwrap().sequence =
+            Some(Sequence::fixed_definition(definition));
+        engine.set_operating_channel(definition);
+        let mut packet = PendingPacket::new(ethernet, 0);
+        let mut first = vec![];
+        assert!(matches!(
+            packet
+                .transmit(&mut engine, 10_000, |bytes| {
+                    first = bytes.to_vec();
+                    Ok(false)
+                })
+                .unwrap(),
+            Transmission::QueueFull
+        ));
+        engine.set_operating_channel(crate::channel::ChannelDefinition::new(149, 20).unwrap());
+        assert!(matches!(
+            packet
+                .transmit(&mut engine, 10_000, |bytes| {
+                    let (rt, data) = radiotap::Radiotap::parse(bytes).unwrap();
+                    assert_eq!(rt.vht.unwrap().bw.unwrap().bandwidth, 20);
+                    assert_eq!(rt.vht.unwrap().users[0].unwrap().index, 8);
+                    assert_eq!(data, radiotap::Radiotap::parse(&first).unwrap().1);
+                    Ok(true)
                 })
                 .unwrap(),
             Transmission::Sent

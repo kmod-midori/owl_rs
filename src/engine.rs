@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{
     channel::{Clock, SLOT_US, SLOTS, Sequence, Strategy},
-    protocol::{self, Action, Advertisement, Body, Election, Error, Frame, Mac, Rate},
+    protocol::{self, Action, Advertisement, Body, Election, Error, Frame, Mac},
+    rate::Rate,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -51,6 +52,8 @@ pub struct Peer {
     pub valid: bool,
     pub sync_offset_us: Option<i64>,
     pub rssi: Option<i8>,
+    pub capabilities: protocol::BandCapabilities,
+    pub tx_rate: Option<Rate>,
     #[serde(skip)]
     mif: bool,
     #[serde(skip)]
@@ -71,6 +74,8 @@ impl Peer {
             valid: false,
             sync_offset_us: None,
             rssi: None,
+            capabilities: protocol::BandCapabilities::default(),
+            tx_rate: None,
             mif: false,
             v2: false,
             recent: VecDeque::new(),
@@ -352,6 +357,9 @@ impl Engine {
                 self.clock.update(now, sync.next, sync.counter);
             }
         }
+        if a.subtype == 3 {
+            peer.capabilities = a.capabilities.clone();
+        }
         peer.mif |= a.subtype == 3;
         peer.valid = peer.mif && peer.version != 0 && peer.devclass != 0;
         let added = peer.valid && !valid_before;
@@ -610,7 +618,33 @@ impl Engine {
         }
         frame
     }
-    pub fn data_frame(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn data_rate(&mut self, destination: Mac) -> Rate {
+        let requested = self.config.rate;
+        let fallback = requested.fallback();
+        // Automatic/VHT multicast discovery stays at the robust legacy rate.
+        if destination.multicast() {
+            return fallback;
+        }
+        let Some(peer) = self.peers.get_mut(&destination).filter(|p| p.valid) else {
+            return fallback;
+        };
+        let rate = self.config.operating_channel.map_or(fallback, |channel| {
+            requested.for_peer(
+                channel,
+                self.config.capabilities.for_channel(channel.channel),
+                &peer.capabilities,
+                peer.sequence
+                    .as_ref()
+                    .map_or(20, |s| s.width_mhz(channel.channel)),
+            )
+        });
+        if peer.tx_rate != Some(rate) {
+            info!(peer=%destination, %requested, %rate, "selected data injection rate");
+            peer.tx_rate = Some(rate);
+        }
+        rate
+    }
+    pub(crate) fn data_frame(&mut self, ethernet: &[u8], rate: Rate) -> Result<Vec<u8>, Error> {
         let seq = self.next_sequence();
         let data_seq = self.data_sequence;
         self.data_sequence = self.data_sequence.wrapping_add(1);
@@ -618,7 +652,7 @@ impl Engine {
             ethernet,
             seq,
             data_seq,
-            self.config.rate,
+            rate,
             self.config.fixed_radio,
             false,
         )

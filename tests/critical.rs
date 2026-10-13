@@ -2,7 +2,8 @@
 use owl_rs::{
     channel::{Clock, Encoding, SLOT_US, Sequence, Strategy},
     engine::{Config, Engine},
-    protocol::{self, Advertisement, Body, Election, Mac, Rate},
+    protocol::{self, Advertisement, Body, Election, Mac},
+    rate::Rate,
 };
 fn config(mac: Mac) -> Config {
     Config {
@@ -20,7 +21,7 @@ fn config(mac: Mac) -> Config {
         election_counter: 0,
         widen: 4,
         filter_rssi: false,
-        rate: Rate::default(),
+        rate: Rate::Legacy(12),
         capabilities: Default::default(),
         operating_channel: None,
     }
@@ -65,22 +66,60 @@ fn malformed_lengths_never_panic_and_cannot_mutate_peers() {
     }
 }
 #[test]
-fn mcs_noack_alignment_and_ethernet_roundtrip() {
-    for rate in ["12", "mcs0", "mcs7-sgi", "mcs15"] {
+fn rate_parsing_alignment_and_ethernet_roundtrip() {
+    for rate in [
+        Rate::Auto,
+        Rate::Legacy(0),
+        Rate::Vht {
+            index: 4,
+            nss: 0,
+            width: 80,
+            sgi: false,
+        },
+    ] {
+        assert!(protocol::radiotap_tx(rate, false, false).is_err());
+    }
+    for rate in [
+        "12",
+        "mcs0",
+        "mcs7-sgi",
+        "mcs31",
+        "auto",
+        "vht4-nss2-bw40-sgi",
+        "vht9-nss2-bw80",
+    ] {
         assert!(rate.parse::<Rate>().is_ok());
     }
-    for rate in ["0", "mcs", "mcs16", "mcs-1", "12x", "mcs7-sgix"] {
+    for rate in [
+        "0",
+        "mcs",
+        "mcs32",
+        "mcs-1",
+        "12x",
+        "mcs7-sgix",
+        "vht",
+        "vht10-nss2-bw80",
+        "vht4-nss0-bw40",
+        "vht4-nss9-bw40",
+        "vht4-nss2-bw160",
+        "vht9-nss2-bw20",
+        "vht4-nss2-bw40-sgix",
+    ] {
         assert!(rate.parse::<Rate>().is_err());
     }
     assert_eq!(
-        protocol::radiotap_tx(Rate::default(), true, false),
+        protocol::radiotap_tx(Rate::Legacy(12), true, false).unwrap(),
         [0, 0, 12, 0, 4, 128, 0, 0, 24, 0, 8, 0]
     );
     assert_eq!(
-        protocol::radiotap_tx("mcs7-sgi".parse().unwrap(), true, false),
+        protocol::radiotap_tx("mcs7-sgi".parse().unwrap(), true, false).unwrap(),
         [0, 0, 13, 0, 0, 128, 8, 0, 8, 0, 7, 4, 7]
     );
-    for rate in [Rate::default(), "mcs15-sgi".parse().unwrap()] {
+    for rate in [
+        Rate::Legacy(12),
+        "mcs15-sgi".parse().unwrap(),
+        "vht9-nss2-bw80-sgi".parse().unwrap(),
+    ] {
         let mut maximum = vec![2, 0, 0, 0, 0, 1, 2, 1, 2, 3, 4, 5, 0x86, 0xdd];
         maximum.extend(vec![0; owl_rs::runtime::HOST_MTU as usize]);
         assert!(
@@ -94,7 +133,7 @@ fn mcs_noack_alignment_and_ethernet_roundtrip() {
     ethernet.extend_from_slice(&[0x60; 48]);
     for fcs in [false, true] {
         let frame =
-            protocol::encode_data(&ethernet, 4095, 65535, Rate::default(), true, fcs).unwrap();
+            protocol::encode_data(&ethernet, 4095, 65535, Rate::Legacy(12), true, fcs).unwrap();
         let parsed = protocol::parse(&frame).unwrap().unwrap();
         let Body::Data(frames) = parsed.body else {
             panic!("not data");
@@ -192,7 +231,7 @@ fn amsdu_bounds_and_retry_deduplication() {
     ethernet.extend(peer.0);
     ethernet.extend([0x86, 0xdd]);
     ethernet.extend([0x60; 48]);
-    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::default(), false, false).unwrap();
+    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12), false, false).unwrap();
     assert_eq!(e.receive(&frame, 10).unwrap().0.len(), 1);
     let mut retry = frame.clone();
     retry[10] |= 8;
@@ -224,7 +263,7 @@ fn busy_peer_data_refreshes_liveness_without_discovering_unknown_peers() {
     ethernet.extend(peer.0);
     ethernet.extend([0x86, 0xdd]);
     ethernet.extend([0x60; 48]);
-    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::default(), false, false).unwrap();
+    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12), false, false).unwrap();
     assert!(engine.receive(&frame, 0).unwrap().0.is_empty());
     assert!(engine.peers.is_empty());
     engine
@@ -263,7 +302,7 @@ fn early_syns_wait_for_peer_validation_and_are_bounded_deduplicated_and_expired(
             &ethernet,
             seq as u16,
             seq as u16,
-            Rate::default(),
+            Rate::Legacy(12),
             false,
             false,
         )
@@ -428,6 +467,147 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
 }
 
 #[test]
+fn vht_radiotap_alignment_and_peer_limits() {
+    use owl_rs::channel::ChannelDefinition;
+    use protocol::{BandCapabilities, HtCapabilities, VhtCapabilities};
+    let rate: Rate = "vht4-nss2-bw40-sgi".parse().unwrap();
+    assert_eq!(
+        protocol::radiotap_tx(rate, true, false).unwrap(),
+        [
+            0, 0, 22, 0, 0, 128, 32, 0, 8, 0, 0x44, 0, 4, 1, 0x42, 0, 0, 0, 0, 0, 0, 0
+        ]
+    );
+    let ethernet = [2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60];
+    for width in [20, 40, 80] {
+        for noack in [false, true] {
+            for fcs in [false, true] {
+                let rate = format!("vht4-nss2-bw{width}-sgi").parse().unwrap();
+                let frame = protocol::encode_data(&ethernet, 1, 2, rate, noack, fcs).unwrap();
+                // Exercise flags/TX-flags/VHT alignment with an independently parsed header.
+                let (rt, _) = radiotap::Radiotap::parse(&frame).unwrap();
+                let vht = rt.vht.unwrap();
+                assert_eq!(vht.bw.unwrap().bandwidth, width);
+                assert_eq!(
+                    (vht.users[0].unwrap().index, vht.users[0].unwrap().nss),
+                    (4, 2)
+                );
+                assert_eq!(vht.gi, Some(radiotap::field::ext::GuardInterval::Short));
+                assert!(matches!(
+                    protocol::parse(&frame).unwrap().unwrap().body,
+                    Body::Data(_)
+                ));
+            }
+        }
+    }
+    let local = BandCapabilities {
+        ht: Some(HtCapabilities {
+            cap_info: 0x6e,
+            ampdu_params: 3,
+            rx_mask: [255, 255, 0, 0],
+            tx_mask: Some([255, 255, 0, 0]),
+        }),
+        vht: Some(VhtCapabilities {
+            cap_info: 1 << 5,
+            rx_mcs_map: 0xffff,
+            tx_mcs_map: 0xfffa,
+            rx_highest: 0,
+            tx_highest: 0,
+        }),
+    };
+    // The receive map is relevant for the peer, the transmit map for our PHY.
+    let mut remote = local.clone();
+    remote.vht.as_mut().unwrap().rx_mcs_map = 0xfffd; // one stream, MCS 0–8
+    remote.vht.as_mut().unwrap().tx_mcs_map = 0xffff;
+    remote.ht.as_mut().unwrap().cap_info &= !(1 << 6);
+    let request: Rate = "vht9-nss2-bw80-sgi".parse().unwrap();
+    let channel = ChannelDefinition::new(149, 80).unwrap();
+    assert_eq!(
+        request.for_peer(channel, &local, &remote, 40),
+        "vht8-nss1-bw40".parse().unwrap()
+    );
+    assert_eq!(
+        request.for_peer(channel, &local, &remote, 20),
+        "vht8-nss1-bw20-sgi".parse().unwrap()
+    );
+    assert_eq!(
+        request.for_peer(ChannelDefinition::new(6, 20).unwrap(), &local, &remote, 80),
+        Rate::Legacy(12)
+    );
+    assert_eq!(
+        request.for_peer(channel, &local, &Default::default(), 80),
+        Rate::Legacy(12)
+    );
+    remote.vht.as_mut().unwrap().rx_mcs_map = 0xfffa;
+    assert_eq!(Rate::Auto.for_peer(channel, &local, &remote, 80), request);
+    let mut ht_only = remote.clone();
+    ht_only.vht = None;
+    assert_eq!(
+        Rate::Auto.for_peer(channel, &local, &ht_only, 80),
+        "mcs15-sgi".parse().unwrap()
+    );
+    ht_only.ht.as_mut().unwrap().cap_info &= !0x0c; // Static SMPS permits one stream.
+    assert_eq!(
+        Rate::Auto.for_peer(channel, &local, &ht_only, 80),
+        "mcs7-sgi".parse().unwrap()
+    );
+    let mut unknown_tx = local.clone();
+    unknown_tx.ht.as_mut().unwrap().tx_mask = None;
+    assert_eq!(
+        Rate::Auto.for_peer(channel, &unknown_tx, &ht_only, 80),
+        Rate::Legacy(12)
+    );
+    assert_eq!(
+        "vht0-nss1-bw20"
+            .parse::<Rate>()
+            .unwrap()
+            .for_peer(channel, &local, &remote, 80),
+        "vht0-nss1-bw20".parse().unwrap()
+    );
+    // A smaller NSS with a higher supported MCS can outrun the maximum NSS.
+    let mut many_tx = local.clone();
+    let mut many_rx = remote.clone();
+    many_tx.vht.as_mut().unwrap().tx_mcs_map = 2 << 12;
+    many_rx.vht.as_mut().unwrap().rx_mcs_map = 2 << 12;
+    assert_eq!(
+        Rate::Auto.for_peer(channel, &many_tx, &many_rx, 80),
+        "vht9-nss7-bw80-sgi".parse().unwrap()
+    );
+    assert_eq!(
+        request.for_peer(
+            ChannelDefinition::new(149, 20).unwrap(),
+            &local,
+            &remote,
+            80
+        ),
+        "vht8-nss2-bw20-sgi".parse().unwrap()
+    );
+    let peer_mac = Mac([2, 0, 0, 0, 0, 2]);
+    let mut peer_cfg = config(peer_mac);
+    peer_cfg.capabilities.ghz5 = remote;
+    peer_cfg.strategy = Strategy::Pin;
+    let mut peer = Engine::new(peer_cfg, 0);
+    peer.set_operating_channel(channel);
+    let mut cfg = config(Mac([2, 0, 0, 0, 0, 1]));
+    cfg.rate = request;
+    cfg.capabilities.ghz5 = local;
+    let mut engine = Engine::new(cfg, 0);
+    engine.receive(&peer.action_frame(3, 0), 0).unwrap();
+    assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(12));
+    engine.set_operating_channel(channel);
+    assert_eq!(engine.data_rate(peer_mac), request);
+    assert_eq!(engine.data_rate(protocol::BROADCAST), Rate::Legacy(12));
+    assert_eq!(engine.peers[&peer_mac].tx_rate, Some(request));
+    engine.config.rate = Rate::Auto;
+    assert_eq!(engine.data_rate(peer_mac), request);
+    engine.config.rate = Rate::Legacy(24);
+    assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(24));
+    let mut bad = peer.action_frame(3, 0);
+    bad.pop();
+    assert!(engine.receive(&bad, 0).is_err());
+    assert!(engine.peers[&peer_mac].capabilities.vht.is_some());
+}
+
+#[test]
 fn hardware_capabilities_use_current_band_and_awdl_wire_layout() {
     use protocol::{BandCapabilities, HtCapabilities, RadioCapabilities, VhtCapabilities};
     fn tags(frame: &[u8]) -> std::collections::BTreeMap<u8, Vec<u8>> {
@@ -445,6 +625,7 @@ fn hardware_capabilities_use_current_band_and_awdl_wire_layout() {
         cap_info: 0x01ff,
         ampdu_params: 3,
         rx_mask: [255, 255, 0, 0],
+        tx_mask: Some([255, 255, 0, 0]),
     };
     let mut cfg = config(Mac([2, 0, 0, 0, 0, 1]));
     cfg.capabilities = RadioCapabilities {

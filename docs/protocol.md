@@ -301,7 +301,27 @@ data injection attempts. Other injection errors remain failures with normal
 session cleanup. These changes adapt
 [omdrop-owl PR #11](https://github.com/t4t5/omdrop-owl/pull/11).
 
-Radiotap selects a validated legacy or MCS data rate; action frames use 12 Mbps.
+### Transmit rates
+
+[Rate selection](../src/rate.rs) resolves `auto` against local TX and peer RX
+capabilities before frame encoding. The radiotap library's rate tables rank
+candidates by PHY Mbps. HT20 requires a defined local TX set matching RX;
+VHT also uses the peer's operating classes and acknowledged local channel
+width. Static/dynamic SMPS peers are limited to one stream because injection
+does not arrange RTS/CTS wake-up. Unsupported short GI becomes long GI.
+VHT requests bound MCS, streams and width; missing capabilities fall back to
+12 Mbps. Actions and automatic/VHT multicast discovery also use 12 Mbps.
+CLI syntax and overrides are documented in [Radio configuration](radio.md#transmit-rates).
+
+The codec rejects unresolved `auto` and invalid PHY rates. VHT radiotap field
+21 has two-byte alignment, known GI/bandwidth, bandwidth code 0/1/4, and a
+single user's MCS/NSS nibble pair with BCC coding. Encoding follows the
+[radiotap VHT specification](https://www.radiotap.org/fields/VHT.html) and
+[mac80211 injection format](https://docs.kernel.org/networking/mac80211-injection.html).
+Queued packets keep their 802.11/AWDL sequence numbers across backpressure;
+retuning or capability changes refresh only the radiotap rate header. The
+encoder emits individual frames without outgoing aggregation.
+
 Fixed-radio unicast injection requests NOACK, inherited from the C patch. This
 transmit setting is distinct from the radio backend's hardware reception ACKs.
 FCS presence and radiotap padding are handled explicitly.
@@ -767,7 +787,7 @@ large payload. BLE wake to radio readiness was 1.69 seconds, versus 1.09 seconds
 in the earlier HT20 receive; this evidence does not establish faster discovery.
 
 A 14.76 MiB synthetic PNG sent through name-based discovery completed in
-45.9 seconds at 0.32 MiB/s, using the default 12 Mbps data injection rate.
+45.9 seconds at 0.32 MiB/s, using the then-default 12 Mbps data injection rate.
 The phone returned HTTP 200 and opened the image correctly. Both latest tests
 reported no transmit queue drops or backpressure, and normal teardown restored
 managed Wi-Fi. These observations are not controlled benchmarks; throughput
@@ -789,6 +809,7 @@ service TLVs, NSEC, BLE presence and neighbor learning all affect visibility.
 | Area | Source |
 | --- | --- |
 | Frame encoding/decoding, service TLVs | [protocol.rs](../src/protocol.rs) |
+| PHY rate parsing and selection | [rate.rs](../src/rate.rs) |
 | Clock and channel sequence | [channel.rs](../src/channel.rs) |
 | Election, peer validity, traffic scheduling | [engine.rs](../src/engine.rs) |
 | Capture, TAP, neighbor and radio workers | [runtime.rs](../src/runtime.rs) |

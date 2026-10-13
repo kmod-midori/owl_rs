@@ -4,7 +4,8 @@ use clap::Args;
 use owl_rs::{
     channel::Strategy,
     engine::Config,
-    protocol::{Mac, Rate},
+    protocol::Mac,
+    rate::Rate,
     runtime::{self, Options},
 };
 use std::path::PathBuf;
@@ -36,8 +37,8 @@ pub struct Arguments {
     /// Maximum unavailable slots filled by the widen strategy.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=16))]
     widen: u8,
-    /// Legacy Mbps or mcsN[-sgi] data rate; actions use 12 Mbps.
-    #[arg(long, default_value = "12")]
+    /// Data rate: auto (fastest supported), legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi]; actions use 12 Mbps.
+    #[arg(long, default_value = "auto")]
     rate: Rate,
     /// AWDL/TAP MAC; defaults to the monitor MAC or a local MAC for replay.
     #[arg(long)]

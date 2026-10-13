@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::channel::Sequence;
+use crate::{
+    channel::Sequence,
+    rate::{Rate, vht_width_code},
+};
 use serde::{Serialize, Serializer};
 use std::{fmt, net::Ipv6Addr, str::FromStr};
 
@@ -128,56 +131,6 @@ impl<'a> Reader<'a> {
             .map_err(|_| Error::Truncated)?))
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rate {
-    Legacy(u8),
-    Mcs { index: u8, sgi: bool },
-}
-impl fmt::Display for Rate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Legacy(n) => write!(f, "{n}"),
-            Self::Mcs { index, sgi } => write!(f, "mcs{index}{}", if *sgi { "-sgi" } else { "" }),
-        }
-    }
-}
-impl Serialize for Rate {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-impl<'de> serde::Deserialize<'de> for Rate {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <String as serde::Deserialize>::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-impl Default for Rate {
-    fn default() -> Self {
-        Self::Legacy(12)
-    }
-}
-impl FromStr for Rate {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        if let Some(m) = s.strip_prefix("mcs") {
-            let (m, sgi) = m.strip_suffix("-sgi").map_or((m, false), |v| (v, true));
-            if !m.is_empty()
-                && m.bytes().all(|b| b.is_ascii_digit())
-                && let Ok(index) = m.parse::<u8>()
-                && index <= 15
-            {
-                return Ok(Self::Mcs { index, sgi });
-            }
-        } else if let Ok(n) = s.parse::<u8>()
-            && [6, 9, 12, 18, 24, 36, 48, 54].contains(&n)
-        {
-            return Ok(Self::Legacy(n));
-        }
-        Err("use 6, 9, 12, 18, 24, 36, 48, 54, mcs0..mcs15, or mcsN-sgi".into())
-    }
-}
 #[derive(Clone, Debug, Serialize)]
 pub struct Election {
     pub master: Mac,
@@ -216,6 +169,7 @@ pub struct Action {
     pub name: Option<String>,
     pub version: Option<u8>,
     pub devclass: Option<u8>,
+    pub capabilities: BandCapabilities,
 }
 #[derive(Debug)]
 pub enum Body {
@@ -323,6 +277,7 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
         name: None,
         version: None,
         devclass: None,
+        capabilities: BandCapabilities::default(),
     };
     while !r.rest().is_empty() {
         let kind = r.u8()?;
@@ -343,6 +298,44 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
                     return Err(Error::Invalid("sync parameters"));
                 }
                 a.sync = Some(SyncParams { next, counter });
+            }
+            7 => {
+                // Reserved prefix, HT flags, A-MPDU parameters, RX MCS mask, reserved suffix.
+                if !(8..=11).contains(&value.len()) {
+                    return Err(Error::Invalid("HT capabilities length"));
+                }
+                v.take(2)?;
+                let cap_info = v.le16()?;
+                let ampdu_params = v.u8()?;
+                let mut rx_mask = [0; 4];
+                let mask = v.take(value.len() - 7)?;
+                rx_mask[..mask.len()].copy_from_slice(mask);
+                a.capabilities.ht = Some(HtCapabilities {
+                    cap_info,
+                    ampdu_params,
+                    rx_mask,
+                    tx_mask: None,
+                });
+            }
+            17 => {
+                // AWDL's container can hold multiple IEEE capability IEs.
+                while !v.rest().is_empty() {
+                    let id = v.u8()?;
+                    let len = v.u8()? as usize;
+                    let mut ie = Reader::new(v.take(len)?);
+                    if id == 191 {
+                        if len != 12 {
+                            return Err(Error::Invalid("VHT capabilities length"));
+                        }
+                        a.capabilities.vht = Some(VhtCapabilities {
+                            cap_info: ie.le32()?,
+                            rx_mcs_map: ie.le16()?,
+                            rx_highest: ie.le16()?,
+                            tx_mcs_map: ie.le16()?,
+                            tx_highest: ie.le16()?,
+                        });
+                    }
+                }
             }
             18 => a.sequence = Some(Sequence::parse(value)?),
             5 if !a.v2 => {
@@ -445,7 +438,10 @@ fn parse_amsdu(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(out)
 }
 
-pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Vec<u8> {
+pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Result<Vec<u8>, Error> {
+    if rate.phy_mbps().is_none() {
+        return Err(Error::Invalid("concrete transmit rate"));
+    }
     let mut present = 0u32;
     let mut fields = Vec::new();
     if fcs {
@@ -467,11 +463,37 @@ pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Vec<u8> {
         present |= 1 << 19;
         fields.extend_from_slice(&[7, if sgi { 4 } else { 0 }, index]);
     }
+    if let Rate::Vht {
+        index,
+        nss,
+        width,
+        sgi,
+    } = rate
+    {
+        present |= 1 << 21;
+        if (8 + fields.len()) % 2 != 0 {
+            fields.push(0);
+        }
+        // VHT known GI/bandwidth, SU user 0, BCC, no beamforming or STBC.
+        fields.extend_from_slice(&0x0044u16.to_le_bytes());
+        fields.extend_from_slice(&[
+            if sgi { 4 } else { 0 },
+            vht_width_code(width).ok_or(Error::Invalid("VHT width"))?,
+            (index << 4) | nss,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+    }
     let mut out = vec![0, 0];
     out.extend_from_slice(&((8 + fields.len()) as u16).to_le_bytes());
     out.extend_from_slice(&present.to_le_bytes());
     out.extend(fields);
-    out
+    Ok(out)
 }
 fn header(out: &mut Vec<u8>, source: Mac, destination: Mac, sequence: u16, fc: u16) {
     out.extend_from_slice(&fc.to_le_bytes());
@@ -498,6 +520,9 @@ pub struct HtCapabilities {
     pub cap_info: u16,
     pub ampdu_params: u8,
     pub rx_mask: [u8; 4],
+    /// Local TX mask from nl80211; absent from AWDL's compact receive-only HT TLV.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_mask: Option<[u8; 4]>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct VhtCapabilities {
@@ -542,7 +567,7 @@ pub struct Advertisement<'a> {
 }
 
 pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u8> {
-    let mut out = radiotap_tx(Rate::default(), false, false);
+    let mut out = radiotap_tx(Rate::DISCOVERY, false, false).expect("valid discovery rate");
     header(&mut out, a.mac, BROADCAST, sequence, 0xd0);
     out.extend_from_slice(&[127, 0, 0x17, 0xf2, 8, 0x10, subtype, 0]);
     le32(&mut out, a.now_us as u32);
@@ -647,7 +672,7 @@ pub fn encode_data(
     if ethertype != 0x86dd || r.rest().len() > 1500 {
         return Err(Error::Invalid("outgoing Ethernet frame"));
     }
-    let mut out = radiotap_tx(rate, fixed && !destination.multicast(), fcs);
+    let mut out = radiotap_tx(rate, fixed && !destination.multicast(), fcs)?;
     let header_start = out.len();
     header(&mut out, source, destination, sequence, 8);
     out.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0]);

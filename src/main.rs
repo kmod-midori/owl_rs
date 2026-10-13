@@ -337,7 +337,7 @@ async fn foreground_client(
 mod tests {
     use super::*;
     #[test]
-    fn cli_timeout_overrides_preserve_explicit_values() {
+    fn cli_overrides_preserve_explicit_values() {
         Cli::command().debug_assert();
         for value in ["0", "-1", "NaN", "inf", "90000"] {
             assert!(
@@ -369,6 +369,29 @@ mod tests {
         };
         options.timeouts = parsed.timeouts;
         let changed = overrides(&options, matches.subcommand().unwrap().1).unwrap();
+        assert_eq!(options.rate, owl_rs::rate::Rate::Auto);
+        assert!(changed.get("rate").is_none());
+        for rate in ["12", "mcs7-sgi", "vht4-nss2-bw40-sgi", "auto"] {
+            let matches = Cli::command()
+                .try_get_matches_from([
+                    "owl_rs",
+                    "send",
+                    "fixture",
+                    "--url",
+                    "https://example.com/",
+                    "--rate",
+                    rate,
+                ])
+                .unwrap();
+            let Action::Send { options, .. } = Cli::from_arg_matches(&matches).unwrap().command
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                overrides(&options, matches.subcommand().unwrap().1).unwrap()["rate"],
+                rate
+            );
+        }
         assert_eq!(
             changed["timeouts"],
             serde_json::json!({"ble_idle":12.5,"approval":0.5,"completion_grace":0.0})

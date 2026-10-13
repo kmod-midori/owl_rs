@@ -6,8 +6,9 @@ use crate::{
     discovery::Discovery,
     identity::Identity,
     link::Link,
-    protocol::{Mac, Rate},
+    protocol::Mac,
     radio::RadioArgs,
+    rate::Rate,
     session::{Activity, Lease},
     timeouts::Timeouts,
     transfer::{Receiver, Sender, Transfer},
@@ -69,7 +70,8 @@ pub struct Options {
     pub duration: Option<u64>,
     #[arg(long)]
     pub save: Option<String>,
-    #[arg(long, default_value = "12")]
+    /// Data rate: auto (fastest supported), legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi] (20/40/80 MHz).
+    #[arg(long, default_value = "auto")]
     pub rate: Rate,
     /// Experimental local master-election preference; peers decide whether to follow.
     #[arg(long, default_value_t = 60)]

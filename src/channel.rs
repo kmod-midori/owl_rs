@@ -118,6 +118,24 @@ impl Sequence {
     pub fn channel(&self, i: usize) -> u8 {
         self.slots[i % SLOTS][usize::from(self.encoding == Encoding::Legacy)]
     }
+    /// Narrowest advertised width for this channel; unknown encodings stay at 20 MHz.
+    pub fn width_mhz(&self, channel: u8) -> u32 {
+        (0..SLOTS)
+            .filter(|&i| self.channel(i) == channel)
+            .map(|i| {
+                if self.encoding != Encoding::Opclass {
+                    return 20;
+                }
+                match self.slots[i][1] {
+                    128 => 80,
+                    129 | 130 => 160,
+                    116 | 117 | 119 | 120 | 122 | 123 | 126 | 127 => 40,
+                    _ => 20,
+                }
+            })
+            .min()
+            .unwrap_or(20)
+    }
     pub fn parse(data: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(data);
         if r.u8()? != 15 {

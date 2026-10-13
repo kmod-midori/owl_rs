@@ -12,6 +12,7 @@ pub mod identity;
 pub mod netlink;
 pub mod protocol;
 pub mod radio;
+pub mod rate;
 pub mod runtime;
 pub mod service;
 pub mod timeouts;

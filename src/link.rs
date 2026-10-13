@@ -3,8 +3,9 @@
 use crate::{
     channel::{ChannelPlan, Strategy},
     engine::Config,
-    protocol::{Mac, Rate},
+    protocol::Mac,
     radio::{Mode, Radio, RadioArgs},
+    rate::Rate,
     runtime,
     visibility::Policy,
 };

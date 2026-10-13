@@ -79,7 +79,27 @@ Shared mode preserves the AP's width. `probe` lists permitted tuning candidates.
 Timing, overlap ranking and tuning acknowledgments are
 described in [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 
-`--rate 12` or `--rate mcs7-sgi` selects the data injection rate. Experimental
+## Transmit rates
+
+`send`, `daemon` and `awdl` default to `--rate auto`, selecting the fastest
+mutually supported VHT or HT20 rate for each peer and the current channel.
+Selection uses advertised capabilities and does not adapt to packet loss.
+
+| Override | Selection |
+| --- | --- |
+| `--rate auto` | Automatic selection (default) |
+| `--rate 12` | Legacy Mbps: 6, 9, 12, 18, 24, 36, 48 or 54 |
+| `--rate mcs7-sgi` | HT20 MCS 0–31, optional `-sgi` |
+| `--rate vht4-nss2-bw40-sgi` | VHT MCS 0–9, NSS 1–8, width 20/40/80 MHz, optional `-sgi` |
+
+VHT requests are upper limits, constrained by both peers and the tuned channel.
+Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
+and unavailable capabilities use 12 Mbps. Effective peer rates appear in
+`status` and rate-change logs. See [Transmit rates](protocol.md#transmit-rates)
+for capability and encoding details.
+
+## Election experiments
+
 `--election-metric N` and `--election-counter N` change local election preference
 (defaults 60 and 0). The fixed election counter is separate from availability
 window timing and does not implement Apple's election-counter aging. Peers

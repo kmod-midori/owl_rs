@@ -81,6 +81,7 @@ pub struct PhyCapabilities {
 struct BandDump {
     ht_cap: Option<u16>,
     ht_mcs: Option<[u8; 4]>,
+    ht_tx_mask: Option<[u8; 4]>,
     ampdu_factor: Option<u8>,
     ampdu_density: Option<u8>,
     vht_cap: Option<u32>,
@@ -91,7 +92,12 @@ impl BandDump {
         match attr {
             Nl80211BandInfo::HtCapa(c) => self.ht_cap = Some(c.bits()),
             Nl80211BandInfo::HtMcsSet(m) => {
-                self.ht_mcs = Some([m.rx_mask[0], m.rx_mask[1], m.rx_mask[2], m.rx_mask[3]])
+                let mask = [m.rx_mask[0], m.rx_mask[1], m.rx_mask[2], m.rx_mask[3]];
+                self.ht_mcs = Some(mask);
+                // Without an equal defined TX set, RX bits do not prove TX support.
+                self.ht_tx_mask = (m.tx_params.mcs_set_defined
+                    && !m.tx_params.tx_rx_mcs_set_not_equal)
+                    .then_some(mask);
             }
             Nl80211BandInfo::HtAmpduFactor(f) => self.ampdu_factor = Some(f),
             Nl80211BandInfo::HtAmpduDensity(d) => self.ampdu_density = Some(d),
@@ -113,6 +119,7 @@ impl BandDump {
                 Some(HtCapabilities {
                     cap_info,
                     rx_mask,
+                    tx_mask: self.ht_tx_mask,
                     ampdu_params: f | (d << 2),
                 })
             }
@@ -647,6 +654,7 @@ mod tests {
         let mut mcs = [0; 16];
         mcs[..2].copy_from_slice(&[255, 255]);
         mcs[4] = 1; // MCS 32 cannot be represented in compact AWDL HT.
+        mcs[12] = 1; // Defined TX set equals RX.
         let ht = vec![
             Nl80211BandInfo::HtMcsSet(Ieee80211HtMcsInfo::parse(&mcs[..]).unwrap()),
             Nl80211BandInfo::HtCapa(Ieee80211HtCaps::from_bits_retain(0x01ff)),
@@ -686,6 +694,16 @@ mod tests {
             (ht.cap_info, ht.ampdu_params, ht.rx_mask),
             (0x01ff, 3, [255, 255, 0, 0])
         );
+        assert_eq!(ht.tx_mask, Some([255, 255, 0, 0]));
+        for params in [0, 3] {
+            // Undefined or asymmetric TX must not be inferred from RX.
+            mcs[12] = params;
+            let mut dump = BandDump::default();
+            dump.update(Nl80211BandInfo::HtMcsSet(
+                Ieee80211HtMcsInfo::parse(&mcs[..]).unwrap(),
+            ));
+            assert!(dump.ht_tx_mask.is_none());
+        }
         assert_eq!(caps.ghz5.vht.unwrap().rx_mcs_map, 0xfffa);
     }
 
@@ -697,6 +715,7 @@ mod tests {
                     cap_info: 2,
                     ampdu_params: 0,
                     rx_mask: [255, 0, 0, 0],
+                    tx_mask: Some([255, 0, 0, 0]),
                 }),
                 vht: Some(VhtCapabilities {
                     cap_info: 0,
