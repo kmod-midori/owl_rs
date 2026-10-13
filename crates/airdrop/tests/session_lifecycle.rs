@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use owl_rs::service::{self, Command};
-use std::{path::Path, time::Duration};
+use airdrop::{
+    service::{self, Command},
+    visibility::Visibility,
+};
+use std::{path::Path, process::Stdio, time::Duration};
 use tokio::process::{Child, Command as Process};
-fn cli() -> Process {
-    let mut command = Process::new(env!("CARGO_BIN_EXE_owl_rs"));
-    command
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    command
-}
 async fn ready(dir: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -22,14 +17,13 @@ async fn ready(dir: &Path) {
     .await
     .unwrap();
 }
-async fn finished(child: Child, success: bool) {
+async fn finished(child: Child) {
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
+    assert!(
         output.status.success(),
-        success,
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -40,9 +34,11 @@ async fn runtime_visibility_idle_control_and_killed_daemon_restart() {
     let dir = temp.path().join("run");
     let keys = temp.path().join("keys");
     let start = || {
-        cli()
+        Process::new(env!("CARGO_BIN_EXE_airdropd"))
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .args([
-                "daemon",
                 "--no-radio",
                 "--no-bluetooth",
                 "--ble-idle-timeout",
@@ -63,36 +59,43 @@ async fn runtime_visibility_idle_control_and_killed_daemon_restart() {
         service::client(&dir, Command::Status, None).await.unwrap()["timeouts"]["ble_idle"],
         0.25
     );
-    for mode in ["off", "everyone", "contacts", "off"] {
-        let mut command = cli();
-        command.args(["discoverable", mode, "--run-dir"]).arg(&dir);
-        if mode == "contacts" {
-            command
-                .arg("--contacts-file")
-                .arg(temp.path().join("contacts"));
-        }
-        let output = command.output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    for mode in [
+        Visibility::Off,
+        Visibility::Everyone,
+        Visibility::Contacts,
+        Visibility::Off,
+    ] {
+        service::client(
+            &dir,
+            Command::Discoverable {
+                mode,
+                contacts_file: (mode == Visibility::Contacts).then(|| temp.path().join("contacts")),
+            },
+            None,
+        )
+        .await
+        .unwrap();
         let status = service::client(&dir, Command::Status, None).await.unwrap();
-        assert_eq!(status["visibility"], mode);
+        assert_eq!(status["visibility"], serde_json::to_value(mode).unwrap());
         assert!(status["session"].is_null());
         assert_eq!(status["ble"]["listening"], false);
         assert!(!keys.exists());
         assert!(!dir.join("radio.json").exists());
     }
-    let waiting = cli()
-        .args(["accept", "--run-dir"])
-        .arg(&dir)
-        .spawn()
-        .unwrap();
+    let waiting = tokio::spawn({
+        let dir = dir.clone();
+        async move { service::client(&dir, Command::Accept { id: None }, None).await }
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(service::client(&dir, Command::Status, None).await.unwrap()["session"].is_null());
     daemon.kill().await.unwrap();
-    finished(waiting, false).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
     assert!(dir.join("control.sock").exists());
     let daemon = start();
     ready(&dir).await;
@@ -101,7 +104,7 @@ async fn runtime_visibility_idle_control_and_killed_daemon_restart() {
         "off"
     );
     service::client(&dir, Command::Stop, None).await.unwrap();
-    finished(daemon, true).await;
+    finished(daemon).await;
     assert!(!dir.join("control.sock").exists());
     assert!(!keys.exists());
 }

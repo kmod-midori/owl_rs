@@ -28,17 +28,20 @@ current station address.
 Exclusive mode saves NetworkManager ownership, the station's MAC/up state and
 any connected AP's connection UUID. It disconnects Wi-Fi for the session and
 restores saved state afterward. A cryptographically random, locally administered
-unicast MAC is generated at each daemon start and reused for exclusive sessions
-until the daemon exits. A restart generates a new MAC. The original station MAC
+unicast MAC is generated at each `owld` start and reused for exclusive sessions
+until `owld` exits. A restart generates a new MAC. The original station MAC
 is retained in the recovery journal and restored during cleanup. With no
-connected AP, disassociation and reassociation are skipped. The backend supplies the radio's channel context:
+connected AP, disassociation and reassociation are skipped. Setup waits for
+NetworkManager to finish releasing the station before changing it. The backend
+supplies the radio's channel context:
 
 - **IBSS:** `owlibss0` joins AWDL BSSID `00:25:00:ff:94:73` on the selected
   channel, supplying context and hardware ACKs. Passive `owlmon0` captures and
   injects frames.
 - **Active monitor:** active `owlmon0` captures, injects and supplies hardware
   ACKs. The existing station becomes a passive monitor with the same MAC for
-  tuning. This requires hardware support and `mon_mac = "station"`, and avoids
+  tuning. Setup establishes the discovery channel before bringing up the active
+  monitor. This requires hardware support and `mon_mac = "station"`, and avoids
   an additional tuning interface on MT7612U.
 
 `reconnect` addresses drivers that need reconnection after shared-mode monitor
@@ -50,12 +53,13 @@ settings. Existing monitor/TAP names are rejected rather than adopted.
 Exclusive mode separates discovery/negotiation from transmission:
 
 ```sh
-just daemon --discovery-channel 6 --channel 149 --auto-accept
-# In another terminal:
+just owld --discovery-channel 6 --channel 149
+# In other terminals:
+just daemon --auto-accept
 just discoverable everyone
 ```
 
-These flags also apply to `send` and to daemon session defaults.
+Radio flags configure `owld`; `catdrop send` and `airdropd` do not change them.
 `--transmit-channel` aliases `--channel`. Discovery defaults to 6; the transmit
 preference defaults to 6 for active monitor and 44 for IBSS, subject to regulatory
 availability. Disabled, radar and no-IR channels are excluded.
@@ -81,16 +85,19 @@ described in [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 
 ## Transmit rates
 
-`send`, `daemon` and `awdl` default to `--rate auto`, selecting the fastest
+`owld` and `owld awdl` default to `--rate auto`, selecting the fastest
 mutually supported VHT or HT20 rate for each peer and the current channel.
 Selection uses advertised capabilities and does not adapt to packet loss.
+VHT transmission is capped at **MCS8**, including explicit MCS9 requests,
+because MCS9 caused stalled uploads in radio tests. Hardware capability
+advertisements and reception retain full MCS9 support.
 
 | Override | Selection |
 | --- | --- |
 | `--rate auto` | Automatic selection (default) |
 | `--rate 12` | Legacy Mbps: 6, 9, 12, 18, 24, 36, 48 or 54 |
 | `--rate mcs7-sgi` | HT20 MCS 0–31, optional `-sgi` |
-| `--rate vht4-nss2-bw40-sgi` | VHT MCS 0–9, NSS 1–8, width 20/40/80 MHz, optional `-sgi` |
+| `--rate vht4-nss2-bw40-sgi` | VHT MCS 0–9 request, capped at 8; NSS 1–8, width 20/40/80 MHz, optional `-sgi` |
 
 VHT requests are upper limits, constrained by both peers and the tuned channel.
 Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
@@ -118,7 +125,7 @@ original session's run directory:
 ```sh
 just recover
 # For a custom directory:
-just recover --run-dir /run/owl_rs-example
+just recover --run-dir /run/owld-example
 ```
 
 Recovery refuses to interrupt a live owner. If auto-selection reports no managed
@@ -126,7 +133,8 @@ Wi-Fi interface after a killed session, recover before starting another session.
 Rapid radio restart can also encounter a kernel tuning rejection; the underlying
 netlink error is reported and saved WLAN state is restored.
 
-The application does not configure firewall or VPN routing. mDNS and keepalives
-use Ethernet frames on the AWDL TAP; HTTPS binds to its scoped link-local
-interface. See [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
+The application does not configure firewall or VPN routing. The user daemon
+uses interface-scoped UDP for mDNS and TCP for HTTPS; host routing and filtering
+still apply. `owld` generates Ethernet neighbor-learning probes on its owned
+link. See [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
 for tested hardware and remaining limits.

@@ -12,8 +12,9 @@ just build
 just check
 ```
 
-`build` creates `target/release/owl_rs` without installing a package. `check`
-runs formatting, all-target Clippy and the automated test suite. The suite uses
+`build` creates `target/release/owld`, `airdropd` and `catdrop` without
+installing a package. `check` runs formatting, all-target Clippy and the
+automated test suite. The suite uses
 synthetic frames, temporary files, loopback HTTPS and local control sockets;
 it does not require a phone, Wi-Fi setup or root.
 
@@ -36,7 +37,7 @@ local directories.
 Automated tests exercise runtime visibility, optional client certificates,
 contact verification and consent over loopback TLS. A simulated BLE callback
 starts a no-radio shared session, overlaps incoming and outgoing work, and checks
-independent cancellation and ordered cleanup. The CLI
+independent cancellation and ordered cleanup. The daemon
 regression uses local control sockets to verify idle toggles, waiting acceptance
 and restart after SIGKILL. None of these checks requires a phone or Bluetooth
 adapter. BLE parser cases reject truncated, ambiguous and unrelated manufacturer
@@ -45,24 +46,30 @@ BLE wake resets, active-user protection and refresh during completion grace. CLI
 checks cover fractional values and explicit override inheritance. Real BLE scanning is disabled for `--no-radio` sessions.
 
 ```sh
-cargo test --locked --lib
-cargo test --locked --test session_lifecycle
+cargo test --workspace --locked --lib
+cargo test --workspace --locked --test session_lifecycle
 ```
 
-`daemon --no-radio --no-bluetooth` exercises idle control commands. Tests create
+`airdropd --no-radio --no-bluetooth` exercises idle control commands. Tests create
 direct loopback HTTPS receivers through the library API.
+
+The UDP regression checks source address, interface and hop-limit metadata as
+a normal user. Link regressions cover peer credentials, generation validation,
+publication readiness, heartbeats, bounded framing and disconnect cleanup.
+The daemon lifecycle test belongs to the AirDrop crate and uses Cargo's binary
+path, so it runs without a previous build of the CLI.
 
 ## AWDL diagnostics
 
-`awdl` shares the main CLI's Tokio runtime and logging. Choose exactly one input:
+`owld awdl` shares the radio daemon's Tokio runtime and logging. Choose exactly one input:
 `--read PCAP` for offline radiotap replay, or `--interface IFACE` for an already
 prepared monitor. Diagnostics do not convert managed interfaces or apply profiles;
-managed setup and recovery belong to the shared session coordinator.
+managed setup and recovery belong to `owld`.
 
 ```sh
 just replay /path/to/full-radiotap.pcap
 just listen owlmon0 30
-sudo target/release/owl_rs awdl --interface owlmon0 --channel 6 \
+sudo target/release/owld awdl --interface owlmon0 --channel 6 \
   --fixed-radio --metric-first --strategy pin --verbose
 ```
 
@@ -86,7 +93,8 @@ executables are not required. NetworkManager ownership and saved-AP restoration
 still use `nmcli`.
 
 `pcap` and `tun-rs` handle capture and TAP I/O; `etherparse` and `hickory-proto`
-handle packets and DNS; `bluer` owns BlueZ LE scanning and advertising. AirDrop uses `hyper`,
+handle radio packets and DNS; `socket2`/`nix` provide IPv6 UDP metadata without
+raw sockets in the user process. `bluer` owns BlueZ LE scanning and advertising. AirDrop uses `hyper`,
 `tokio-openssl`, `openssl` and `plist`; archives and previews use `cpio-archive`,
 `flate2`, `tempfile` and `image`. `cms` and `x509-cert` inspect signed identity
 records and certificate-role markers without unsafe code. The [source map](protocol.md#source-map) links
@@ -97,10 +105,15 @@ on channels 149 and 44, return to channel 6 at 20 MHz, and TAP
 MTU/link-local readiness, permanent neighbor add/replace/delete, normal cleanup,
 startup-error rollback, passive observation, SIGKILL recovery and stale-socket
 restart. These checks restored managed Wi-Fi and preserved Ethernet configuration.
+The split also verified root owld with a user TCP/UDP listener on the AWDL
+TAP, mDNS multicast membership and UDP submission, normal release and disconnect
+cleanup. Those checks restored managed Wi-Fi and preserved Ethernet settings.
 They are separate from transfer validation; see
 [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
 for live transfer evidence, timings and remaining limits. The optional
-[systemd unit](../examples/owl_rs.service) runs the idle foreground daemon.
+[radio service](../examples/owld.service) runs as root, while the
+[AirDrop user service](../examples/airdropd.service) runs in the user manager.
+The [workspace architecture](architecture.md) documents their IPC boundary.
 
 ## Origins
 
@@ -122,3 +135,8 @@ Contacts Only reception follows omdrop-plugin's policy at commit
 checks from Apple's published Security policies. Public Apple Application
 Integration CA certificates are vendored from that reference; see
 [their provenance and license](../assets/apple-ca/README.md).
+
+`owld --save PATH` uses PATH as a capture prefix. Each radio lease writes
+`PATH.<session-id>.pcap`, preserving earlier captures when BLE starts another
+session. The `owld awdl --save PATH` diagnostic command still writes the exact
+path supplied. Captures belong in ignored local directories.

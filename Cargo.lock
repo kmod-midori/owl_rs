@@ -18,6 +18,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "airdrop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bluer",
+ "bytes",
+ "clap",
+ "cms",
+ "cpio-archive",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "hickory-proto",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "nix 0.31.3",
+ "openssl",
+ "owl-ipc",
+ "plist",
+ "serde",
+ "serde_json",
+ "socket2 0.6.5",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-openssl",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "x509-cert",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,6 +270,18 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "catdrop"
+version = "0.1.0"
+dependencies = [
+ "airdrop",
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "cc"
@@ -1600,47 +1649,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "owl_rs"
+name = "owl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bluer",
- "bytes",
  "clap",
- "cms",
- "cpio-archive",
  "crc32fast",
  "etherparse",
- "flate2",
  "fs2",
  "futures-util",
- "hickory-proto",
- "http-body-util",
- "hyper",
- "hyper-util",
- "image",
  "nix 0.31.3",
- "openssl",
+ "owl-ipc",
  "pcap",
- "plist",
  "radiotap",
  "rtnetlink",
  "serde",
  "serde_json",
- "socket2 0.6.5",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-openssl",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
  "tun-rs",
- "uuid",
- "walkdir",
  "wl-nl80211",
- "x509-cert",
+]
+
+[[package]]
+name = "owl-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -2408,6 +2456,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

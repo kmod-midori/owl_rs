@@ -5,57 +5,58 @@ default:
     @just --list
 
 build:
-    cargo build --release --locked
+    cargo build --workspace --release --locked
 
 check:
-    cargo fmt --check
-    cargo clippy --all-targets --locked -- -D warnings
-    cargo test --locked
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --locked
 
 probe *ARGS:
-    cargo run --locked -- probe "$@"
+    cargo run --locked -p owl --bin owld -- probe "$@"
 
-# Foreground daemon: receiving starts on BLE after discoverable is enabled.
+# Privileged radio service: WLAN stays inactive until a user obtains a lease.
+owld *ARGS: build
+    sudo target/release/owld "$@"
+
+# AirDrop runs as the current user and connects to owld as needed.
 daemon *ARGS: build
-    sudo target/release/owl_rs daemon "$@"
+    target/release/airdropd "$@"
 
 discoverable MODE *ARGS:
-    target/release/owl_rs discoverable "$@"
+    target/release/catdrop discoverable "$@"
 
 send TO *FILES: build
-    sudo target/release/owl_rs send "$@"
+    target/release/catdrop send "$@"
 
-# Local contact management needs neither root nor an active daemon.
 contact *ARGS: build
-    target/release/owl_rs contact "$@"
+    target/release/catdrop contact "$@"
 
 peers *ARGS:
-    target/release/owl_rs peers "$@"
+    target/release/catdrop peers "$@"
 
 status *ARGS:
-    target/release/owl_rs status "$@"
+    target/release/catdrop status "$@"
 
 transfers *ARGS:
-    target/release/owl_rs transfers "$@"
+    target/release/catdrop transfers "$@"
 
 accept *ARGS:
-    target/release/owl_rs accept "$@"
+    target/release/catdrop accept "$@"
 
 reject ID *ARGS:
-    target/release/owl_rs reject "$@"
+    target/release/catdrop reject "$@"
 
 stop *ARGS:
-    target/release/owl_rs stop "$@"
+    target/release/catdrop stop "$@"
 
 recover *ARGS: build
-    sudo target/release/owl_rs recover "$@"
+    sudo target/release/owld "$@" recover
 
 replay CAPTURE:
-    cargo run --locked -- awdl --read {{quote(CAPTURE)}} --no-rssi-filter --fixed-radio --metric-first
+    cargo run --locked -p owl --bin owld -- awdl --read {{quote(CAPTURE)}} --no-rssi-filter --fixed-radio --metric-first
 
-# Low-level observation on an already prepared monitor interface.
 listen IFACE="owlmon0" SECONDS="30": build
-    sudo target/release/owl_rs awdl --interface {{quote(IFACE)}} --no-rssi-filter --fixed-radio --metric-first --listen-only --duration {{quote(SECONDS)}}
+    sudo target/release/owld awdl --interface {{quote(IFACE)}} --no-rssi-filter --fixed-radio --metric-first --listen-only --duration {{quote(SECONDS)}}
 
-# Optional machine-specific commands belong in ignored dev/.
 import? 'dev/justfile.local'

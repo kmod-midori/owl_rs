@@ -32,7 +32,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 /// Create private directories without changing ownership of existing parents.
-pub fn private_directory(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
+pub fn private_directory(path: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut parent = path;
     while !parent.as_os_str().is_empty() && !parent.exists() {
@@ -41,15 +41,7 @@ pub fn private_directory(path: &Path, owner: Option<(u32, u32)>) -> Result<()> {
     }
     for path in missing.into_iter().rev() {
         match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => {
-                if let Some((uid, gid)) = owner {
-                    nix::unistd::chown(
-                        &path,
-                        Some(nix::unistd::Uid::from_raw(uid)),
-                        Some(nix::unistd::Gid::from_raw(gid)),
-                    )?;
-                }
-            }
+            Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => (),
             Err(e) => return Err(e.into()),
         }

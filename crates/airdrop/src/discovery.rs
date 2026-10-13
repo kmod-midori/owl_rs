@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::visibility::{self, Policy};
-use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use anyhow::Result;
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_proto::{
     op::{Message, MessageType, Query},
@@ -29,7 +28,7 @@ pub struct Peer {
 }
 impl Peer {
     /// A live AWDL neighbor may answer HTTPS before publishing mDNS records.
-    pub fn from_awdl(mac: crate::protocol::Mac, scope: u32, expiry: Duration) -> Self {
+    pub fn from_awdl(mac: owl_ipc::Mac, scope: u32, expiry: Duration) -> Self {
         Self {
             id: mac.0.iter().map(|b| format!("{b:02x}")).collect(),
             address: SocketAddrV6::new(mac.ipv6(), 8770, 0, scope),
@@ -44,13 +43,7 @@ pub struct Discovery {
     timeouts: crate::timeouts::Timeouts,
     pub peers: Arc<RwLock<BTreeMap<String, Peer>>>,
 }
-pub fn scope(interface: &str) -> Result<u32> {
-    Ok(
-        std::fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))?
-            .trim()
-            .parse()?,
-    )
-}
+
 impl Discovery {
     pub(crate) fn with_timeouts(mut self, timeouts: crate::timeouts::Timeouts) -> Self {
         self.timeouts = timeouts;
@@ -71,37 +64,18 @@ impl Discovery {
     }
     pub(crate) async fn run(
         &self,
-        interface: &str,
+        socket: crate::mdns::Socket,
         id: &str,
         address: Ipv6Addr,
         port: u16,
         cancel: CancellationToken,
-        snapshot: tokio::sync::watch::Receiver<serde_json::Value>,
     ) -> Result<()> {
         let mut policy = self
             .policy
             .clone()
             .unwrap_or_else(|| tokio::sync::watch::channel(Policy::everyone()).1);
-        let index = scope(interface)?;
-        // Match the proven helper: multicast mDNS uses Ethernet directly on the
-        // AWDL TAP, independent of host VPN policy routing. pcap owns the native I/O.
-        let mac: crate::protocol::Mac =
-            std::fs::read_to_string(format!("/sys/class/net/{interface}/address"))?
-                .trim()
-                .parse()?;
-        let mut capture = pcap::Capture::from_device(interface)?
-            .snaplen(65535)
-            .immediate_mode(true)
-            .timeout(self.timeouts.capture_read.as_millis().max(1) as i32)
-            .open()?
-            .setnonblock()?;
-        anyhow::ensure!(
-            capture.get_datalink() == pcap::Linktype::ETHERNET,
-            "mDNS needs an Ethernet TAP"
-        );
-        capture.direction(pcap::Direction::In)?;
-        capture.filter("ip6 and udp port 5353", true)?;
-        let mut stream = capture.stream(DnsCodec)?;
+        let index = socket.interface_index();
+        let mut received = vec![0; 65535];
         let group: Ipv6Addr = "ff02::fb".parse()?;
         let service = Name::from_ascii("_airdrop._tcp.local.")?;
         let instance = Name::from_ascii(format!("{id}._airdrop._tcp.local."))?;
@@ -177,63 +151,43 @@ impl Discovery {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    if advertised { let _ = stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &goodbye)?); }
+                    if advertised { let _ = socket.send(&goodbye, group).await; }
                     return Ok(());
                 }
                 _ = visibility::changed(&mut policy) => {
                     if !policy.borrow().mode.enabled() && advertised {
-                        stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &goodbye)?)?;
+                        socket.send(&goodbye, group).await?;
                         advertised = false;
                     }
                     step = 0;
                 }
                 _ = tick.tick() => {
-                    if step == 0 {
-                        let peers = snapshot.borrow().get("peers")
-                            .and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
-                        for peer in peers.iter().take(512) {
-                            if let Some(value) = peer.get("mac").and_then(serde_json::Value::as_str)
-                                && let Ok(peer) = value.parse::<crate::protocol::Mac>()
-                            {
-                                let builder = etherparse::PacketBuilder::ethernet2(mac.0, peer.0)
-                                    .ipv6(address.octets(), peer.ipv6().octets(), 255)
-                                    .icmpv6_echo_request(0x4157, 0);
-                                let mut packet = Vec::new();
-                                builder.write(&mut packet, b"owl_rs")?;
-                                stream.capture_mut().sendpacket(packet)?;
-                            }
-                        }
-                    }
                     if step < 64 {
                         if policy.borrow().mode.enabled() {
-                            stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &answer)?)?;
+                            socket.send(&answer, group).await?;
                             if !advertised {
                                 tracing::debug!(elapsed_ms=started.elapsed().as_millis(), "first mDNS advertisement submitted to AWDL");
                             }
                             advertised = true;
                         }
                         if step.is_multiple_of(8) {
-                            stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &query)?)?;
+                            socket.send(&query, group).await?;
                         }
                     }
                     step = (step + 1) % 176;
                 }
-                packet = stream.next() => {
-                    let packet = packet.context("mDNS capture ended")??;
-                    let Ok(parsed) = etherparse::SlicedPacket::from_ethernet(&packet) else { continue; };
-                    let Some(etherparse::NetSlice::Ipv6(ip)) = parsed.net else { continue; };
-                    if !ip.header().source_addr().is_unicast_link_local()
-                        || ip.header().source_addr() == address || ip.header().hop_limit() != 255
-                    {
-                        continue;
-                    }
-                    let Some(etherparse::TransportSlice::Udp(udp)) = parsed.transport else { continue; };
-                    if udp.source_port() != 5353 || udp.destination_port() != 5353 { continue; }
-                    let Ok(msg) = Message::from_vec(udp.payload()) else { continue; };
+                packet = socket.receive(&mut received) => {
+                    let Some(packet) = packet? else { continue; };
+                    if packet.interface != index || packet.hop_limit != 255
+                        || packet.source.port() != 5353
+                        || !packet.source.ip().is_unicast_link_local()
+                        || *packet.source.ip() == address
+                    { continue; }
+                    let Ok(msg) = Message::from_vec(&received[..packet.len]) else { continue; };
                     if policy.borrow().mode.enabled() && last_reply.elapsed() >= Duration::from_millis(100)
                         && msg.queries().iter().any(|q| q.name() == &service || q.name().to_ascii().starts_with(id))
                     {
-                        stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &answer)?)?;
+                        socket.send(&answer, group).await?;
                         last_reply = Instant::now();
                         advertised = true;
                         tracing::debug!(elapsed_ms=started.elapsed().as_millis(), "answered incoming AirDrop mDNS query");
@@ -292,26 +246,4 @@ impl Discovery {
             }
         }
     }
-}
-
-struct DnsCodec;
-impl pcap::PacketCodec for DnsCodec {
-    type Item = Vec<u8>;
-    fn decode(&mut self, packet: pcap::Packet<'_>) -> Vec<u8> {
-        packet.data.to_vec()
-    }
-}
-fn ethernet_dns(
-    mac: [u8; 6],
-    source: Ipv6Addr,
-    destination: Ipv6Addr,
-    dns: &[u8],
-) -> Result<Vec<u8>> {
-    let builder = etherparse::PacketBuilder::ethernet2(mac, [0x33, 0x33, 0, 0, 0, 0xfb])
-        .ipv6(source.octets(), destination.octets(), 255)
-        .udp(5353, 5353);
-    let mut frame = Vec::with_capacity(builder.size(dns.len()));
-    builder.write(&mut frame, dns)?;
-    anyhow::ensure!(frame.len() <= 1514, "mDNS announcement exceeds AWDL MTU");
-    Ok(frame)
 }

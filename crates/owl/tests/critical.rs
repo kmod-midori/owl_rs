@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use owl_rs::{
+use owl::{
     channel::{Clock, Encoding, SLOT_US, Sequence, Strategy},
     engine::{Config, Engine},
     protocol::{self, Advertisement, Body, Election, Mac},
@@ -7,9 +7,9 @@ use owl_rs::{
 };
 fn config(mac: Mac) -> Config {
     Config {
-        peer_timeout: owl_rs::timeouts::Timeouts::default().peer_idle,
-        retry_timeout: owl_rs::timeouts::Timeouts::default().retry_cache,
-        pending_timeout: owl_rs::timeouts::Timeouts::default().queued_packet,
+        peer_timeout: owl::timeouts::Timeouts::default().peer_idle,
+        retry_timeout: owl::timeouts::Timeouts::default().retry_cache,
+        pending_timeout: owl::timeouts::Timeouts::default().queued_packet,
         airdrop_port: None,
         mac,
         name: "test".into(),
@@ -121,7 +121,7 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         "vht9-nss2-bw80-sgi".parse().unwrap(),
     ] {
         let mut maximum = vec![2, 0, 0, 0, 0, 1, 2, 1, 2, 3, 4, 5, 0x86, 0xdd];
-        maximum.extend(vec![0; owl_rs::runtime::HOST_MTU as usize]);
+        maximum.extend(vec![0; owl::runtime::HOST_MTU as usize]);
         assert!(
             protocol::encode_data(&maximum, 0, 0, rate, true, false)
                 .unwrap()
@@ -418,7 +418,7 @@ fn early_syns_wait_for_peer_validation_and_are_bounded_deduplicated_and_expired(
 
 #[test]
 fn discovery_plan_ranks_overlap_and_falls_back_without_publishing_failed_tunes() {
-    use owl_rs::channel::ChannelPlan;
+    use owl::channel::ChannelPlan;
     let mut peer = Sequence::fixed(149);
     peer.slots[0] = [6, 0x51];
     peer.slots[1] = [44, 0x80];
@@ -486,7 +486,7 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
         panic!("action frame");
     };
     assert_eq!(action.sequence, Some(Sequence::fixed(6)));
-    engine.set_operating_channel(owl_rs::channel::ChannelDefinition::new(149, 20).unwrap());
+    engine.set_operating_channel(owl::channel::ChannelDefinition::new(149, 20).unwrap());
     assert!(!engine.send_ready(peer, 10_000));
     assert!(engine.send_ready(peer, SLOT_US + 10_000));
     let bytes = engine.action_frame_on_channel(3, 10_000, 149);
@@ -494,11 +494,11 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
         panic!("action frame");
     };
     assert_eq!(action.sequence, Some(Sequence::fixed(149)));
-    engine.set_operating_channel(owl_rs::channel::ChannelDefinition::new(6, 20).unwrap());
+    engine.set_operating_channel(owl::channel::ChannelDefinition::new(6, 20).unwrap());
     assert!(engine.send_ready(peer, 10_000));
     assert!(!engine.send_ready(peer, SLOT_US + 10_000));
     for (width, class) in [(80, 128), (40, 126), (20, 124)] {
-        let definition = owl_rs::channel::ChannelDefinition::new(149, width).unwrap();
+        let definition = owl::channel::ChannelDefinition::new(149, width).unwrap();
         engine.set_operating_channel(definition);
         engine.tick(10_000); // Following a parent must not erase the confirmed width.
         for subtype in [0, 3] {
@@ -510,12 +510,12 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
         }
     }
     let mut sparse =
-        Sequence::fixed_definition(owl_rs::channel::ChannelDefinition::new(149, 80).unwrap());
+        Sequence::fixed_definition(owl::channel::ChannelDefinition::new(149, 80).unwrap());
     sparse.slots[1] = [0, 0];
     let mut cfg = config(own);
     cfg.channel = 149;
     cfg.fixed_radio = false;
-    cfg.operating_channel = Some(owl_rs::channel::ChannelDefinition::new(149, 20).unwrap());
+    cfg.operating_channel = Some(owl::channel::ChannelDefinition::new(149, 20).unwrap());
     let mut shared = Engine::new(cfg, 0);
     shared.receive(&mif(peer, 518, 10, &sparse), 0).unwrap();
     shared.tick(0);
@@ -526,7 +526,7 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
 
 #[test]
 fn vht_radiotap_alignment_and_peer_limits() {
-    use owl_rs::channel::ChannelDefinition;
+    use owl::channel::ChannelDefinition;
     use protocol::{BandCapabilities, HtCapabilities, VhtCapabilities};
     let rate: Rate = "vht4-nss2-bw40-sgi".parse().unwrap();
     assert_eq!(
@@ -578,6 +578,7 @@ fn vht_radiotap_alignment_and_peer_limits() {
     remote.vht.as_mut().unwrap().tx_mcs_map = 0xffff;
     remote.ht.as_mut().unwrap().cap_info &= !(1 << 6);
     let request: Rate = "vht9-nss2-bw80-sgi".parse().unwrap();
+    let selected: Rate = "vht8-nss2-bw80-sgi".parse().unwrap();
     let channel = ChannelDefinition::new(149, 80).unwrap();
     assert_eq!(
         request.for_peer(channel, &local, &remote, 40),
@@ -596,7 +597,9 @@ fn vht_radiotap_alignment_and_peer_limits() {
         Rate::Legacy(12)
     );
     remote.vht.as_mut().unwrap().rx_mcs_map = 0xfffa;
-    assert_eq!(Rate::Auto.for_peer(channel, &local, &remote, 80), request);
+    // Both automatic and explicitly requested MCS9 obey the transmit ceiling.
+    assert_eq!(Rate::Auto.for_peer(channel, &local, &remote, 80), selected);
+    assert_eq!(request.for_peer(channel, &local, &remote, 80), selected);
     let mut ht_only = remote.clone();
     ht_only.vht = None;
     assert_eq!(
@@ -628,7 +631,7 @@ fn vht_radiotap_alignment_and_peer_limits() {
     many_rx.vht.as_mut().unwrap().rx_mcs_map = 2 << 12;
     assert_eq!(
         Rate::Auto.for_peer(channel, &many_tx, &many_rx, 80),
-        "vht9-nss7-bw80-sgi".parse().unwrap()
+        "vht8-nss7-bw80-sgi".parse().unwrap()
     );
     assert_eq!(
         request.for_peer(
@@ -652,11 +655,11 @@ fn vht_radiotap_alignment_and_peer_limits() {
     engine.receive(&peer.action_frame(3, 0), 0).unwrap();
     assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(12));
     engine.set_operating_channel(channel);
-    assert_eq!(engine.data_rate(peer_mac), request);
+    assert_eq!(engine.data_rate(peer_mac), selected);
     assert_eq!(engine.data_rate(protocol::BROADCAST), Rate::Legacy(12));
-    assert_eq!(engine.peers[&peer_mac].tx_rate, Some(request));
+    assert_eq!(engine.peers[&peer_mac].tx_rate, Some(selected));
     engine.config.rate = Rate::Auto;
-    assert_eq!(engine.data_rate(peer_mac), request);
+    assert_eq!(engine.data_rate(peer_mac), selected);
     engine.config.rate = Rate::Legacy(24);
     assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(24));
     let mut bad = peer.action_frame(3, 0);

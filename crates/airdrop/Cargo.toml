@@ -1,0 +1,49 @@
+[package]
+name = "airdrop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "airdropd"
+path = "src/airdropd.rs"
+
+[dependencies]
+anyhow.workspace = true
+bluer.workspace = true
+bytes.workspace = true
+clap.workspace = true
+cms.workspace = true
+cpio-archive.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+hickory-proto.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+image.workspace = true
+nix.workspace = true
+openssl.workspace = true
+plist.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-openssl.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+x509-cert.workspace = true
+owl-ipc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

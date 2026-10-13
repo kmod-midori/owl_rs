@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Context, Result, ensure};
 use clap::Args;
-use owl_rs::{
+use owl::{
     channel::Strategy,
     engine::Config,
     protocol::Mac,
@@ -37,7 +37,7 @@ pub struct Arguments {
     /// Maximum unavailable slots filled by the widen strategy.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=16))]
     widen: u8,
-    /// Data rate: auto (fastest supported), legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi]; actions use 12 Mbps.
+    /// Data rate: auto, legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi]; VHT is capped at MCS8, actions use 12 Mbps.
     #[arg(long, default_value = "auto")]
     rate: Rate,
     /// AWDL/TAP MAC; defaults to the monitor MAC or a local MAC for replay.
@@ -85,7 +85,7 @@ fn parse_channel(s: &str) -> Result<u8, String> {
         Err("use channel 6, 36, 44, or 149".into())
     }
 }
-pub async fn run(args: Arguments, timeouts: owl_rs::timeouts::Timeouts) -> Result<()> {
+pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<()> {
     timeouts.validate()?;
     let offline = args.input.read.is_some();
     let input = match args.input.read {
@@ -96,7 +96,7 @@ pub async fn run(args: Arguments, timeouts: owl_rs::timeouts::Timeouts) -> Resul
         None => args.input.interface.context("missing AWDL input")?,
     };
     if !offline {
-        owl_rs::radio::interface_name(&input)?;
+        owl::radio::interface_name(&input)?;
     }
     let mac = match args.mac {
         Some(mac) => mac,
@@ -117,7 +117,7 @@ pub async fn run(args: Arguments, timeouts: owl_rs::timeouts::Timeouts) -> Resul
     let capabilities = if offline {
         Default::default()
     } else {
-        let net = owl_rs::netlink::Netlink::with_timeout(timeouts.netlink)?;
+        let net = owl::netlink::Netlink::with_timeout(timeouts.netlink)?;
         let iface = net.interface(&input).await?;
         net.phy_capabilities(iface.phy).await?.radio
     };

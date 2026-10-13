@@ -6,9 +6,6 @@ use crate::{
     discovery::Discovery,
     identity::Identity,
     link::Link,
-    protocol::Mac,
-    radio::RadioArgs,
-    rate::Rate,
     session::{Activity, Lease},
     timeouts::Timeouts,
     transfer::{Receiver, Sender, Transfer},
@@ -34,22 +31,20 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Options {
-    #[command(flatten)]
-    pub radio: RadioArgs,
     #[arg(skip)]
     #[serde(default)]
     pub timeouts: Timeouts,
     #[arg(long, default_value = "owl-rs")]
     pub name: String,
-    /// User who owns the control socket, identity and received files (root daemons).
-    #[arg(long)]
-    pub owner: Option<String>,
     #[arg(long)]
     pub keys: Option<PathBuf>,
     #[arg(long)]
     pub output: Option<PathBuf>,
-    #[arg(long, default_value = "/run/owl_rs")]
+    #[arg(long, default_value_os_t = default_run_dir())]
     pub run_dir: PathBuf,
+    /// Privileged radio service socket; owld is configured separately.
+    #[arg(long, default_value = "/run/owld/control.sock")]
+    pub owl_socket: PathBuf,
     /// Skip Wi-Fi setup for local IPv6 loopback HTTPS testing.
     #[arg(long)]
     pub no_radio: bool,
@@ -68,17 +63,6 @@ pub struct Options {
     /// Limit the daemon lifetime or one outgoing operation in seconds.
     #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
     pub duration: Option<u64>,
-    #[arg(long)]
-    pub save: Option<String>,
-    /// Data rate: auto (fastest supported), legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi] (20/40/80 MHz).
-    #[arg(long, default_value = "auto")]
-    pub rate: Rate,
-    /// Experimental local master-election preference; peers decide whether to follow.
-    #[arg(long, default_value_t = 60)]
-    pub election_metric: u32,
-    /// Experimental advertised local election counter (fixed, not availability-window timing).
-    #[arg(long, default_value_t = 0)]
-    pub election_counter: u32,
 }
 impl Options {
     fn validate(&self) -> Result<()> {
@@ -94,27 +78,15 @@ impl Options {
         self.timeouts.validate()
     }
 }
-pub fn owner(name: Option<&str>) -> Result<(u32, u32, PathBuf)> {
-    if let Some(name) = name {
-        let user = nix::unistd::User::from_name(name)?.context("owner user not found")?;
-        ensure!(
-            nix::unistd::geteuid().is_root() || user.uid == nix::unistd::getuid(),
-            "only root can select another owner"
-        );
-        return Ok((user.uid.as_raw(), user.gid.as_raw(), user.dir));
-    }
-    let uid = if nix::unistd::geteuid().is_root() {
-        std::env::var("SUDO_UID")
-            .ok()
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or(0)
-    } else {
-        nix::unistd::getuid().as_raw()
-    };
-    let user =
-        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?.context("user not found")?;
-    Ok((uid, user.gid.as_raw(), user.dir))
+pub fn default_run_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())))
+        .join("owl_rs")
+}
+pub fn current_user() -> Result<(u32, PathBuf)> {
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("user not found")?;
+    Ok((user.uid.as_raw(), user.dir))
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
@@ -205,7 +177,7 @@ impl State {
                         continue;
                     }
                     if let Some(mac) = peer.get("mac").and_then(serde_json::Value::as_str)
-                        && let Ok(mac) = mac.parse::<Mac>()
+                        && let Ok(mac) = mac.parse::<owl_ipc::Mac>()
                         && mac.valid_unicast()
                         && !candidates
                             .iter()
@@ -369,7 +341,7 @@ pub async fn control_available(run_dir: &Path) -> Result<bool> {
         {
             Ok(false)
         }
-        Err(error) => Err(error).context("connect to owl_rs control socket"),
+        Err(error) => Err(error).context("connect to airdropd control socket"),
     }
 }
 pub async fn client(
@@ -379,7 +351,7 @@ pub async fn client(
 ) -> Result<serde_json::Value> {
     let mut socket = UnixStream::connect(run_dir.join("control.sock"))
         .await
-        .context("connect to owl_rs daemon (start `owl_rs daemon` first)")?;
+        .context("connect to airdropd (start `just daemon` first)")?;
     socket.write_all(&serde_json::to_vec(&command)?).await?;
     socket.write_all(b"\n").await?;
     if let Some(path) = archive {
@@ -418,7 +390,7 @@ async fn expires(deadline: Option<tokio::time::Instant>) {
 pub type Request = (Command, Option<tempfile::NamedTempFile>);
 async fn session(active: &Active) -> Result<()> {
     let opts = &active.opts;
-    let (uid, gid, home) = owner(opts.owner.as_deref())?;
+    let (_, home) = current_user()?;
     let keys = opts
         .keys
         .clone()
@@ -427,58 +399,31 @@ async fn session(active: &Active) -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| home.join("Downloads/AirDrop"));
-    let new_identity = !keys.join("key.pem").exists() && !keys.join("cert.pem").exists();
-    crate::identity::private_directory(
-        &keys,
-        if nix::unistd::geteuid().is_root() {
-            Some((uid, gid))
-        } else {
-            None
-        },
-    )?;
+    crate::identity::private_directory(&keys)?;
     let identity = Identity::load(&keys, &opts.name)?;
-    if new_identity && nix::unistd::geteuid().is_root() {
-        for entry in walkdir::WalkDir::new(&keys) {
-            nix::unistd::chown(
-                entry?.path(),
-                Some(nix::unistd::Uid::from_raw(uid)),
-                Some(nix::unistd::Gid::from_raw(gid)),
-            )?;
-        }
-    }
     ensure!(
         !active.cancel.is_cancelled(),
         "session cancelled before startup"
     );
-    let link_opts = crate::link::Options {
-        radio: opts.radio.clone(),
-        run_dir: opts.run_dir.clone(),
-        loopback: if opts.no_radio {
-            let std::net::IpAddr::V6(ip) = opts.listen.ip() else {
-                bail!("AirDrop requires an IPv6 listener")
-            };
-            Some(ip)
-        } else {
-            None
-        },
-        service_port: opts.listen.port(),
-        timeouts: opts.timeouts,
-        save: opts.save.clone(),
-        rate: opts.rate,
-        election_metric: opts.election_metric,
-        election_counter: opts.election_counter,
+    let mut link = if opts.no_radio {
+        let std::net::IpAddr::V6(ip) = opts.listen.ip() else {
+            bail!("AirDrop requires an IPv6 listener")
+        };
+        Link::loopback(ip)?
+    } else {
+        Link::start(
+            &opts.owl_socket,
+            opts.listen.port(),
+            opts.timeouts,
+            active.policy.clone(),
+            active.activity.traffic(),
+        )
+        .await?
     };
-    let mut link = Link::start(
-        &link_opts,
-        active.policy.clone(),
-        active.mac,
-        active.activity.traffic(),
-    )
-    .await?;
     let result = async {
         let receiver = Receiver::new(
             opts.name.clone(), identity.clone(), output, opts.max_bytes,
-            opts.auto_accept, nix::unistd::geteuid().is_root().then_some((uid, gid)),
+            opts.auto_accept,
         )
         .with_policy(active.policy.clone())
         .with_activity(active.activity.clone()).with_timeouts(opts.timeouts);
@@ -492,6 +437,7 @@ async fn session(active: &Active) -> Result<()> {
             receiver, sender, &link, active.policy.clone(), opts.listen.port(),
             bluetooth, opts.bluetooth_adapter.clone(),
         ).await?;
+        link.announce();
         let state = State {
             receiver: transport.receiver.clone(),
             sender: transport.sender.clone(),
@@ -539,7 +485,6 @@ enum Phase {
 }
 #[derive(Clone)]
 struct Active {
-    mac: Mac,
     id: String,
     opts: Options,
     cancel: CancellationToken,
@@ -602,7 +547,6 @@ impl Drop for Sending {
 }
 #[derive(Clone)]
 struct Daemon {
-    mac: Mac,
     opts: Options,
     cancel: CancellationToken,
     active: Arc<Mutex<Option<Active>>>,
@@ -623,7 +567,7 @@ fn merge_options(base: &mut serde_json::Value, overrides: &serde_json::Value) ->
         let slot = target
             .get_mut(key)
             .with_context(|| format!("unknown session option {key}"))?;
-        if key == "radio" || key == "timeouts" {
+        if key == "timeouts" {
             merge_options(slot, value)?;
         } else {
             *slot = value.clone();
@@ -725,8 +669,8 @@ impl Daemon {
             "session run-dir must match the control socket"
         );
         ensure!(
-            owner(opts.owner.as_deref())?.0 == owner(self.opts.owner.as_deref())?.0,
-            "session owner must match the daemon owner"
+            opts.owl_socket == self.opts.owl_socket,
+            "session owld socket must match the daemon"
         );
         opts.validate()?;
         Ok(opts)
@@ -829,7 +773,6 @@ impl Daemon {
             opts.duration = None;
             let timeouts = opts.timeouts;
             let active = Active {
-                mac: self.mac,
                 id: uuid::Uuid::new_v4().to_string(),
                 opts,
                 cancel: self.cancel.child_token(),
@@ -983,7 +926,9 @@ impl Daemon {
                         serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"awdl":{},"sending":[],"transfers":[]})
                     };
                     value["ble"] = serde_json::json!({"listening":listening});
-                    value["timeouts"] = serde_json::to_value(active.opts.timeouts)?;
+                    value["timeouts"] = serde_json::to_value(
+                        crate::timeouts::AirDropTimeouts::from(active.opts.timeouts),
+                    )?;
                     value["sending"] = serde_json::to_value(active.sending.borrow().clone())?;
                     let phase = match &*active.phase.borrow() {
                         Phase::Starting => "starting",
@@ -994,7 +939,7 @@ impl Daemon {
                     Ok(value)
                 } else {
                     Ok(
-                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"session":null,"awdl":{},"sending":[],"transfers":self.history.lock().await.clone(),"timeouts":self.opts.timeouts}),
+                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"session":null,"awdl":{},"sending":[],"transfers":self.history.lock().await.clone(),"timeouts":crate::timeouts::AirDropTimeouts::from(self.opts.timeouts)}),
                     )
                 }
             }
@@ -1096,8 +1041,18 @@ impl Daemon {
 }
 pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
     opts.validate()?;
-    let (uid, gid, home) = owner(opts.owner.as_deref())?;
+    ensure!(
+        !nix::unistd::geteuid().is_root(),
+        "airdropd must run as a regular user; start owld separately as root"
+    );
+    let (uid, home) = current_user()?;
     std::fs::create_dir_all(&opts.run_dir)?;
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(&opts.run_dir)?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0,
+        "AirDrop run directory must be owned by this user and not writable by others"
+    );
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1111,17 +1066,9 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    if nix::unistd::geteuid().is_root() {
-        nix::unistd::chown(
-            &socket_path,
-            Some(nix::unistd::Uid::from_raw(uid)),
-            Some(nix::unistd::Gid::from_raw(gid)),
-        )?;
-    }
     let cancel = CancellationToken::new();
     let (listening, ble) = watch::channel(false);
     let daemon = Daemon {
-        mac: Mac::random().context("generate daemon MAC")?,
         opts: opts.clone(),
         cancel: cancel.clone(),
         active: Arc::default(),
@@ -1193,6 +1140,7 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use owl_ipc::Mac;
     #[derive(Parser)]
     struct TestArgs {
         #[command(flatten)]
@@ -1215,7 +1163,6 @@ mod tests {
         opts.output = Some(temp.path().join("received"));
         let (_, ble) = watch::channel(false);
         let daemon = Daemon {
-            mac: Mac::random().unwrap(),
             opts,
             cancel: CancellationToken::new(),
             active: Arc::default(),
@@ -1316,8 +1263,6 @@ mod tests {
                 .id,
             active.id
         );
-        assert_eq!(active.mac, daemon.mac);
-        assert_eq!(daemon.mac.0[0] & 3, 2);
         let bad = temp.path().join("invalid-contacts");
         std::fs::write(&bad, [255]).unwrap();
         assert!(
@@ -1330,7 +1275,7 @@ mod tests {
         assert_eq!(state.receiver.visibility(), Visibility::Everyone);
         assert!(
             daemon
-                .activate(&serde_json::json!({"radio":{"channel":44}}), None, true)
+                .activate(&serde_json::json!({"name":"different"}), None, true)
                 .await
                 .is_err()
         );
@@ -1362,7 +1307,6 @@ mod tests {
             temp.path().join("remote-received"),
             1024 * 1024,
             false,
-            None,
         );
         let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
         let remote_address = match listener.local_addr().unwrap() {
@@ -1487,7 +1431,6 @@ mod tests {
             .unwrap();
         next.ready().await.unwrap();
         assert_ne!(active.id, next.id);
-        assert_eq!(active.mac, next.mac);
         daemon.visibility.set(Visibility::Off, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), next.stopped())
             .await

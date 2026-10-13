@@ -143,7 +143,7 @@ pub struct Control {
     pub cancel: tokio_util::sync::CancellationToken,
     pub ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub snapshot: watch::Sender<serde_json::Value>,
-    pub(crate) policy: watch::Receiver<crate::visibility::Policy>,
+    pub(crate) policy: watch::Receiver<bool>,
     pub(crate) traffic: watch::Receiver<usize>,
 }
 pub async fn controlled(config: Config, opts: Options, control: Control) -> Result<()> {
@@ -261,6 +261,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     let mut queue = tx::Queue::default();
     let mut psf_at = 110 * 1024;
     let mut mif_at = 0;
+    let mut keepalive_at = 0;
     let mut last_tcp = None;
     let mut draining = None;
     let mut last_traffic = 0;
@@ -406,7 +407,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     let on_channel = desired != 0 && applied_definition.is_some_and(|d| d.channel == desired);
                     if on_channel {
                         if let Some(control) = &control {
-                            engine.config.airdrop_port = control.policy.borrow().mode.enabled().then_some(advertised_port).flatten();
+                            engine.config.airdrop_port = (*control.policy.borrow()).then_some(advertised_port).flatten();
                         }
                         if now >= mif_at {
                             if !inject(stream.capture_mut(), &engine.action_frame_on_channel(3, now, desired))? { continue; }
@@ -420,6 +421,20 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             if !inject(stream.capture_mut(), &engine.action_frame_on_channel(0, now, desired))? { continue; }
                             engine.stats.tx_action += 1;
                             psf_at = now + 110 * 1024;
+                        }
+                        // Neighbor-learning probes belong to the link, not mDNS.
+                        if draining.is_none() && now >= keepalive_at {
+                            for peer in engine.peers.values().filter(|peer| peer.valid) {
+                                if queue.len() == tx::QUEUE_LIMIT { break; }
+                                let own = engine.config.mac;
+                                let builder = etherparse::PacketBuilder::ethernet2(own.0, peer.mac.0)
+                                    .ipv6(own.ipv6().octets(), peer.mac.ipv6().octets(), 255)
+                                    .icmpv6_echo_request(0x4157, 0);
+                                let mut packet = Vec::new();
+                                builder.write(&mut packet, b"owl_rs")?;
+                                queue.push(packet, now);
+                            }
+                            keepalive_at = now + 3_000_000;
                         }
                         let report = queue.flush(
                             &mut engine, desired, monitor_limit,

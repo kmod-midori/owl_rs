@@ -7,7 +7,6 @@ use crate::{
     radio::{Mode, Radio, RadioArgs},
     rate::Rate,
     runtime,
-    visibility::Policy,
 };
 use anyhow::{Context, Result, ensure};
 use std::{net::Ipv6Addr, path::PathBuf, time::Duration};
@@ -41,7 +40,7 @@ impl Link {
     }
     pub async fn start(
         opts: &Options,
-        policy: watch::Receiver<Policy>,
+        policy: watch::Receiver<bool>,
         mac: Mac,
         traffic: watch::Receiver<usize>,
     ) -> Result<Self> {
@@ -88,7 +87,7 @@ impl Link {
         &mut self,
         opts: &Options,
         tx: watch::Sender<serde_json::Value>,
-        policy: watch::Receiver<Policy>,
+        policy: watch::Receiver<bool>,
         traffic: watch::Receiver<usize>,
     ) -> Result<()> {
         let net = crate::netlink::Netlink::with_timeout(opts.timeouts.netlink)?;

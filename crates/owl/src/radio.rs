@@ -194,7 +194,7 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
         .into_owned();
     let table = match &args.profiles {
         Some(p) => std::fs::read_to_string(p)?,
-        None => include_str!("../profiles.toml").into(),
+        None => include_str!("../../../profiles.toml").into(),
     };
     let mut profile = Profile::parse(&table, &driver)?;
     if let Some(mode) = args.mode {
@@ -522,6 +522,23 @@ impl Radio {
                     &["device", "set", &station, "managed", "no"],
                 )
                 .await?;
+                // The property update can precede NetworkManager's device
+                // transition, which may still bring the station down.
+                tokio::time::timeout(self.state.timeouts.network_manager, async {
+                    loop {
+                        let state = nmcli(
+                            self.state.timeouts.network_manager,
+                            &["-g", "GENERAL.STATE", "device", "show", &station],
+                        )
+                        .await?;
+                        if state.split_whitespace().next() == Some("10") {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .context("NetworkManager did not release the Wi-Fi interface")??;
             }
             // No disassociate command is issued for an offline station.
             self.net.set_up(&station, false).await?;
@@ -529,22 +546,20 @@ impl Radio {
                 self.net.set_type(&station, IfType::Monitor).await?;
                 self.net.set_mac(&station, self.mac).await?;
                 self.net.set_up(&station, true).await?;
-                self.create(false, true).await?;
+                // Establish the discovery context before the active monitor
+                // joins it; its initial context must not conflict with tuning.
                 let mut tuned = Err(anyhow::anyhow!("no allowed AWDL channel"));
                 for &c in channels {
-                    tuned = self
-                        .net
-                        .tune(&self.state.monitor, c, 20)
-                        .await
-                        .map(|definition| {
-                            self.operating_channel = Some(definition);
-                        });
+                    tuned = self.net.tune(&station, c, 20).await.map(|definition| {
+                        self.operating_channel = Some(definition);
+                    });
                     if tuned.is_ok() {
                         self.channel = c;
                         break;
                     }
                 }
-                tuned.context("failed to tune active monitor to an allowed AWDL channel")?;
+                tuned.context("failed to prepare an allowed AWDL monitor channel")?;
+                self.create(false, true).await?;
             } else {
                 self.create(true, false).await?;
                 let mut chosen = None;

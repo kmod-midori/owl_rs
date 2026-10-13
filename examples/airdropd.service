@@ -1,0 +1,14 @@
+[Unit]
+Description=User AirDrop service
+
+[Service]
+Type=simple
+# Run with systemctl --user; replace the build path. owld is a separate system service.
+ExecStart=/path/to/owl_rs/target/release/airdropd
+ExecStop=/path/to/owl_rs/target/release/catdrop stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target

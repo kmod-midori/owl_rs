@@ -45,10 +45,10 @@ pub(crate) struct Verifier {
 impl Verifier {
     pub(crate) fn apple() -> Result<Self> {
         Self::new(
-            X509::from_pem(include_bytes!("../assets/apple_root_ca.pem"))?,
+            X509::from_pem(include_bytes!("../../../assets/apple_root_ca.pem"))?,
             vec![
-                X509::from_pem(include_bytes!("../assets/apple-ca/apple-aai-ca.pem"))?,
-                X509::from_pem(include_bytes!("../assets/apple-ca/apple-aai2-ca.pem"))?,
+                X509::from_pem(include_bytes!("../../../assets/apple-ca/apple-aai-ca.pem"))?,
+                X509::from_pem(include_bytes!("../../../assets/apple-ca/apple-aai2-ca.pem"))?,
             ],
         )
     }
@@ -690,7 +690,7 @@ mod tests {
             policy.decide(Some(&fx.record("stranger@example.com", false)), None),
             Err(Denied::Unknown)
         );
-        crate::contact_book::Book::new(path.clone(), None)
+        crate::contact_book::Book::new(path.clone())
             .remove(&["FRIEND@example.com".into(), "+1-555-010-1234".into()])
             .unwrap();
         assert_eq!(
@@ -781,7 +781,6 @@ mod tests {
             dir.path().join("output"),
             1024,
             true,
-            None,
         )
         .with_policy({
             let (tx, rx) = tokio::sync::watch::channel(crate::visibility::Policy {
@@ -875,7 +874,7 @@ mod tests {
             hyper::StatusCode::OK
         );
         // Revocation applies to the next Ask, even on the same TLS connection.
-        crate::contact_book::Book::new(path, None)
+        crate::contact_book::Book::new(path)
             .remove(&["FRIEND@example.com".into()])
             .unwrap();
         assert_eq!(

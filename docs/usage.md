@@ -1,8 +1,12 @@
-# Using owl_rs
+# Using catdrop and the daemons
 
 [README](../README.md) · [Radio configuration](radio.md) · [Development](development.md)
 
 ## Transfers
+
+Start `just owld` in a dedicated terminal first. This is the privileged radio
+service; it stays idle until a user session acquires the link. All following
+AirDrop commands run as your regular user.
 
 Keep the phone unlocked with AirDrop set to Everyone for 10 Minutes. To send:
 
@@ -40,7 +44,7 @@ just accept TRANSFER_ID
 just reject TRANSFER_ID
 ```
 
-Run `daemon --auto-accept` to approve offers automatically after the receiving
+Run `airdropd --auto-accept` to approve offers automatically after the receiving
 policy passes. There is no separate `receive` command or receive visibility flag.
 
 ## Runtime discoverability
@@ -90,8 +94,8 @@ An invalid argument rejects the entire batch before any list change.
 The default file is `~/.config/owl_rs/known-senders`, also used by the receiver.
 Use `contact --contacts-file /path/to/known-senders add|list|remove` for a custom
 list, and select it with
-`discoverable contacts --contacts-file /path/to/known-senders`. Under sudo, the
-default belongs to the invoking user; `--owner USER` selects another user when running as root.
+`discoverable contacts --contacts-file /path/to/known-senders`. The
+default belongs to the current user. Run contact commands without sudo.
 These commands do not start the daemon or touch Wi-Fi.
 
 You can also edit the file with one identifier per line. Blank lines and lines
@@ -116,7 +120,7 @@ Unreadable or invalid lists fail closed. List changes apply to the next offer,
 including on an existing connection; an already approved upload keeps its
 connection-bound authorization.
 
-`daemon --auto-accept` skips manual approval only after these checks pass.
+`airdropd --auto-accept` skips manual approval only after these checks pass.
 Discovery hiding is best-effort: a verifiable non-contact is not given receiver
 metadata, but a device without a verifiable record can still see the receiver.
 It cannot transfer without passing the separate certificate-bound offer check.
@@ -133,9 +137,10 @@ daemon exposes its control socket and scans BLE when receiving is enabled;
 Wi-Fi and HTTPS remain inactive. BLE wake-up and CLI sends activate or reuse
 one bidirectional session.
 
-Radio setup and the AWDL link are separate from the AirDrop transport. The link
-owns capture, TAP addressing and WLAN restoration; the transport owns HTTPS,
-mDNS and receiver BLE advertising. Sending and receiving share these resources.
+`owld` owns capture, scheduling, TAP addressing and WLAN restoration. The
+user-owned `airdropd` owns HTTPS, UDP mDNS, identities, contact policy and BLE.
+It acquires a connection-owned link lease through authenticated Unix IPC.
+Sending and receiving share these resources.
 Each send, peer browse and active incoming request holds the session alive.
 Idle discovery connections do not delay cleanup.
 Canceling a CLI send releases only that operation; `cancel SESSION_ID` stops
@@ -157,13 +162,14 @@ service waits for cleanup and exits; an independent daemon returns to idle.
 
 Omitted send flags inherit the active session's settings, or daemon defaults
 when idle. Explicit settings must match an existing session; cancel that session
-before changing its radio, identity or transport configuration. `send --duration SECONDS` limits that operation, while `daemon --duration SECONDS` limits the
+before changing its identity or transport configuration. Radio settings are
+configured separately when starting `owld`. `send --duration SECONDS` limits that operation, while `airdropd --duration SECONDS` limits the
 control service's lifetime.
 
 ```sh
 just status
 just peers
-target/release/owl_rs cancel SESSION_ID
+target/release/catdrop cancel SESSION_ID
 just stop
 ```
 
@@ -176,10 +182,13 @@ CLI send cancels that operation; other transfers can keep the shared session act
 
 Timeouts are command-line options; no timeout configuration file is used.
 Set daemon defaults at startup, or override them when `send` starts a session.
-Radio options also apply to `probe`, `recover` and `awdl`. An existing active
+Configure radio timeouts on `owld`; they also apply to its `probe`, `recover`
+and `awdl` subcommands. AirDrop and link-client timeouts belong to `airdropd`
+or standalone `catdrop send`. An existing active
 session retains its settings: explicit conflicting overrides are rejected.
 Control-only commands use the running daemon's settings; they cannot change
-these flags. `status.timeouts` shows effective values in seconds.
+these flags. `status.timeouts` shows effective user-session values in seconds;
+active `status.awdl.timeouts` reports radio service deadlines.
 
 ```sh
 just daemon --ble-idle-timeout 180 --completion-grace 5 \
@@ -203,6 +212,8 @@ are protocol parameters, rather than application timeout options.
 | `--capture-read-timeout` | 0.001 | Packet capture read timeout (minimum resolution: one millisecond). |
 | `--peer-idle-timeout` | 5 | AWDL neighbor inactivity deadline. |
 | `--queued-packet-timeout` | 2 | Queued AWDL packet and early SYN expiry; quiet tail before returning to discovery. |
+| `--link-startup-timeout` | 120 | User-side wait for owld link readiness. |
+| `--link-shutdown-timeout` | 180 | User-side wait for owld restoration. |
 | `--discovery-cache-timeout` | 120 | Local mDNS cache lifetime cap. |
 | `--discovery-fallback-timeout` | 2 | Transient AWDL fallback discovery candidate lifetime. |
 | `--ble-idle-timeout` | 120 | Idle session lifetime after an eligible BLE wake. |
@@ -219,7 +230,7 @@ are protocol parameters, rather than application timeout options.
 | `--connection-drain-timeout` | 5 | Successful HTTP/TLS close deadline. |
 | `--rejection-drain-timeout` | 2 | Refusal response close deadline. |
 | `--tcp-linger-timeout` | 10 | Successful final TCP acknowledgment drain bound. |
-| `--control-request-timeout` | 10 | Control socket request header deadline. |
+| `--control-request-timeout` | 10 | User control request deadline; on owld, link request/heartbeat deadline. |
 | `--control-archive-timeout` | 600 | Control socket archive receive deadline. |
 | `--transport-shutdown-timeout` | 2 | Transport task shutdown deadline. |
 | `--name-probe-timeout` | 8 | Per-peer HTTPS name resolution deadline. |
@@ -235,26 +246,38 @@ are protocol parameters, rather than application timeout options.
 | `--ble-retry-interval` | 30 | BLE scan/advertisement retry interval. |
 | `--ble-power-restore-timeout` | 5 | BLE adapter power restoration deadline. |
 
+Radio flags (`retry-cache`, `capture-read`, `peer-idle`, `queued-packet`,
+`netlink`, `network-manager`, `reconnect`, `ibss-ready`, `ibss-tune`,
+`radio-startup`, `address-ready`, `radio-drain`, `radio-quiet`) are accepted only
+by `owld`. The other timeout flags are accepted by `airdropd`/`catdrop send`;
+`control-request-timeout` configures the corresponding IPC endpoint in each.
+
 ## Paths and ownership
 
 | Data | Default | Override |
 | --- | --- | --- |
 | Identity | `~/.local/share/owl_rs/identity` | `--keys DIR` |
 | Received transfers | `~/Downloads/AirDrop/airdrop-TRANSFER_ID/` | `--output DIR` |
-| Control socket and recovery journal | `/run/owl_rs` | `--run-dir DIR` |
+| User control socket | `$XDG_RUNTIME_DIR/owl_rs/control.sock` | `--run-dir DIR` |
+| Radio socket and recovery journal | `/run/owld/` | `owld --run-dir DIR` |
+| Radio socket used by AirDrop | `/run/owld/control.sock` | `airdropd`/`send --owl-socket PATH` |
 
-Under sudo, ownership and home-directory defaults use the invoking user. Root
-services can select `--owner USER`. The private control socket accepts only its
-owner or root. Send clients build archives themselves; the privileged daemon
-does not open source paths supplied through IPC.
+Run `airdropd` and `catdrop` as the account that owns identities, contacts and
+received files. The user daemon rejects root execution. `owld --user USER`
+authorizes that account; under sudo it defaults to the invoking user.
+The user control socket accepts its owner or root; the radio socket accepts only
+the configured UID, and the AirDrop client verifies that owld runs as root.
+The root service never receives identity/contact/output/source file paths.
+If XDG_RUNTIME_DIR is unset, the user control directory defaults to
+`/run/user/UID/owl_rs`.
 
 Every command addressing a custom control directory needs the same `--run-dir`:
 
 ```sh
-just daemon --run-dir /run/owl_rs-example
-just discoverable everyone --run-dir /run/owl_rs-example
-just status --run-dir /run/owl_rs-example
-just stop --run-dir /run/owl_rs-example
+just daemon --run-dir "$XDG_RUNTIME_DIR/owl_rs-example"
+just discoverable everyone --run-dir "$XDG_RUNTIME_DIR/owl_rs-example"
+just status --run-dir "$XDG_RUNTIME_DIR/owl_rs-example"
+just stop --run-dir "$XDG_RUNTIME_DIR/owl_rs-example"
 ```
 
 A stale socket left by a killed daemon is replaced under the daemon lock when
@@ -263,7 +286,8 @@ a standalone transfer starts. Interrupted radio state can require
 
 ## Other options
 
-Use `target/release/owl_rs send --help` or `daemon --help` for the full CLI.
+Use `target/release/catdrop --help`, `airdropd --help` and `owld --help`
+for their respective command-line options.
 
 - `--max-bytes N` limits transfer size.
 - `--no-bluetooth` disables BLE scanning and wake-up advertising; `--bluetooth-adapter hci0`
@@ -271,7 +295,7 @@ Use `target/release/owl_rs send --help` or `daemon --help` for the full CLI.
 - `--direct '[fe80::200:ff:fe00:1%3]:8770'` bypasses receiver-name discovery;
   substitute the receiver's address, interface scope and port.
 - `--interface`, `--profiles`, `--backend`, `--channel` and `--discovery-channel`
-  are covered in [Radio configuration](radio.md).
+  belong to `owld` and are covered in [Radio configuration](radio.md).
 
 The identity directory contains a generated RSA private key and self-signed
 certificate (`key.pem` and `cert.pem`). An optional `validation_record.cms` must

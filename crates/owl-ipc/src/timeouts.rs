@@ -32,15 +32,13 @@ mod duration {
 }
 macro_rules! deadlines {
     ($($field:ident, $flag:literal, $default:literal, $help:literal;)+) => {
-        #[derive(Clone, Copy, Debug, Args, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct Timeouts {
             /// Quiet time after the final successful transfer and TCP drain.
-            #[arg(long, global = true, help_heading="Timeouts (seconds)", default_value="5", value_name="SECONDS", value_parser=seconds)]
             #[serde(with="duration")]
             pub completion_grace: Duration,
             $(#[doc=$help]
-            #[arg(long=$flag, global=true, help_heading="Timeouts (seconds)", default_value=$default, value_name="SECONDS", value_parser=positive)]
             #[serde(with="duration")]
             pub $field: Duration,)+
         }
@@ -49,8 +47,9 @@ macro_rules! deadlines {
         }
         impl Timeouts {
             pub fn explicit(matches: &clap::ArgMatches) -> bool {
-                matches.value_source("completion_grace") == Some(clap::parser::ValueSource::CommandLine)
-                    $(|| matches.value_source(stringify!($field)) == Some(clap::parser::ValueSource::CommandLine))+
+                let explicit = |id| matches.try_contains_id(id).unwrap_or(false)
+                    && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+                explicit("completion_grace") $(|| explicit(stringify!($field)))+
             }
             pub fn validate(&self) -> anyhow::Result<()> {
                 $(anyhow::ensure!(!self.$field.is_zero() && self.$field <= Duration::from_secs(86400), concat!("invalid ", $flag));)+
@@ -67,6 +66,8 @@ deadlines! {
     capture_read, "capture-read-timeout", "0.001", "Packet capture read timeout (minimum resolution: one millisecond).";
     peer_idle, "peer-idle-timeout", "5", "AWDL neighbor inactivity deadline.";
     queued_packet, "queued-packet-timeout", "2", "Queued AWDL packet expiry.";
+    link_startup, "link-startup-timeout", "120", "Wait for owld to prepare a link.";
+    link_shutdown, "link-shutdown-timeout", "180", "Wait for owld to drain and restore a link.";
     discovery_cache, "discovery-cache-timeout", "120", "Local mDNS cache lifetime cap.";
     discovery_fallback, "discovery-fallback-timeout", "2", "Transient AWDL fallback discovery candidate lifetime.";
     ble_idle, "ble-idle-timeout", "120", "Idle session lifetime after an eligible BLE wake.";
@@ -99,3 +100,65 @@ deadlines! {
     ble_retry, "ble-retry-interval", "30", "BLE scan/advertisement retry interval.";
     ble_power_restore, "ble-power-restore-timeout", "5", "BLE adapter power restoration deadline.";
 }
+
+macro_rules! cli_deadlines {
+    ($name:ident { $($field:ident, $flag:literal, $default:literal, $parser:ident, $help:literal;)+ }) => {
+        #[derive(Clone, Copy, Debug, Args, Serialize)]
+        pub struct $name {
+            $(#[doc=$help]
+            #[arg(long=$flag, global=true, help_heading="Timeouts (seconds)", default_value=$default,
+                value_name="SECONDS", value_parser=$parser)]
+            #[serde(with="duration")]
+            pub $field: Duration,)+
+        }
+        impl From<Timeouts> for $name {
+            fn from(timeouts:Timeouts)->Self { Self { $($field:timeouts.$field,)+ } }
+        }
+        impl From<$name> for Timeouts {
+            fn from(args:$name)->Self { Self { $($field:args.$field,)+ ..Self::default() } }
+        }
+    }
+}
+cli_deadlines! { RadioTimeouts {
+    retry_cache, "retry-cache-timeout", "0.5", positive, "802.11 retry duplicate-cache lifetime.";
+    capture_read, "capture-read-timeout", "0.001", positive, "Packet capture read timeout (minimum resolution: one millisecond).";
+    peer_idle, "peer-idle-timeout", "5", positive, "AWDL neighbor inactivity deadline.";
+    queued_packet, "queued-packet-timeout", "2", positive, "Queued AWDL packet expiry.";
+    control_request, "control-request-timeout", "10", positive, "Control socket request header deadline.";
+    netlink, "netlink-timeout", "5", positive, "Kernel netlink request deadline.";
+    network_manager, "network-manager-timeout", "15", positive, "NetworkManager setup and restoration command deadline.";
+    reconnect, "reconnect-timeout", "10", positive, "NetworkManager saved-AP reconnection wait.";
+    ibss_ready, "ibss-ready-timeout", "10", positive, "Ad-hoc cell readiness deadline.";
+    ibss_tune, "ibss-tune-timeout", "15", positive, "Ad-hoc channel retuning deadline.";
+    radio_startup, "radio-startup-timeout", "15", positive, "AWDL runtime startup deadline.";
+    address_ready, "address-ready-timeout", "5", positive, "AWDL IPv6 address readiness deadline.";
+    radio_drain, "radio-drain-timeout", "2", positive, "AWDL transmit queue shutdown deadline.";
+    radio_quiet, "radio-quiet-period", "0.1", positive, "Quiet period before ending AWDL queue drain.";
+} }
+cli_deadlines! { AirDropTimeouts {
+    completion_grace, "completion-grace", "5", seconds, "Quiet time after the final transfer and TCP drain.";
+    link_startup, "link-startup-timeout", "120", positive, "Wait for owld to prepare a link.";
+    link_shutdown, "link-shutdown-timeout", "180", positive, "Wait for owld to drain and restore a link.";
+    discovery_cache, "discovery-cache-timeout", "120", positive, "Local mDNS cache lifetime cap.";
+    discovery_fallback, "discovery-fallback-timeout", "2", positive, "Transient AWDL fallback discovery candidate lifetime.";
+    ble_idle, "ble-idle-timeout", "120", positive, "Idle session lifetime after an eligible BLE wake.";
+    tcp_connect, "tcp-connect-timeout", "15", positive, "Outgoing TCP connection deadline.";
+    tls_handshake, "tls-handshake-timeout", "10", positive, "Incoming TLS handshake deadline.";
+    tls_connect, "tls-connect-timeout", "15", positive, "Outgoing TLS handshake deadline.";
+    http_headers, "http-header-timeout", "20", positive, "Incoming HTTP header deadline.";
+    http_request, "http-request-timeout", "15", positive, "Outgoing Discover response deadline.";
+    metadata_idle, "metadata-timeout", "20", positive, "Plist/response body stall deadline.";
+    approval, "approval-timeout", "60", positive, "Incoming manual approval and outgoing Ask deadline.";
+    upload_idle, "upload-idle-timeout", "20", positive, "Incoming upload stall deadline.";
+    upload_total, "upload-timeout", "600", positive, "Incoming and outgoing upload deadline.";
+    upload_check, "upload-check-interval", "2", positive, "Quiet interval before checking for a complete archive without an HTTP terminator.";
+    connection_drain, "connection-drain-timeout", "5", positive, "Successful HTTP/TLS close deadline.";
+    rejection_drain, "rejection-drain-timeout", "2", positive, "Refusal response close deadline.";
+    tcp_linger, "tcp-linger-timeout", "10", positive, "Successful final TCP acknowledgment drain bound.";
+    control_request, "control-request-timeout", "10", positive, "Control socket request header deadline.";
+    control_archive, "control-archive-timeout", "600", positive, "Control socket archive receive deadline.";
+    transport_shutdown, "transport-shutdown-timeout", "2", positive, "Transport task shutdown deadline.";
+    name_probe, "name-probe-timeout", "8", positive, "Per-peer HTTPS name resolution deadline.";
+    ble_retry, "ble-retry-interval", "30", positive, "BLE scan/advertisement retry interval.";
+    ble_power_restore, "ble-power-restore-timeout", "5", positive, "BLE adapter power restoration deadline.";
+} }

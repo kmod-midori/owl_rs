@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use owl_rs::{
+use airdrop::{
     archive,
     identity::Identity,
     transfer::{Receiver, Sender},
@@ -113,7 +113,6 @@ async fn native_https_transfer_and_connection_bound_upload() {
         dir.path().join("received"),
         16 * 1024 * 1024,
         true,
-        None,
     );
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let std::net::SocketAddr::V6(address) = listener.local_addr().unwrap() else {
@@ -130,7 +129,7 @@ async fn native_https_transfer_and_connection_bound_upload() {
         id: "020000000001".into(),
         identity: identity.clone(),
         tag: None,
-        timeouts: owl_rs::timeouts::Timeouts {
+        timeouts: airdrop::timeouts::Timeouts {
             approval: Duration::from_secs(2),
             ..Default::default()
         },
@@ -229,7 +228,6 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         dir.path().join("received"),
         1024 * 1024,
         true,
-        None,
     );
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -257,11 +255,11 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
     std::fs::write(&path, &payload).unwrap();
     let prepared = archive::prepare(&[path], 1024 * 1024).unwrap();
     let id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    let offer = owl_rs::transfer::dict([
+    let offer = airdrop::transfer::dict([
         ("TransferID".into(), id.clone().into()),
         (
             "Files".into(),
-            plist::Value::Array(vec![owl_rs::transfer::dict([
+            plist::Value::Array(vec![airdrop::transfer::dict([
                 ("FileName".into(), "photo.txt".into()),
                 (
                     "FileSize".into(),
@@ -270,7 +268,7 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
             ])]),
         ),
     ]);
-    let metadata = owl_rs::transfer::plist_bytes(&offer).unwrap();
+    let metadata = airdrop::transfer::plist_bytes(&offer).unwrap();
     stream
         .write_all(
             format!(

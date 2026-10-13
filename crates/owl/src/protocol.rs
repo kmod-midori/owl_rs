@@ -3,8 +3,7 @@ use crate::{
     channel::Sequence,
     rate::{Rate, vht_width_code},
 };
-use serde::{Serialize, Serializer};
-use std::{fmt, net::Ipv6Addr, str::FromStr};
+use serde::Serialize;
 
 pub const BSSID: Mac = Mac([0, 0x25, 0, 0xff, 0x94, 0x73]);
 pub const BROADCAST: Mac = Mac([255; 6]);
@@ -21,74 +20,7 @@ pub(crate) fn tcp_frame(ethernet: &[u8]) -> bool {
     )
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Mac(pub [u8; 6]);
-impl fmt::Display for Mac {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
-        )
-    }
-}
-impl Serialize for Mac {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-impl<'de> serde::Deserialize<'de> for Mac {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        <String as serde::Deserialize>::deserialize(d)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-impl FromStr for Mac {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Error> {
-        let mut bytes = [0; 6];
-        let mut parts = s.split(':');
-        for b in &mut bytes {
-            let p = parts.next().ok_or(Error::Invalid("MAC address"))?;
-            if p.len() != 2 {
-                return Err(Error::Invalid("MAC address"));
-            }
-            *b = u8::from_str_radix(p, 16).map_err(|_| Error::Invalid("MAC address"))?;
-        }
-        if parts.next().is_some() {
-            return Err(Error::Invalid("MAC address"));
-        }
-        Ok(Self(bytes))
-    }
-}
-impl Mac {
-    pub fn random() -> Result<Self, openssl::error::ErrorStack> {
-        let mut bytes = [0; 6];
-        openssl::rand::rand_bytes(&mut bytes)?;
-        bytes[0] = (bytes[0] | 2) & !1;
-        Ok(Self(bytes))
-    }
-    pub fn multicast(self) -> bool {
-        self.0[0] & 1 != 0
-    }
-    pub fn valid_unicast(self) -> bool {
-        !self.multicast() && self.0 != [0; 6]
-    }
-    pub fn ipv6(self) -> Ipv6Addr {
-        let b = self.0;
-        Ipv6Addr::new(
-            0xfe80,
-            0,
-            0,
-            0,
-            u16::from_be_bytes([b[0] ^ 2, b[1]]),
-            u16::from_be_bytes([b[2], 255]),
-            u16::from_be_bytes([254, b[3]]),
-            u16::from_be_bytes([b[4], b[5]]),
-        )
-    }
-}
+pub use owl_ipc::Mac;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("truncated frame or TLV")]

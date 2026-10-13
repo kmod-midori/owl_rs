@@ -168,7 +168,6 @@ pub struct Receiver {
     pub output: PathBuf,
     pub limit: u64,
     pub auto_accept: bool,
-    pub owner: Option<(u32, u32)>,
     entries: Arc<Mutex<BTreeMap<String, Entry>>>,
     upload: Arc<Semaphore>,
     activity: Option<Arc<crate::session::Activity>>,
@@ -182,7 +181,6 @@ impl Receiver {
         output: PathBuf,
         limit: u64,
         auto_accept: bool,
-        owner: Option<(u32, u32)>,
     ) -> Self {
         Self {
             name,
@@ -190,7 +188,6 @@ impl Receiver {
             output,
             limit,
             auto_accept,
-            owner,
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             upload: Arc::new(Semaphore::new(4)),
             activity: None,
@@ -647,7 +644,7 @@ impl Receiver {
         }
     }
     fn save_urls(&self, offer: &Offer) -> Result<PathBuf> {
-        crate::identity::private_directory(&self.output, self.owner)?;
+        crate::identity::private_directory(&self.output)?;
         let stage = tempfile::tempdir_in(&self.output)?;
         for (n, url) in offer.urls.iter().enumerate() {
             std::fs::write(
@@ -657,22 +654,8 @@ impl Receiver {
         }
         let out = self.output.join(format!("airdrop-{}", offer.id));
         ensure!(!out.exists(), "output exists");
-        self.ownership(stage.path())?;
         std::fs::rename(stage.path(), &out)?;
         Ok(out)
-    }
-    fn ownership(&self, path: &std::path::Path) -> Result<()> {
-        if let Some((uid, gid)) = self.owner {
-            for entry in walkdir::WalkDir::new(path) {
-                let entry = entry?;
-                nix::unistd::chown(
-                    entry.path(),
-                    Some(nix::unistd::Uid::from_raw(uid)),
-                    Some(nix::unistd::Gid::from_raw(gid)),
-                )?;
-            }
-        }
-        Ok(())
     }
     async fn upload(&self, req: Request<Incoming>, offer: &Offer) -> Result<(u64, PathBuf, bool)> {
         let id = req
@@ -698,7 +681,7 @@ impl Receiver {
             .clone()
             .try_acquire_owned()
             .context("too many concurrent uploads")?;
-        crate::identity::private_directory(&self.output, self.owner)?;
+        crate::identity::private_directory(&self.output)?;
         let disk = nix::sys::statvfs::statvfs(&self.output)?;
         // Four uploads may hold wire, decoded CPIO and extracted data at once.
         let budget = self
@@ -743,7 +726,6 @@ impl Receiver {
                         })
                         .await?;
                         if let Ok(out) = check {
-                            self.ownership(&out)?;
                             tracing::info!(id=%offer.id,bytes,"validated complete archive before HTTP terminator");
                             return Ok((bytes, out, true));
                         }
@@ -760,11 +742,9 @@ impl Receiver {
         let output = self.output.clone();
         let id = offer.id.clone();
         let limit = budget;
-        let receiver = self.clone();
         let expected = offer.items.clone();
         let out = tokio::task::spawn_blocking(move || {
             let out = archive::extract_checked(file.path(), &output, &id, limit, &expected)?;
-            receiver.ownership(&out)?;
             Ok::<_, anyhow::Error>(out)
         })
         .await??;
@@ -808,10 +788,9 @@ impl Sender {
             let name = interface.file_name();
             use std::os::unix::ffi::OsStrExt;
             socket2::SockRef::from(&socket).bind_device(Some(name.as_bytes()))?;
-            let mac: crate::protocol::Mac =
-                std::fs::read_to_string(interface.path().join("address"))?
-                    .trim()
-                    .parse()?;
+            let mac: owl_ipc::Mac = std::fs::read_to_string(interface.path().join("address"))?
+                .trim()
+                .parse()?;
             socket.bind(SocketAddrV6::new(mac.ipv6(), 0, 0, address.scope_id()).into())?;
         }
         let tcp = tokio::time::timeout(self.timeouts.tcp_connect, socket.connect(address.into()))
@@ -1065,7 +1044,6 @@ mod tests {
             dir.path().join("output"),
             1024,
             false,
-            None,
         );
         let older = uuid::Uuid::new_v4().to_string().to_uppercase();
         let newer = uuid::Uuid::new_v4().to_string().to_uppercase();

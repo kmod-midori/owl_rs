@@ -5,6 +5,10 @@ use radiotap::field::ext::{Bandwidth, GuardInterval, ht_rate, vht_rate};
 use serde::{Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
+// Injection policy: MCS9 stalled transfers despite advertised support.
+// Keep the hardware capability maps intact for advertisement and reception.
+const MAX_TX_VHT_MCS: u8 = 8;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rate {
     #[default]
@@ -153,7 +157,7 @@ impl Rate {
     ) -> Self {
         if self == Self::Auto {
             let vht = Self::Vht {
-                index: 9,
+                index: MAX_TX_VHT_MCS,
                 nss: 8,
                 width: 80,
                 sgi: true,
@@ -209,6 +213,7 @@ impl Rate {
         };
         let rates = (1..=nss).filter_map(|streams| {
             let limit = index
+                .min(MAX_TX_VHT_MCS)
                 .min(max_mcs(tx.tx_mcs_map, streams)?)
                 .min(max_mcs(rx.rx_mcs_map, streams)?);
             (0..=limit)

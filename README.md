@@ -1,15 +1,15 @@
 # owl_rs
 
-A Linux AirDrop CLI and daemon with a safe Rust AWDL implementation. Send and
+A Linux AirDrop workspace with a safe Rust AWDL implementation. Send and
 receive files, folders and links. Receive from everyone or verified contacts;
 sending to Contacts Only recipients is not implemented.
 
 ## Build
 
 Requires Rust 1.88+, Cargo, `just`, and libpcap, OpenSSL and D-Bus development
-libraries. Live transfers require `/dev/net/tun`, root and a supported Wi-Fi
-adapter. NetworkManager integration uses `nmcli`; Bluetooth wake-up uses BlueZ
-with LE advertising.
+libraries. The radio service requires `/dev/net/tun`, root and a supported Wi-Fi
+adapter. AirDrop transport and the CLI run as your regular user. NetworkManager
+integration uses `nmcli`; Bluetooth wake-up uses BlueZ with LE advertising.
 
 ```sh
 just build
@@ -21,13 +21,20 @@ Commands run the development build without installing a package. Use
 
 ## Send and receive
 
-Unlock the iPhone and set AirDrop to **Everyone for 10 Minutes**.
+Start the radio service in its own terminal:
+
+```sh
+just owld
+```
+
+Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
+**Everyone for 10 Minutes**, then send as your regular user:
 
 ```sh
 just send 'Example Phone' /path/to/photo.png
 ```
 
-To receive, run the daemon in one terminal:
+To receive, keep `owld` running and start the user daemon in another terminal:
 
 ```sh
 just daemon --name 'Example Computer'
@@ -48,15 +55,21 @@ just discoverable off
 Opening Share → AirDrop on the phone sends a BLE wake request. The daemon starts
 a shared Wi-Fi/HTTPS session, then restores Wi-Fi after its transfers finish or
 inactivity. `accept TRANSFER_ID` and `reject TRANSFER_ID` select specific offers;
-`daemon --auto-accept` skips manual approval. Received files go to
+`airdropd --auto-accept` skips manual approval. Received files go to
 `~/Downloads/AirDrop/` by default.
 
 Discoverability starts **off** and applies until the daemon stops. `send` works
-standalone or through the daemon. Incoming and outgoing transfers share one
-active session. See [Usage](docs/usage.md) for runtime controls and Contacts Only receiving.
+standalone or through `airdropd`; both require `owld`. Incoming and outgoing
+transfers share one active session. See [Usage](docs/usage.md) for runtime controls
+and Contacts Only receiving.
+
+The development build produces `owld`, `airdropd` and the user-facing `catdrop`
+CLI. `just send`, `just accept` and the other control helpers invoke `catdrop`.
+mDNS uses scoped IPv6 UDP sockets in the user daemon.
 
 ## Documentation
 
+- [Architecture](docs/architecture.md): privilege separation and link leases.
 - [Usage](docs/usage.md): sessions, approvals, paths and control commands.
 - [Radio configuration](docs/radio.md): profiles, backends, channels and recovery.
 - [Development](docs/development.md): local testing, diagnostics and implementation.

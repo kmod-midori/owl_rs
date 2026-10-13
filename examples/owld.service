@@ -1,0 +1,14 @@
+[Unit]
+Description=Privileged AWDL radio service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+# Replace the build path and USER; just does not install this example.
+ExecStart=/path/to/owl_rs/target/release/owld --user USER
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

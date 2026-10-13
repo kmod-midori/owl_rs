@@ -100,14 +100,13 @@ fn validate(identifier: &str) -> Result<String> {
     Ok(normalized)
 }
 
-/// Atomic, serialized updates. The owner applies to newly created directories and files.
+/// Atomic, serialized updates in the current user account.
 pub struct Book {
     path: PathBuf,
-    owner: Option<(u32, u32)>,
 }
 impl Book {
-    pub fn new(path: PathBuf, owner: Option<(u32, u32)>) -> Self {
-        Self { path, owner }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
     }
     /// Add identifiers after validating the entire batch; return the number added.
     pub fn add(&self, identifiers: &[String]) -> Result<usize> {
@@ -128,7 +127,7 @@ impl Book {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        crate::identity::private_directory(parent, self.owner)?;
+        crate::identity::private_directory(parent)?;
         // Lock a stable sidecar: replacing the list changes its inode.
         let mut lock_name = self
             .path
@@ -146,9 +145,6 @@ impl Book {
             .open(parent.join(lock_name))?;
         ensure!(lock.metadata()?.is_file(), "invalid contacts lock file");
         lock.lock_exclusive()?;
-        if let Some((uid, gid)) = self.owner {
-            set_owner(&lock, uid, gid)?;
-        }
         ensure!(
             !self.path.is_symlink(),
             "cannot update a symlink; use its target as --contacts-file"
@@ -182,9 +178,6 @@ impl Book {
         ensure!(text.len() as u64 <= LIMIT, "contacts file exceeds 1 MiB");
         entries(&text)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        if let Some((uid, gid)) = self.owner {
-            set_owner(file.as_file(), uid, gid)?;
-        }
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(&self.path)?;
@@ -192,15 +185,6 @@ impl Book {
         Ok(changed)
     }
 }
-fn set_owner(file: &File, uid: u32, gid: u32) -> Result<()> {
-    nix::unistd::fchown(
-        file,
-        Some(nix::unistd::Uid::from_raw(uid)),
-        Some(nix::unistd::Gid::from_raw(gid)),
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,7 +199,7 @@ mod tests {
             "# Keep this comment\n Friend@Example.COM \n+1 (555) 010-1234\n",
         )
         .unwrap();
-        let book = Book::new(path.clone(), None);
+        let book = Book::new(path.clone());
         assert_eq!(
             book.add(&["FRIEND@example.com".into(), "15550101234".into()])
                 .unwrap(),
@@ -260,10 +244,7 @@ mod tests {
         assert_eq!(book.remove(&remaining).unwrap(), 0);
         let missing = dir.path().join("missing");
         assert!(list(&missing).unwrap().is_empty());
-        assert_eq!(
-            Book::new(missing.clone(), None).remove(&remaining).unwrap(),
-            0
-        );
+        assert_eq!(Book::new(missing.clone()).remove(&remaining).unwrap(), 0);
         assert!(!missing.exists());
     }
 }

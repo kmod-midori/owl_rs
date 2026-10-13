@@ -35,6 +35,13 @@ impl Transport {
             link.interface.as_deref(),
         )
         .await?;
+        // Bind all sockets before publication; startup errors release the lease
+        // without advertising a partially initialized service.
+        let mdns = link
+            .interface
+            .as_deref()
+            .map(|interface| crate::mdns::Socket::open(interface, link.scope, link.address))
+            .transpose()?;
         let discovery = Discovery::default()
             .with_policy(policy.clone())
             .with_timeouts(timeouts);
@@ -56,16 +63,14 @@ impl Transport {
                 crate::ble::receiving(adapter.as_deref(), hashes, policy, cancel, timeouts).await
             });
         }
-        if let Some(interface) = &link.interface {
-            let interface = interface.clone();
+        if let Some(socket) = mdns {
             let discovery = discovery.clone();
             let cancel = cancel.clone();
             let id = sender.id.clone();
             let address = link.address;
-            let snapshot = link.snapshot.clone();
             tasks.spawn(async move {
                 discovery
-                    .run(&interface, &id, address, port, cancel, snapshot)
+                    .run(socket, &id, address, port, cancel)
                     .await
                     .context("mDNS discovery")
             });
