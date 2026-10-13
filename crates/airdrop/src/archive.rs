@@ -163,12 +163,16 @@ fn copy_limited(reader: &mut impl Read, writer: &mut impl Write, left: &mut u64)
     Ok(copied)
 }
 pub fn decode(wire: &Path, limit: u64) -> Result<NamedTempFile> {
+    decode_reader(File::open(wire)?, limit, false)
+}
+fn decode_reader(mut input: impl Read, limit: u64, streaming: bool) -> Result<NamedTempFile> {
     let out = NamedTempFile::new()?;
     let mut writer = out.reopen()?;
-    let mut input = File::open(wire)?;
+    let mut inspect = out.reopen()?;
     let mut magic = [0; 2];
     input.read_exact(&mut magic)?;
-    input.rewind()?;
+    let mut input = std::io::Cursor::new(magic).chain(input);
+    let mut cursor = CpioCursor::default();
     let mut left = limit;
     if magic == [0x1f, 0x8b] {
         copy_limited(
@@ -228,68 +232,123 @@ pub fn decode(wire: &Path, limit: u64) -> Result<NamedTempFile> {
                 }
             }
             ensure!(section.limit() == 0, "truncated DVZip block");
+            // Check only newly available headers. Commit only after the entire
+            // DVZip block (including its zlib checksum) has been verified.
+            if cursor.check(&mut inspect, limit)? && streaming {
+                writer.flush()?;
+                return Ok(out);
+            }
         }
     }
     writer.flush()?;
-    preflight(out.path(), limit)?;
+    ensure!(
+        cursor.check(&mut inspect, limit)?,
+        "incomplete CPIO archive"
+    );
     Ok(out)
 }
 fn number(bytes: &[u8], radix: u32) -> Result<u64> {
     Ok(u64::from_str_radix(std::str::from_utf8(bytes)?, radix)?)
 }
-pub fn preflight(path: &Path, limit: u64) -> Result<()> {
-    let mut input = File::open(path)?;
-    let length = input.metadata()?.len();
-    ensure!(length <= limit, "archive exceeds size limit");
-    let mut count = 0;
-    loop {
-        let start = input.stream_position()?;
-        let mut magic = [0; 6];
-        input
-            .read_exact(&mut magic)
-            .context("missing CPIO trailer")?;
-        let (names, size, header, align) = match &magic {
-            b"070707" => {
-                let mut rest = [0; 70];
-                input.read_exact(&mut rest)?;
-                (number(&rest[53..59], 8)?, number(&rest[59..70], 8)?, 76, 1)
-            }
-            b"070701" => {
-                let mut rest = [0; 104];
-                input.read_exact(&mut rest)?;
-                (
-                    number(&rest[88..96], 16)?,
-                    number(&rest[48..56], 16)?,
-                    110,
-                    4,
-                )
-            }
-            _ => bail!("unsupported CPIO format"),
-        };
-        ensure!((1..=4096).contains(&names), "invalid CPIO name length");
-        let mut name = vec![0; names as usize];
-        input.read_exact(&mut name)?;
-        ensure!(name.last() == Some(&0), "unterminated CPIO name");
-        let name = std::str::from_utf8(&name[..name.len() - 1])?;
-        let data = (start + header + names).div_ceil(align) * align;
-        let end = data
-            .checked_add(size)
-            .context("CPIO size overflow")?
-            .div_ceil(align)
-            * align;
-        ensure!(end <= length, "truncated CPIO data");
-        if name == "TRAILER!!!" {
-            ensure!(size == 0, "invalid CPIO trailer");
-            ensure!(count > 0, "empty CPIO archive");
-            return Ok(());
+#[derive(Default)]
+struct CpioCursor {
+    offset: u64,
+    count: usize,
+    trailer_end: Option<u64>,
+}
+impl CpioCursor {
+    fn check(&mut self, input: &mut File, limit: u64) -> Result<bool> {
+        let length = input.metadata()?.len();
+        ensure!(length <= limit, "archive exceeds size limit");
+        if let Some(end) = self.trailer_end {
+            return Ok(length >= end);
         }
-        if name != "." && name != "./" {
-            safe_path(name)?;
+        loop {
+            let start = self.offset;
+            if start > length || length - start < 6 {
+                return Ok(false);
+            }
+            input.seek(SeekFrom::Start(start))?;
+            let mut magic = [0; 6];
+            input.read_exact(&mut magic)?;
+            let (header, align) = match &magic {
+                b"070707" => (76u64, 1u64),
+                b"070701" => (110, 4),
+                _ => bail!("unsupported CPIO format"),
+            };
+            if length - start < header {
+                return Ok(false);
+            }
+            let mut rest = [0; 104];
+            input.read_exact(&mut rest[..header as usize - 6])?;
+            let (names, size) = if header == 76 {
+                (number(&rest[53..59], 8)?, number(&rest[59..70], 8)?)
+            } else {
+                (number(&rest[88..96], 16)?, number(&rest[48..56], 16)?)
+            };
+            ensure!((1..=4096).contains(&names), "invalid CPIO name length");
+            if length - start - header < names {
+                return Ok(false);
+            }
+            let mut name = vec![0; names as usize];
+            input.read_exact(&mut name)?;
+            ensure!(name.last() == Some(&0), "unterminated CPIO name");
+            let name = std::str::from_utf8(&name[..name.len() - 1])?;
+            let data = (start + header + names).div_ceil(align) * align;
+            let end = data
+                .checked_add(size)
+                .context("CPIO size overflow")?
+                .div_ceil(align)
+                * align;
+            ensure!(end <= limit, "CPIO member exceeds size limit");
+            if name == "TRAILER!!!" {
+                ensure!(size == 0, "invalid CPIO trailer");
+                ensure!(self.count > 0, "empty CPIO archive");
+                self.trailer_end = Some(end);
+                return Ok(length >= end);
+            }
+            if name != "." && name != "./" {
+                safe_path(name)?;
+            }
+            self.count += 1;
+            ensure!(self.count <= 4096, "too many CPIO members");
+            // Skip the payload once its declared length has arrived; a trailer
+            // string within a member's contents can never complete the archive.
+            self.offset = end;
         }
-        count += 1;
-        ensure!(count <= 4096, "too many CPIO members");
-        input.seek(SeekFrom::Start(end))?;
     }
+}
+pub fn preflight(path: &Path, limit: u64) -> Result<()> {
+    ensure!(
+        CpioCursor::default().check(&mut File::open(path)?, limit)?,
+        "incomplete CPIO archive"
+    );
+    Ok(())
+}
+/// Checked files stay private until the receive task commits them. Dropping a
+/// cancelled worker's result removes staging instead of publishing a transfer.
+pub struct Validated {
+    staging: tempfile::TempDir,
+    target: PathBuf,
+}
+impl Validated {
+    pub fn commit(self) -> Result<PathBuf> {
+        ensure!(!self.target.exists(), "transfer output already exists");
+        std::fs::rename(self.staging.path(), &self.target)?;
+        Ok(self.target)
+    }
+}
+/// Validate incoming DVZip blocks and CPIO structure without waiting for HTTP EOF.
+/// Gzip reception completes after its CRC/footer, rather than transport EOF.
+pub fn receive(
+    input: impl Read,
+    output: &Path,
+    id: &str,
+    limit: u64,
+    expected: &[Item],
+) -> Result<Validated> {
+    let cpio = decode_reader(input, limit, true)?;
+    extract_cpio(cpio, output, id, limit, expected)
 }
 pub fn extract_checked(
     wire: &Path,
@@ -298,7 +357,15 @@ pub fn extract_checked(
     limit: u64,
     expected: &[Item],
 ) -> Result<PathBuf> {
-    let cpio = decode(wire, limit)?;
+    extract_cpio(decode(wire, limit)?, output, id, limit, expected)?.commit()
+}
+fn extract_cpio(
+    cpio: NamedTempFile,
+    output: &Path,
+    id: &str,
+    limit: u64,
+    expected: &[Item],
+) -> Result<Validated> {
     std::fs::create_dir_all(output)?;
     let staging = tempfile::Builder::new()
         .prefix(".owl-rs-")
@@ -383,9 +450,7 @@ pub fn extract_checked(
         }
     }
     let target = output.join(format!("airdrop-{id}"));
-    ensure!(!target.exists(), "transfer output already exists");
-    std::fs::rename(staging.path(), &target)?;
-    Ok(target)
+    Ok(Validated { staging, target })
 }
 
 fn thumbnail(path: &Path) -> Option<Vec<u8>> {

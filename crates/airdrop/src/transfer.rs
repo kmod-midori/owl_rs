@@ -27,9 +27,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt,
     net::TcpListener,
-    sync::{Mutex, Semaphore, oneshot, watch},
+    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -676,79 +675,81 @@ impl Receiver {
             matches!(content, "application/x-dvzip" | "application/octet-stream"),
             "unsupported upload type"
         );
-        let _permit = self
+        let permit = self
             .upload
             .clone()
             .try_acquire_owned()
             .context("too many concurrent uploads")?;
         crate::identity::private_directory(&self.output)?;
         let disk = nix::sys::statvfs::statvfs(&self.output)?;
-        // Four uploads may hold wire, decoded CPIO and extracted data at once.
+        // Bound concurrent decoded archives, extracted data and temporary storage.
         let budget = self
             .limit
             .min(disk.blocks_available().saturating_mul(disk.fragment_size()) / 12);
         ensure!(budget > 0, "insufficient receive disk space");
-        let file = tempfile::NamedTempFile::new_in(&self.output)?;
-        let mut writer = tokio::fs::File::from_std(file.reopen()?);
+        let (chunks, reader) = mpsc::channel(4);
+        let output = self.output.clone();
+        let id = offer.id.clone();
+        let expected = offer.items.clone();
+        let mut decoded = tokio::task::spawn_blocking(move || {
+            // A cancelled HTTP task must not free a slot while its decoder runs.
+            let _permit = permit;
+            archive::receive(
+                UploadReader {
+                    chunks: reader,
+                    current: std::io::Cursor::new(Bytes::new()),
+                },
+                &output,
+                &id,
+                budget,
+                &expected,
+            )
+        });
+        let mut chunks = Some(chunks);
         let mut body = req.into_body();
         let mut bytes = 0u64;
         self.update(&offer.id, "receiving", 0, None, None).await;
-        let mut last_data = tokio::time::Instant::now();
-        let mut checked_bytes = None;
-        loop {
-            match tokio::time::timeout(self.timeouts.upload_check, body.frame()).await {
-                Ok(Some(frame)) => {
-                    if let Ok(data) = frame?.into_data() {
-                        bytes = bytes
-                            .checked_add(data.len() as u64)
-                            .context("size overflow")?;
-                        ensure!(bytes <= budget, "upload exceeds receive budget");
-                        writer.write_all(&data).await?;
-                        last_data = tokio::time::Instant::now();
-                        self.update(&offer.id, "receiving", bytes, None, None).await;
+        let validated = loop {
+            tokio::select! {
+                result = &mut decoded => break result??,
+                frame = tokio::time::timeout(self.timeouts.upload_idle, body.frame()), if chunks.is_some() => {
+                    match frame.context("upload stalled before a complete archive arrived")? {
+                        Some(frame) => if let Ok(data) = frame?.into_data() {
+                            bytes = bytes.checked_add(data.len() as u64).context("size overflow")?;
+                            ensure!(bytes <= budget, "upload exceeds receive budget");
+                            self.update(&offer.id, "receiving", bytes, None, None).await;
+                            if chunks.as_ref().expect("HTTP body still open").send(data).await.is_err() {
+                                break decoded.await??;
+                            }
+                        },
+                        None => { chunks.take(); }
                     }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    // A stalled partial upload cannot become complete without new
-                    // bytes. Decode at most once per quiet period, retaining the
-                    // Hyper parser/body state so partial chunk lines survive waits.
-                    if checked_bytes != Some(bytes) {
-                        checked_bytes = Some(bytes);
-                        writer.flush().await?;
-                        let path = file.path().to_path_buf();
-                        let output = self.output.clone();
-                        let id = offer.id.clone();
-                        let expected = offer.items.clone();
-                        let limit = budget;
-                        let check = tokio::task::spawn_blocking(move || {
-                            archive::extract_checked(&path, &output, &id, limit, &expected)
-                        })
-                        .await?;
-                        if let Ok(out) = check {
-                            tracing::info!(id=%offer.id,bytes,"validated complete archive before HTTP terminator");
-                            return Ok((bytes, out, true));
-                        }
-                    }
-                    ensure!(
-                        last_data.elapsed() < self.timeouts.upload_idle,
-                        "upload stalled before a complete archive arrived"
-                    );
                 }
             }
+        };
+        let out = validated.commit()?;
+        tracing::info!(id=%offer.id, bytes, "validated complete archive while receiving");
+        Ok((bytes, out, chunks.is_some()))
+    }
+}
+// Bounded adapter between asynchronous HTTP input and the blocking archive
+// decoder. Cancellation drops the sender, unblocking reads with EOF.
+struct UploadReader {
+    chunks: mpsc::Receiver<Bytes>,
+    current: std::io::Cursor<Bytes>,
+}
+impl std::io::Read for UploadReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = std::io::Read::read(&mut self.current, out)?;
+            if n != 0 || out.is_empty() {
+                return Ok(n);
+            }
+            match self.chunks.blocking_recv() {
+                Some(data) => self.current = std::io::Cursor::new(data),
+                None => return Ok(0),
+            }
         }
-        writer.flush().await?;
-        drop(writer);
-        let output = self.output.clone();
-        let id = offer.id.clone();
-        let limit = budget;
-        let expected = offer.items.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            let out = archive::extract_checked(file.path(), &output, &id, limit, &expected)?;
-            Ok::<_, anyhow::Error>(out)
-        })
-        .await??;
-        Ok((bytes, out, false))
     }
 }
 #[derive(Clone)]

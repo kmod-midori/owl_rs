@@ -594,17 +594,29 @@ then tested with an 8,727,870-byte MOV, which the phone reported as Sent. Earlie
 Content-Type and keep-alive changes were tested together; this comparison
 preserves the body and Content-Type behavior while changing connection closure.
 
-Some captured iPhone transfers delivered a complete archive without finishing
-the HTTP chunk terminator. After the configured archive-check quiet interval (default two seconds), Rust
-attempts full
-archive validation against the accepted offer. Only a complete, matching archive
-is committed and acknowledged; that exceptional connection is then closed. If
-validation fails, reception can continue until the stall deadline. Validation
-runs once per received byte count during a quiet period. Hyper retains partial
-chunk headers and body data across short timed waits. The decoded CPIO must have
-at least one member and a structurally parsed, zero-size `TRAILER!!!` entry;
-an empty upload, an archive cut between members or a trailer string inside file
-data cannot complete it. All approved files and sizes must still match.
+Some captured iPhone transfers deliver a complete archive without finishing
+its HTTP chunk terminator. The receiver now feeds incoming bytes through a
+bounded queue to a blocking archive decoder, independent of HTTP completion.
+Each complete DVZip block is checked for its length and zlib checksum, then an
+incremental CPIO cursor checks newly available headers, names and member bounds.
+It skips declared file contents rather than searching for trailer text. Gzip
+reception verifies the gzip CRC/footer before completing.
+
+A structurally parsed, zero-size `TRAILER!!!` entry after at least one member
+marks archive completion. The enclosing DVZip block must also be complete.
+The existing extraction checks then verify safe member types, duplicate names,
+AppleDouble companions and all approved files and sizes. Validated files remain
+in private staging until the receive task commits them and sends HTTP 200;
+cancelling a receive discards staging instead of publishing a detached worker's
+result. No quiet-period timer or repeated whole-archive decoding is needed;
+`--upload-idle-timeout` still rejects stalled incomplete uploads. Hyper retains
+partial chunk headers and body data while the decoder runs.
+
+A live 14.76 MiB image receive verified this path without an HTTP terminator:
+HTTP 200 was ready 89 ms after the final upload TCP packet, and the phone sent
+FIN after 265 ms. The phone reported Sent and the extracted file matched its
+source hash. A preceding quiet-period receive took 4.06 seconds from the final
+upload packet to the phone's FIN; the radio environments were not controlled.
 
 This is the same recovery principle as
 [omdrop-plugin PR #41](https://github.com/brentkearney/omdrop-plugin/pull/41).

@@ -197,8 +197,7 @@ just daemon --ble-idle-timeout 180 --completion-grace 5 \
 
 The new flags accept fractional seconds, such as `--ble-idle-timeout 0.5`.
 Values must be positive and at most 86400 seconds; `--completion-grace 0` disables
-only that grace period. The archive-check interval must not exceed the upload
-stall timeout; the radio quiet period must not exceed its drain timeout.
+only that grace period. The radio quiet period must not exceed its drain timeout.
 `--timeout` separately sets send discovery (default 60 s) or `peers` waiting
 (default 10 s); `--duration` bounds a daemon or outgoing operation to
 1–86400 whole seconds. These two
@@ -226,7 +225,6 @@ are protocol parameters, rather than application timeout options.
 | `--approval-timeout` | 60 | Incoming manual approval and outgoing Ask deadline. |
 | `--upload-idle-timeout` | 20 | Incoming upload stall deadline. |
 | `--upload-timeout` | 600 | Incoming and outgoing upload deadline. |
-| `--upload-check-interval` | 2 | Quiet interval before checking for a complete archive without an HTTP terminator. |
 | `--connection-drain-timeout` | 5 | Successful HTTP/TLS close deadline. |
 | `--rejection-drain-timeout` | 2 | Refusal response close deadline. |
 | `--tcp-linger-timeout` | 10 | Successful final TCP acknowledgment drain bound. |

@@ -54,7 +54,6 @@ macro_rules! deadlines {
             pub fn validate(&self) -> anyhow::Result<()> {
                 $(anyhow::ensure!(!self.$field.is_zero() && self.$field <= Duration::from_secs(86400), concat!("invalid ", $flag));)+
                 anyhow::ensure!(self.completion_grace <= Duration::from_secs(86400), "invalid completion grace");
-                anyhow::ensure!(self.upload_check <= self.upload_idle, "upload check interval must not exceed upload idle timeout");
                 anyhow::ensure!(self.radio_quiet <= self.radio_drain, "radio quiet period must not exceed radio drain timeout");
                 Ok(())
             }
@@ -80,7 +79,6 @@ deadlines! {
     approval, "approval-timeout", "60", "Incoming manual approval and outgoing Ask deadline.";
     upload_idle, "upload-idle-timeout", "20", "Incoming upload stall deadline.";
     upload_total, "upload-timeout", "600", "Incoming and outgoing upload deadline.";
-    upload_check, "upload-check-interval", "2", "Quiet interval before checking for a complete archive without an HTTP terminator.";
     connection_drain, "connection-drain-timeout", "5", "Successful HTTP/TLS close deadline.";
     rejection_drain, "rejection-drain-timeout", "2", "Refusal response close deadline.";
     tcp_linger, "tcp-linger-timeout", "10", "Successful final TCP acknowledgment drain bound.";
@@ -151,7 +149,6 @@ cli_deadlines! { AirDropTimeouts {
     approval, "approval-timeout", "60", positive, "Incoming manual approval and outgoing Ask deadline.";
     upload_idle, "upload-idle-timeout", "20", positive, "Incoming upload stall deadline.";
     upload_total, "upload-timeout", "600", positive, "Incoming and outgoing upload deadline.";
-    upload_check, "upload-check-interval", "2", positive, "Quiet interval before checking for a complete archive without an HTTP terminator.";
     connection_drain, "connection-drain-timeout", "5", positive, "Successful HTTP/TLS close deadline.";
     rejection_drain, "rejection-drain-timeout", "2", positive, "Refusal response close deadline.";
     tcp_linger, "tcp-linger-timeout", "10", positive, "Successful final TCP acknowledgment drain bound.";

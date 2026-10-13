@@ -64,6 +64,97 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
         std::fs::read(archive::decode(large.path(), 1024 * 1024).unwrap().path()).unwrap(),
         bytes
     );
+    // Fragmented reads must finish on a validated trailer/block or gzip
+    // footer, without consulting transport EOF. Headers can span DVZip blocks.
+    struct Fragmented(std::io::Cursor<Vec<u8>>);
+    impl Read for Fragmented {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let len = out.len().min(3);
+            let n = self.0.read(&mut out[..len])?;
+            if n == 0 && !out.is_empty() {
+                return Err(std::io::Error::other("unexpected transport EOF read"));
+            }
+            Ok(n)
+        }
+    }
+    let mut split = Vec::new();
+    for chunk in bytes.chunks(17) {
+        split.extend_from_slice(&((chunk.len() as u32) | 0x80000000).to_be_bytes());
+        split.extend_from_slice(chunk);
+    }
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&bytes).unwrap();
+    let gzip = gz.finish().unwrap();
+    for (id, data) in [
+        ("stream-blocks", split),
+        ("stream-zlib", std::fs::read(large.path()).unwrap()),
+        ("stream-gzip", gzip.clone()),
+    ] {
+        let out = archive::receive(
+            Fragmented(std::io::Cursor::new(data)),
+            &dir.path().join("received"),
+            id,
+            1024 * 1024,
+            &wire.items,
+        )
+        .unwrap();
+        assert!(!dir.path().join(format!("received/airdrop-{id}")).exists());
+        let out = out.commit().unwrap();
+        assert_eq!(
+            std::fs::read(out.join("folder/random.bin")).unwrap(),
+            random
+        );
+    }
+    let pending = archive::receive(
+        std::fs::File::open(wire.file.path()).unwrap(),
+        &dir.path().join("received"),
+        "cancelled",
+        1024 * 1024,
+        &wire.items,
+    )
+    .unwrap();
+    drop(pending);
+    assert!(!dir.path().join("received/airdrop-cancelled").exists());
+    assert!(
+        !std::fs::read_dir(dir.path().join("received"))
+            .unwrap()
+            .any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".owl-rs-"))
+    );
+    let mut corrupt_gzip = gzip;
+    let last = corrupt_gzip.len() - 1;
+    corrupt_gzip[last] ^= 1;
+    assert!(
+        archive::receive(
+            std::io::Cursor::new(corrupt_gzip),
+            &dir.path().join("received"),
+            "corrupt-gzip",
+            1024 * 1024,
+            &wire.items
+        )
+        .is_err()
+    );
+    let mut missing_checksum = std::fs::read(large.path()).unwrap();
+    missing_checksum.pop();
+    assert!(
+        archive::receive(
+            std::io::Cursor::new(missing_checksum),
+            &dir.path().join("received"),
+            "missing-checksum",
+            1024 * 1024,
+            &wire.items
+        )
+        .is_err()
+    );
+    assert!(!dir.path().join("received/airdrop-corrupt-gzip").exists());
+    assert!(
+        !dir.path()
+            .join("received/airdrop-missing-checksum")
+            .exists()
+    );
     // A complete DVZip block ending between CPIO members is not a complete
     // archive; an empty archive must also be rejected.
     let partial = tempfile::NamedTempFile::new().unwrap();
@@ -78,6 +169,16 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
         stored.extend(raw);
         std::fs::write(partial.path(), stored).unwrap();
         assert!(archive::decode(partial.path(), 1024 * 1024).is_err());
+        assert!(
+            archive::receive(
+                std::fs::File::open(partial.path()).unwrap(),
+                &dir.path().join("received"),
+                "partial",
+                1024 * 1024,
+                &wire.items
+            )
+            .is_err()
+        );
     }
     let trailer_start = bytes
         .windows(6)
@@ -287,19 +388,19 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
     let chunk_size = format!("{:x}\r\n", data.len());
     stream.write_all(&chunk_size.as_bytes()[..1]).await.unwrap();
     stream.flush().await.unwrap();
-    // Cancelled body waits must retain partially parsed chunk headers/data.
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    // Fragmented chunk headers and bodies must not complete a partial archive.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     stream.write_all(&chunk_size.as_bytes()[1..]).await.unwrap();
     stream.write_all(&data[..data.len() / 2]).await.unwrap();
     stream.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_ne!(receiver.transfers().await[0].state, "completed");
     assert!(!dir.path().join(format!("received/airdrop-{id}")).exists());
     stream.write_all(&data[data.len() / 2..]).await.unwrap();
     stream.write_all(b"\r\n").await.unwrap();
     stream.flush().await.unwrap();
     // Never send the final zero HTTP chunk. Only the validated archive is complete.
-    let response = tokio::time::timeout(Duration::from_secs(5), reply(&mut stream))
+    let response = tokio::time::timeout(Duration::from_millis(700), reply(&mut stream))
         .await
         .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
