@@ -96,7 +96,10 @@ VHT requests are upper limits, constrained by both peers and the tuned channel.
 Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
 and unavailable capabilities use 12 Mbps. Effective peer rates appear in
 `status` and rate-change logs. See [Transmit rates](protocol.md#transmit-rates)
-for capability and encoding details.
+for capability and encoding details. HT/VHT unicast packets already in the
+link queue are aggregated into A-MSDUs within peer, interface and slot limits;
+`status` exposes the aggregation counters. See
+[Transmit aggregation](protocol.md#transmit-aggregation) for retry and fallback behavior.
 
 ## Election experiments
 

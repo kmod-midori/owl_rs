@@ -220,6 +220,64 @@ fn metric_first_election_and_fixed_radio_intersection_union() {
     }
 }
 #[test]
+fn outgoing_amsdu_roundtrip_padding_sequences_and_bounds() {
+    let own = Mac([2, 0, 0, 0, 0, 1]);
+    let peer = Mac([2, 0, 0, 0, 0, 2]);
+    let packet = |length| {
+        let mut p = Vec::new();
+        p.extend(peer.0);
+        p.extend(own.0);
+        p.extend([0x86, 0xdd]);
+        p.extend(vec![0x60; length]);
+        p
+    };
+    let first = packet(41);
+    let second = packet(43);
+    for fcs in [false, true] {
+        let frame = protocol::encode_amsdu(
+            &[&first, &second],
+            4095,
+            65535,
+            "vht4-nss2-bw40-sgi".parse().unwrap(),
+            true,
+            fcs,
+        )
+        .unwrap();
+        let rt = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+        assert_eq!(&frame[rt..rt + 2], &[0x88, 0]);
+        assert_eq!(&frame[rt + 24..rt + 26], &[0x80, 0]);
+        let body = rt + 26;
+        assert_eq!(frame.len(), body + 145 + if fcs { 4 } else { 0 });
+        assert_eq!(&frame[body + 24..body + 26], &65535u16.to_le_bytes());
+        assert_eq!(&frame[body + 72 + 24..body + 72 + 26], &0u16.to_le_bytes());
+        let Body::Data(decoded) = protocol::parse(&frame).unwrap().unwrap().body else {
+            panic!("data")
+        };
+        assert_eq!(decoded, [first.clone(), second.clone()]);
+    }
+    let mut mixed = second.clone();
+    mixed[5] ^= 1;
+    assert!(
+        protocol::encode_amsdu(&[&first, &mixed], 0, 0, Rate::Legacy(12), true, false).is_err()
+    );
+    mixed = second.clone();
+    mixed[11] ^= 1;
+    assert!(
+        protocol::encode_amsdu(&[&first, &mixed], 0, 0, Rate::Legacy(12), true, false).is_err()
+    );
+    let large = packet(1500);
+    assert!(
+        protocol::encode_amsdu(&[large.as_slice(); 6], 0, 0, Rate::Legacy(12), true, false)
+            .is_err()
+    );
+    assert!(
+        protocol::encode_amsdu(&[first.as_slice(); 65], 0, 0, Rate::Legacy(12), true, false)
+            .is_err()
+    );
+    assert!(protocol::encode_amsdu(&[&first], 0, 0, Rate::Legacy(12), true, false).is_err());
+}
+
+#[test]
 fn amsdu_bounds_and_retry_deduplication() {
     let own = Mac([2, 0, 0, 0, 0, 1]);
     let peer = Mac([2, 0, 0, 0, 0, 2]);

@@ -9,7 +9,7 @@ use rtnetlink::{
     packet_route::{
         AddressFamily,
         address::{AddressAttribute, AddressFlags, AddressHeaderFlags, AddressScope},
-        link::{LinkFlags, LinkMessage},
+        link::{LinkAttribute, LinkFlags, LinkMessage},
         neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage},
     },
 };
@@ -318,6 +318,25 @@ impl Netlink {
         self.bounded(self.0.route.link().set(msg).execute())
             .await
             .with_context(|| format!("set {name} up={up}"))
+    }
+    pub async fn mtu(&self, name: &str) -> Result<u32> {
+        self.link(name)
+            .await?
+            .attributes
+            .into_iter()
+            .find_map(|a| match a {
+                LinkAttribute::Mtu(mtu) => Some(mtu),
+                _ => None,
+            })
+            .with_context(|| format!("interface {name} did not report its MTU"))
+    }
+    pub async fn set_mtu(&self, name: &str, mtu: u32) -> Result<()> {
+        let msg = LinkUnspec::new_with_index(self.index(name).await?)
+            .mtu(mtu)
+            .build();
+        self.bounded(self.0.route.link().set(msg).execute())
+            .await
+            .with_context(|| format!("set {name} MTU to {mtu}"))
     }
     pub async fn set_mac(&self, name: &str, mac: Mac) -> Result<()> {
         let msg = LinkUnspec::new_with_index(self.index(name).await?)

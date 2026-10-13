@@ -3,15 +3,14 @@ use crate::{
     channel::{ChannelDefinition, ChannelPlan},
     engine::{Config, Engine, Event},
     netlink::Netlink,
-    protocol::{MAX_FRAME, Mac},
-    rate::Rate,
+    protocol::{MAX_FRAME, tcp_frame},
+    tx,
 };
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use nix::errno::Errno;
 use pcap::{Capture, Packet, PacketCodec, PacketHeader};
 use std::{
-    collections::VecDeque,
     path::Path,
     time::{Duration, Instant},
 };
@@ -37,14 +36,6 @@ pub struct Options {
     pub ibss_interface: Option<String>,
     /// Shared AP contexts must never be retuned.
     pub retune: bool,
-}
-fn tcp_frame(ethernet: &[u8]) -> bool {
-    matches!(
-        etherparse::SlicedPacket::from_ethernet(ethernet)
-            .ok()
-            .and_then(|p| p.transport),
-        Some(etherparse::TransportSlice::Tcp(_))
-    )
 }
 struct OwnedPacket {
     header: PacketHeader,
@@ -166,6 +157,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     if radio.kind != IfType::Monitor {
         bail!("AWDL diagnostics require a prepared monitor interface");
     }
+    let monitor_limit = net.mtu(&opts.input).await? as usize;
     let initial_definition = config
         .operating_channel
         .or_else(|| radio.channel_definition());
@@ -266,7 +258,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     let mut scheduler = time::interval(Duration::from_micros(500));
     scheduler.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut host_buf = vec![0; MAX_FRAME];
-    let mut queue: VecDeque<PendingPacket> = VecDeque::new();
+    let mut queue = tx::Queue::default();
     let mut psf_at = 110 * 1024;
     let mut mif_at = 0;
     let mut last_tcp = None;
@@ -355,11 +347,13 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                         },
                     }
                 },
-                received = receive_tap(&tap, &mut host_buf), if tap.is_some() && queue.len() < 128 => {
+                received = receive_tap(&tap, &mut host_buf), if tap.is_some() && queue.len() < tx::QUEUE_LIMIT => {
                     let len = received?;
                     if len >= 14 {
                         last_traffic = elapsed_us(start);
-                        queue.push_back(PendingPacket::new(host_buf[..len].to_vec(), last_traffic));
+                        if host_buf[..6] == engine.config.mac.0 {
+                            if let Some(tap) = &tap { send_tap(tap, &host_buf[..len]).await?; }
+                        } else { queue.push(host_buf[..len].to_vec(), last_traffic); }
                     }
                 },
                 _ = scheduler.tick() => {
@@ -370,7 +364,8 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     // peer cannot prolong restoration past the configured drain budget.
                     if let Some(since) = draining
                         && (now - since >= opts.timeouts.radio_drain.as_micros() as i64
-                            || (queue.is_empty() && now - since >= opts.timeouts.radio_quiet.as_micros() as i64
+                            || (queue.is_idle(now, opts.timeouts.radio_quiet.as_micros() as i64)
+                                && now - since >= opts.timeouts.radio_quiet.as_micros() as i64
                                 && now - last_traffic >= opts.timeouts.radio_quiet.as_micros() as i64)) {
                         break;
                     }
@@ -388,7 +383,8 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                         let busy = control.as_ref().is_some_and(|c| *c.traffic.borrow() > 0)
                             || (!plan.discovering && (
                                 last_tcp.is_some_and(|t| now - t < opts.timeouts.queued_packet.as_micros() as i64)
-                                || queue.iter().any(|p| tcp_frame(&p.ethernet))
+                                || queue.has_tcp()
+                                || queue.has_pending_airtime(now)
                             ));
                         plan.desired(parent, busy).context("no usable AWDL channel remains")?
                     } else { engine.current_channel(now) };
@@ -425,50 +421,13 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             engine.stats.tx_action += 1;
                             psf_at = now + 110 * 1024;
                         }
-                        // Inspect the whole bounded queue: an unavailable unicast peer must
-                        // not block multicast or traffic for another available peer.
-                        for _ in 0..queue.len() {
-                            let Some(mut packet) = queue.pop_front() else { break; };
-                            let dst = Mac(packet.ethernet[..6].try_into()?);
-                            if dst == engine.config.mac {
-                                if let Some(tap) = &tap {
-                                    send_tap(tap, &packet.ethernet).await.context("deliver AWDL Ethernet frame to TAP")?;
-                                }
-                                continue;
-                            }
-                            // Injection of earlier packets can consume part of a slot.
-                            // Recheck current time and the applied channel for every frame.
-                            let transmit_now = elapsed_us(start);
-                            let known = dst.multicast() || engine.peers.get(&dst).is_some_and(|p| p.valid);
-                            if transmit_now - packet.queued_us > opts.timeouts.queued_packet.as_micros() as i64 || !known {
-                                engine.stats.dropped += 1;
-                                continue;
-                            }
-                            if applied_definition.is_none_or(|d| d.channel != engine.current_channel(transmit_now)) {
-                                queue.push_back(packet);
-                                continue;
-                            }
-                            match packet.transmit(&mut engine, transmit_now, |bytes| inject(stream.capture_mut(), bytes))? {
-                                Transmission::Sent => {
-                                    last_traffic = transmit_now;
-                                    engine.stats.tx_data += 1;
-                                    if dst.multicast() {
-                                        engine.stats.tx_multicast += 1;
-                                    } else {
-                                        if tcp_frame(&packet.ethernet) { last_tcp = Some(transmit_now); }
-                                        engine.stats.tx_unicast += 1;
-                                    }
-                                },
-                                Transmission::WaitForSlot => queue.push_back(packet),
-                                Transmission::QueueFull => {
-                                    engine.stats.tx_backpressure += 1;
-                                    queue.push_front(packet);
-                                    // Yield to RX/TAP and recheck the slot on the next tick.
-                                    break;
-                                },
-                                Transmission::Invalid => engine.stats.dropped += 1,
-                            }
-                        }
+                        let report = queue.flush(
+                            &mut engine, desired, monitor_limit,
+                            || elapsed_us(start),
+                            |bytes| inject_packet(stream.capture_mut(), bytes),
+                        )?;
+                        if let Some(time) = report.last_sent_us { last_traffic = time; }
+                        if let Some(time) = report.last_tcp_us { last_tcp = Some(time); }
                     }
                 },
             }
@@ -517,77 +476,31 @@ async fn wait_deadline(deadline: Option<time::Instant>) {
 // libpcap's sendpacket reports only text; capture errno synchronously before
 // any logging or await. Clear stale errno so unrelated failures cannot retry.
 fn inject(cap: &mut Capture<pcap::Active>, bytes: &[u8]) -> Result<bool, pcap::Error> {
+    match inject_packet(cap, bytes) {
+        Ok(()) => Ok(true),
+        Err(tx::InjectionError::Backpressure) => Ok(false),
+        Err(tx::InjectionError::TooLarge(error) | tx::InjectionError::Fatal(error)) => Err(error),
+    }
+}
+fn inject_packet(
+    cap: &mut Capture<pcap::Active>,
+    bytes: &[u8],
+) -> Result<(), tx::InjectionError<pcap::Error>> {
     Errno::clear();
     let result = cap.sendpacket(bytes);
     injection_result(result, Errno::last())
 }
-fn injection_result(result: Result<(), pcap::Error>, errno: Errno) -> Result<bool, pcap::Error> {
+fn injection_result(
+    result: Result<(), pcap::Error>,
+    errno: Errno,
+) -> Result<(), tx::InjectionError<pcap::Error>> {
     match result {
-        Ok(()) => Ok(true),
-        Err(_) if matches!(errno, Errno::EAGAIN | Errno::ENOBUFS) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-struct PendingPacket {
-    ethernet: Vec<u8>,
-    queued_us: i64,
-    encoded: Option<(Rate, Vec<u8>)>,
-}
-enum Transmission {
-    Sent,
-    WaitForSlot,
-    QueueFull,
-    Invalid,
-}
-impl PendingPacket {
-    fn new(ethernet: Vec<u8>, queued_us: i64) -> Self {
-        Self {
-            ethernet,
-            queued_us,
-            encoded: None,
+        Ok(()) => Ok(()),
+        Err(_) if matches!(errno, Errno::EAGAIN | Errno::ENOBUFS) => {
+            Err(tx::InjectionError::Backpressure)
         }
-    }
-    fn transmit(
-        &mut self,
-        engine: &mut Engine,
-        now: i64,
-        mut send: impl FnMut(&[u8]) -> Result<bool, pcap::Error>,
-    ) -> Result<Transmission, pcap::Error> {
-        let dst = Mac(self.ethernet[..6]
-            .try_into()
-            .expect("checked Ethernet header"));
-        if !engine.send_ready(dst, now) {
-            return Ok(Transmission::WaitForSlot);
-        }
-        let rate = engine.data_rate(dst);
-        if let Some((previous, bytes)) = &mut self.encoded {
-            if *previous != rate {
-                // A retune/capability update must not reuse an over-wide PHY header.
-                // Preserve the queued packet's 802.11/AWDL sequence numbers.
-                let old_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-                let Ok(header) = crate::protocol::radiotap_tx(
-                    rate,
-                    engine.config.fixed_radio && !dst.multicast(),
-                    false,
-                ) else {
-                    return Ok(Transmission::Invalid);
-                };
-                bytes.splice(..old_len, header);
-                *previous = rate;
-            }
-        } else {
-            let Ok(encoded) = engine.data_frame(&self.ethernet, rate) else {
-                return Ok(Transmission::Invalid);
-            };
-            self.encoded = Some((rate, encoded));
-        }
-        // Both Ethernet bytes and AWDL sequence numbers survive backpressure.
-        let (_, bytes) = self.encoded.as_ref().expect("encoded packet");
-        Ok(if send(bytes)? {
-            Transmission::Sent
-        } else {
-            Transmission::QueueFull
-        })
+        Err(error) if errno == Errno::EMSGSIZE => Err(tx::InjectionError::TooLarge(error)),
+        Err(error) => Err(tx::InjectionError::Fatal(error)),
     }
 }
 async fn send_tap(tap: &AsyncDevice, frame: &[u8]) -> Result<()> {
@@ -599,11 +512,15 @@ async fn send_tap(tap: &AsyncDevice, frame: &[u8]) -> Result<()> {
 fn log_stats(engine: &Engine) {
     let s = &engine.stats;
     info!(
-        "STATS tx_action {} tx_data {} tx_unicast {} tx_multicast {} | rx_action {} rx_data {} rx_unknown {} | tx_backpressure {} dropped {}",
+        "STATS tx_action {} tx_data {} tx_unicast {} tx_multicast {} | tx_packets {} tx_amsdu {} tx_aggregated_packets {} tx_aggregation_rejected {} | rx_action {} rx_data {} rx_unknown {} | tx_backpressure {} dropped {}",
         s.tx_action,
         s.tx_data,
         s.tx_unicast,
         s.tx_multicast,
+        s.tx_packets,
+        s.tx_amsdu,
+        s.tx_aggregated_packets,
+        s.tx_aggregation_rejected,
         s.rx_action,
         s.rx_data,
         s.rx_unknown,
@@ -623,154 +540,30 @@ async fn wait_cancel(control: &Option<Control>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        channel::{SLOT_US, SLOTS, Sequence, Strategy},
-        protocol::{self, Advertisement, Election},
-    };
-
     #[test]
-    fn injection_backpressure_preserves_packet_and_rechecks_peer_slot() {
-        let own = Mac([2, 0, 0, 0, 0, 1]);
-        let peer = Mac([2, 0, 0, 0, 0, 2]);
-        let mut engine = Engine::new(
-            Config {
-                peer_timeout: crate::timeouts::Timeouts::default().peer_idle,
-                retry_timeout: crate::timeouts::Timeouts::default().retry_cache,
-                pending_timeout: crate::timeouts::Timeouts::default().queued_packet,
-                mac: own,
-                name: "fixture".into(),
-                airdrop_port: None,
-                channel: 6,
-                strategy: Strategy::Pin,
-                fixed_radio: true,
-                metric_first: true,
-                election_metric: 60,
-                election_counter: 0,
-                widen: 4,
-                filter_rssi: false,
-                rate: Rate::default(),
-                capabilities: Default::default(),
-                operating_channel: None,
-            },
-            0,
-        );
-        let mut sequence = Sequence::fixed(149);
-        sequence.slots[0] = [6, 0x51];
-        let mif = protocol::encode_action(
-            &Advertisement {
-                mac: peer,
-                name: "fixture",
-                capabilities: &Default::default(),
-                sequence: &sequence,
-                election: &Election::own(peer),
-                channel: 6,
-                master_channel: 6,
-                next: 64,
-                aw_counter: 0,
-                now_us: 0,
-            },
-            3,
-            0,
-        );
-        engine.receive(&mif, 0).unwrap();
-        let mut ethernet = vec![];
-        ethernet.extend(peer.0);
-        ethernet.extend(own.0);
-        ethernet.extend([0x86, 0xdd]);
-        ethernet.extend([0x60; 48]);
-        let mut packet = PendingPacket::new(ethernet.clone(), 0);
-        let mut attempts = vec![];
+    fn injection_errors_distinguish_backpressure_oversize_and_failure() {
         for errno in [Errno::EAGAIN, Errno::ENOBUFS] {
             assert!(matches!(
-                packet
-                    .transmit(&mut engine, 10_000, |bytes| {
-                        attempts.push(bytes.to_vec());
-                        injection_result(Err(pcap::Error::PcapError("queue full".into())), errno)
-                    })
-                    .unwrap(),
-                Transmission::QueueFull
+                injection_result(Err(pcap::Error::PcapError("busy".into())), errno),
+                Err(tx::InjectionError::Backpressure)
             ));
         }
-        assert_eq!(attempts[0], attempts[1]);
-        assert_eq!(packet.ethernet, ethernet);
-        assert_eq!(packet.queued_us, 0);
         assert!(matches!(
-            packet
-                .transmit(&mut engine, SLOT_US + 10_000, |_| panic!(
-                    "must not inject after the peer changes channel"
-                ))
-                .unwrap(),
-            Transmission::WaitForSlot
+            injection_result(Err(pcap::Error::PcapError("large".into())), Errno::EMSGSIZE),
+            Err(tx::InjectionError::TooLarge(_))
         ));
         assert!(matches!(
-            packet
-                .transmit(&mut engine, SLOT_US * SLOTS as i64 + 10_000, |bytes| {
-                    assert_eq!(bytes, attempts[0]);
-                    injection_result(Ok(()), Errno::EAGAIN)
-                })
-                .unwrap(),
-            Transmission::Sent
+            injection_result(Err(pcap::Error::PcapError("gone".into())), Errno::ENODEV),
+            Err(tx::InjectionError::Fatal(_))
         ));
-        // Retuning while a VHT packet is backpressured updates only radiotap.
-        let caps = protocol::BandCapabilities {
-            ht: Some(protocol::HtCapabilities {
-                cap_info: 0x6e,
-                ampdu_params: 3,
-                rx_mask: [255, 255, 0, 0],
-                tx_mask: Some([255, 255, 0, 0]),
-            }),
-            vht: Some(protocol::VhtCapabilities {
-                cap_info: 1 << 5,
-                rx_mcs_map: 0xfffa,
-                tx_mcs_map: 0xfffa,
-                rx_highest: 0,
-                tx_highest: 0,
-            }),
-        };
-        let definition = crate::channel::ChannelDefinition::new(149, 80).unwrap();
-        engine.config.rate = "vht9-nss2-bw80-sgi".parse().unwrap();
-        engine.config.capabilities.ghz5 = caps.clone();
-        engine.peers.get_mut(&peer).unwrap().capabilities = caps;
-        engine.peers.get_mut(&peer).unwrap().sequence =
-            Some(Sequence::fixed_definition(definition));
-        engine.set_operating_channel(definition);
-        let mut packet = PendingPacket::new(ethernet, 0);
-        let mut first = vec![];
+        // A stale errno must never turn successful submission into an error.
+        assert!(injection_result(Ok(()), Errno::EMSGSIZE).is_ok());
         assert!(matches!(
-            packet
-                .transmit(&mut engine, 10_000, |bytes| {
-                    first = bytes.to_vec();
-                    Ok(false)
-                })
-                .unwrap(),
-            Transmission::QueueFull
-        ));
-        engine.set_operating_channel(crate::channel::ChannelDefinition::new(149, 20).unwrap());
-        assert!(matches!(
-            packet
-                .transmit(&mut engine, 10_000, |bytes| {
-                    let (rt, data) = radiotap::Radiotap::parse(bytes).unwrap();
-                    assert_eq!(rt.vht.unwrap().bw.unwrap().bandwidth, 20);
-                    assert_eq!(rt.vht.unwrap().users[0].unwrap().index, 8);
-                    assert_eq!(data, radiotap::Radiotap::parse(&first).unwrap().1);
-                    Ok(true)
-                })
-                .unwrap(),
-            Transmission::Sent
-        ));
-        assert!(
             injection_result(
-                Err(pcap::Error::PcapError("device gone".into())),
-                Errno::ENODEV
-            )
-            .is_err()
-        );
-        assert!(
-            injection_result(
-                Err(pcap::Error::PcapError("unspecified".into())),
+                Err(pcap::Error::PcapError("unknown".into())),
                 Errno::from_raw(0)
-            )
-            .is_err()
-        );
+            ),
+            Err(tx::InjectionError::Fatal(_))
+        ));
     }
 }

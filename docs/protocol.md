@@ -94,9 +94,13 @@ interface index 3. Indices can change when a TAP is recreated. HTTPS sockets bin
 link-local address. mDNS and keepalives are injected as Ethernet frames on the
 TAP so they do not depend on host VPN policy routing.
 
-The TAP MTU is **1450**, matching C OWL. Ethernet-to-AWDL encapsulation adds LLC,
-AWDL and 802.11 headers. Using MTU 1500 caused injection failures during TLS
-uploads on the tested MT7612U. TAP packet offloads remain disabled.
+The TAP MTU remains **1450** with packet offloads disabled. Session-owned
+monitors request MTU 8192 through rtnetlink so packet sockets can accept larger
+A-MSDUs. If that request is rejected, batching respects the reported monitor
+MTU; raw diagnostics use the prepared interface's current MTU. The owned
+monitor is deleted during teardown, so no persistent interface MTU changes.
+The previous TAP limit is retained; the monitor MTU bounds the full injected
+frame, including radiotap and 802.11 headers.
 
 Radio operations use `wl-nl80211` and `rtnetlink` directly, with bounded
 requests and kernel acknowledgments. Capability and regulatory checks decode
@@ -320,11 +324,46 @@ single user's MCS/NSS nibble pair with BCC coding. Encoding follows the
 [mac80211 injection format](https://docs.kernel.org/networking/mac80211-injection.html).
 Queued packets keep their 802.11/AWDL sequence numbers across backpressure;
 retuning or capability changes refresh only the radiotap rate header. The
-encoder emits individual frames without outgoing aggregation.
+encoder can combine queued packets in A-MSDUs as described below.
 
 Fixed-radio unicast injection requests NOACK, inherited from the C patch. This
 transmit setting is distinct from the radio backend's hardware reception ACKs.
 FCS presence and radiotap padding are handled explicitly.
+
+### Transmit aggregation
+
+[TX batching](../src/tx.rs) belongs to the AWDL link layer, between the Ethernet
+TAP queue and the 802.11 codec. HTTP, TLS and archive code remain unaware of it.
+Already queued packets with the same source/destination are combined into one
+QoS TID-0 A-MSDU; sparse traffic is sent immediately without a coalescing timer.
+Only validated HT/VHT unicast peers with known capabilities are eligible.
+
+The body is bounded by both peers' HT maximum A-MSDU size (3839/7935), VHT
+maximum MPDU size when applicable, the current monitor MTU, and the remaining
+common-channel window. The local receive-size capability is also used as a
+conservative hardware bound; backend size rejection still triggers fallback.
+The scheduler subtracts its boundary guard and budgets each submitted burst
+using the selected PHY rate and a preamble/ACK allowance. Reservations carry
+across scheduler ticks and keep the radio on its transfer channel while
+submitted frames have estimated airtime remaining. Cleanup waits for that reservation and the configured quiet interval.
+Driver queue latency remains outside this estimate. Each subframe contains
+DA/SA, a big-endian length and its own LLC/AWDL payload and sequence number;
+padding aligns subsequent subframes to four bytes. No trailing padding is added.
+
+The queue limit counts Ethernet packets, including members of cached aggregates.
+Per-peer ordering and original expiry times survive batching and backpressure.
+The encoded frame and sequences are retained until successful submission;
+rate changes replace its radiotap header. If new capabilities no longer permit
+that aggregate, its unsent members are repacked. An aggregate rejected with
+`EMSGSIZE` disables aggregation for that link session and retries the members
+individually. Other permanent injection errors remain fatal.
+
+`tx_data` counts submitted Wi-Fi data frames, `tx_packets` counts their Ethernet
+packets, and `tx_amsdu`/`tx_aggregated_packets` describe batching.
+`tx_aggregation_rejected` counts driver size rejections. A-MPDU aggregation and
+Block ACK session management require kernel support. The current monitor path
+has no kernel peer records or BA sessions and cannot enable A-MPDU through
+radiotap alone.
 
 ## Bluetooth wake-up
 
@@ -809,6 +848,7 @@ service TLVs, NSEC, BLE presence and neighbor learning all affect visibility.
 | Area | Source |
 | --- | --- |
 | Frame encoding/decoding, service TLVs | [protocol.rs](../src/protocol.rs) |
+| Outgoing A-MSDU batching and injection retries | [tx.rs](../src/tx.rs) |
 | PHY rate parsing and selection | [rate.rs](../src/rate.rs) |
 | Clock and channel sequence | [channel.rs](../src/channel.rs) |
 | Election, peer validity, traffic scheduling | [engine.rs](../src/engine.rs) |

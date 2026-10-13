@@ -13,6 +13,9 @@ use std::{
 use tokio::process::Command;
 use wl_nl80211::Nl80211InterfaceType as IfType;
 
+// Enough room for the largest supported A-MSDU plus radiotap and MAC headers.
+const MONITOR_MTU: u32 = 8192;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -499,6 +502,9 @@ impl Radio {
             mac.0[5] ^= 1;
         }
         self.net.set_mac(name, mac).await?;
+        if !ibss && let Err(error) = self.net.set_mtu(name, MONITOR_MTU).await {
+            tracing::warn!(%error, "monitor MTU enlargement rejected; TX aggregation will use the current limit");
+        }
         let ipv6 = PathBuf::from(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"));
         if ipv6.exists() {
             tokio::fs::write(ipv6, b"1\n").await?;

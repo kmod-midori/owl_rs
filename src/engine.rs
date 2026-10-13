@@ -125,6 +125,10 @@ pub struct Stats {
     pub tx_data: u64,
     pub tx_backpressure: u64,
     pub tx_unicast: u64,
+    pub tx_packets: u64,
+    pub tx_amsdu: u64,
+    pub tx_aggregated_packets: u64,
+    pub tx_aggregation_rejected: u64,
     pub tx_multicast: u64,
     pub dropped: u64,
     pub peers_discovered: u64,
@@ -644,17 +648,52 @@ impl Engine {
         }
         rate
     }
-    pub(crate) fn data_frame(&mut self, ethernet: &[u8], rate: Rate) -> Result<Vec<u8>, Error> {
+    pub(crate) fn data_frame(&mut self, packets: &[&[u8]], rate: Rate) -> Result<Vec<u8>, Error> {
         let seq = self.next_sequence();
         let data_seq = self.data_sequence;
-        self.data_sequence = self.data_sequence.wrapping_add(1);
-        protocol::encode_data(
-            ethernet,
-            seq,
-            data_seq,
-            rate,
-            self.config.fixed_radio,
-            false,
-        )
+        self.data_sequence = self.data_sequence.wrapping_add(packets.len() as u16);
+        match packets {
+            [packet] => {
+                protocol::encode_data(packet, seq, data_seq, rate, self.config.fixed_radio, false)
+            }
+            _ => {
+                protocol::encode_amsdu(packets, seq, data_seq, rate, self.config.fixed_radio, false)
+            }
+        }
+    }
+    /// Remaining common-channel airtime, excluding the existing boundary guard.
+    pub(crate) fn tx_window_us(&self, destination: Mac, now: i64) -> i64 {
+        if !self.send_ready(destination, now) {
+            return 0;
+        }
+        if destination.multicast() {
+            return if self.config.fixed_radio {
+                SLOT_US
+            } else {
+                (self.clock.next_us(now) - 16 * 1024).max(0)
+            };
+        }
+        let peer = &self.peers[&destination];
+        let offset = if self.config.strategy == Strategy::Rotate {
+            peer.sync_offset_us.unwrap_or(0)
+        } else {
+            0
+        };
+        let horizon = SLOTS as i64 * SLOT_US;
+        let mut remaining = 0;
+        // Both schedules can have boundaries within one local slot. Stop at
+        // the first loss of overlap, including a peer's unsynchronized boundary.
+        for _ in 0..2 * SLOTS + 1 {
+            let time = now + remaining;
+            remaining += self
+                .clock
+                .next_us(time)
+                .min(self.clock.next_us(time + offset));
+            remaining = remaining.min(horizon);
+            if remaining == horizon || !self.same_channel(peer, now + remaining) {
+                break;
+            }
+        }
+        (remaining - 3 * 1024).max(0)
     }
 }

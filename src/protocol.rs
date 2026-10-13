@@ -9,6 +9,17 @@ use std::{fmt, net::Ipv6Addr, str::FromStr};
 pub const BSSID: Mac = Mac([0, 0x25, 0, 0xff, 0x94, 0x73]);
 pub const BROADCAST: Mac = Mac([255; 6]);
 pub const MAX_FRAME: usize = 65535;
+pub const MAX_AMSDU: usize = 7935;
+pub const MAX_AMSDU_PACKETS: usize = 64;
+
+pub(crate) fn tcp_frame(ethernet: &[u8]) -> bool {
+    matches!(
+        etherparse::SlicedPacket::from_ethernet(ethernet)
+            .ok()
+            .and_then(|p| p.transport),
+        Some(etherparse::TransportSlice::Tcp(_))
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mac(pub [u8; 6]);
@@ -424,7 +435,7 @@ fn parse_amsdu(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut r = Reader::new(data);
     let mut out = Vec::new();
     while !r.rest().is_empty() {
-        if out.len() == 64 {
+        if out.len() == MAX_AMSDU_PACKETS {
             return Err(Error::Invalid("A-MSDU subframe count"));
         }
         let destination = r.mac()?;
@@ -657,6 +668,34 @@ pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u
     tlv(&mut out, 21, &[0x34, 1]);
     out
 }
+fn ethernet_payload(ethernet: &[u8]) -> Result<(Mac, Mac, &[u8]), Error> {
+    let mut r = Reader::new(ethernet);
+    let destination = r.mac()?;
+    let source = r.mac()?;
+    if r.be16()? != 0x86dd || r.rest().len() > 1500 {
+        return Err(Error::Invalid("outgoing Ethernet frame"));
+    }
+    Ok((destination, source, r.rest()))
+}
+pub(crate) fn amsdu_subframe_len(ethernet: &[u8]) -> Option<usize> {
+    let (_, _, ipv6) = ethernet_payload(ethernet).ok()?;
+    Some(14 + 16 + ipv6.len())
+}
+fn data_payload(out: &mut Vec<u8>, ipv6: &[u8], sequence: u16) {
+    out.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0]);
+    le16(out, 0x0403);
+    le16(out, sequence);
+    le16(out, 0);
+    out.extend_from_slice(&0x86ddu16.to_be_bytes());
+    out.extend_from_slice(ipv6);
+}
+fn finish_data(mut out: Vec<u8>, header_start: usize, fcs: bool) -> Vec<u8> {
+    if fcs {
+        let crc = crc32fast::hash(&out[header_start..]);
+        out.extend_from_slice(&crc.to_le_bytes());
+    }
+    out
+}
 pub fn encode_data(
     ethernet: &[u8],
     sequence: u16,
@@ -665,27 +704,51 @@ pub fn encode_data(
     fixed: bool,
     fcs: bool,
 ) -> Result<Vec<u8>, Error> {
-    let mut r = Reader::new(ethernet);
-    let destination = r.mac()?;
-    let source = r.mac()?;
-    let ethertype = r.be16()?;
-    if ethertype != 0x86dd || r.rest().len() > 1500 {
-        return Err(Error::Invalid("outgoing Ethernet frame"));
-    }
+    let (destination, source, ipv6) = ethernet_payload(ethernet)?;
     let mut out = radiotap_tx(rate, fixed && !destination.multicast(), fcs)?;
     let header_start = out.len();
     header(&mut out, source, destination, sequence, 8);
-    out.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0]);
-    le16(&mut out, 0x0403);
-    le16(&mut out, data_sequence);
-    le16(&mut out, 0);
-    out.extend_from_slice(&ethertype.to_be_bytes());
-    out.extend_from_slice(r.rest());
-    if fcs {
-        let crc = crc32fast::hash(&out[header_start..]);
-        out.extend_from_slice(&crc.to_le_bytes());
+    data_payload(&mut out, ipv6, data_sequence);
+    Ok(finish_data(out, header_start, fcs))
+}
+/// One QoS MPDU containing same-address AWDL MSDUs, padded only between subframes.
+pub fn encode_amsdu(
+    packets: &[&[u8]],
+    sequence: u16,
+    data_sequence: u16,
+    rate: Rate,
+    fixed: bool,
+    fcs: bool,
+) -> Result<Vec<u8>, Error> {
+    if !(2..=MAX_AMSDU_PACKETS).contains(&packets.len()) {
+        return Err(Error::Invalid("A-MSDU packet count"));
     }
-    Ok(out)
+    let (destination, source, _) = ethernet_payload(packets[0])?;
+    if !destination.valid_unicast() || !source.valid_unicast() {
+        return Err(Error::Invalid("A-MSDU address"));
+    }
+    let mut out = radiotap_tx(rate, fixed, fcs)?;
+    let header_start = out.len();
+    header(&mut out, source, destination, sequence, 0x88);
+    out.extend_from_slice(&[0x80, 0]); // TID 0, A-MSDU present, normal on-air ACK policy.
+    let body_start = out.len();
+    for (i, packet) in packets.iter().enumerate() {
+        let (dst, src, ipv6) = ethernet_payload(packet)?;
+        if dst != destination || src != source {
+            return Err(Error::Invalid("A-MSDU address mismatch"));
+        }
+        if i != 0 {
+            out.resize(out.len() + (4 - (out.len() - body_start) % 4) % 4, 0);
+        }
+        if out.len() - body_start + 14 + 16 + ipv6.len() > MAX_AMSDU {
+            return Err(Error::Invalid("A-MSDU length"));
+        }
+        out.extend_from_slice(&destination.0);
+        out.extend_from_slice(&source.0);
+        out.extend_from_slice(&((16 + ipv6.len()) as u16).to_be_bytes());
+        data_payload(&mut out, ipv6, data_sequence.wrapping_add(i as u16));
+    }
+    Ok(finish_data(out, header_start, fcs))
 }
 
 /// AWDL service-response records use Apple's fixed DNS compression dictionary.
