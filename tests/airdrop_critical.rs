@@ -2,31 +2,12 @@
 use owl_rs::{
     archive,
     identity::Identity,
-    radio::{Backend, Profile},
     transfer::{Receiver, Sender},
 };
 use std::{
     io::{Read, Write},
     time::Duration,
 };
-#[test]
-fn toml_profiles_are_typed_and_reject_unsafe_combinations() {
-    let table = include_str!("../profiles.toml");
-    assert_eq!(
-        Profile::parse(table, "mt76x2u").unwrap().exclusive_backend,
-        Backend::ActiveMonitor
-    );
-    assert!(!Profile::parse(table, "unknown").unwrap().tested);
-    assert!(Profile::parse(&table.replace("active-monitor", "bogus"), "mt76x2u").is_err());
-    assert!(
-        Profile::parse(
-            &table.replace("mon_mac = \"station\"", "mon_mac = \"own\""),
-            "mt76x2u"
-        )
-        .is_err()
-    );
-    assert!(Profile::parse(&format!("{table}\nextra = true"), "unknown").is_err());
-}
 #[test]
 fn archive_roundtrip_bounds_traversal_and_corruption() {
     let dir = tempfile::tempdir().unwrap();
@@ -149,7 +130,10 @@ async fn native_https_transfer_and_connection_bound_upload() {
         id: "020000000001".into(),
         identity: identity.clone(),
         tag: None,
-        ask_timeout: Duration::from_secs(2),
+        timeouts: owl_rs::timeouts::Timeouts {
+            approval: Duration::from_secs(2),
+            ..Default::default()
+        },
     };
     let path = dir.path().join("payload.txt");
     // Multiple incompressible megabytes exercise sustained HTTPS streaming and
@@ -246,17 +230,14 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         1024 * 1024,
         true,
         None,
-    )
-    .with_once(true);
+    );
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
     let task = tokio::spawn({
         let receiver = receiver.clone();
-        async move {
-            receiver
-                .serve(listener, tokio_util::sync::CancellationToken::new())
-                .await
-        }
+        let cancel = cancel.clone();
+        async move { receiver.serve(listener, cancel).await }
     });
     let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
     let ssl = identity
@@ -337,6 +318,7 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         payload
     );
     drop(stream);
+    cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()

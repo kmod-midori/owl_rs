@@ -6,6 +6,9 @@ use owl_rs::{
 };
 fn config(mac: Mac) -> Config {
     Config {
+        peer_timeout: owl_rs::timeouts::Timeouts::default().peer_idle,
+        retry_timeout: owl_rs::timeouts::Timeouts::default().retry_cache,
+        pending_timeout: owl_rs::timeouts::Timeouts::default().queued_packet,
         airdrop_port: None,
         mac,
         name: "test".into(),
@@ -18,6 +21,8 @@ fn config(mac: Mac) -> Config {
         widen: 4,
         filter_rssi: false,
         rate: Rate::default(),
+        capabilities: Default::default(),
+        operating_channel: None,
     }
 }
 fn mif(mac: Mac, metric: u32, counter: u32, seq: &Sequence) -> Vec<u8> {
@@ -28,6 +33,7 @@ fn mif(mac: Mac, metric: u32, counter: u32, seq: &Sequence) -> Vec<u8> {
         &Advertisement {
             mac,
             name: "fixture",
+            capabilities: &Default::default(),
             sequence: seq,
             election: &election,
             channel: 6,
@@ -150,6 +156,7 @@ fn metric_first_election_and_fixed_radio_intersection_union() {
             &Advertisement {
                 mac: own,
                 name: "master fixture",
+                capabilities: &Default::default(),
                 sequence: &e.sequence,
                 election: &e.election,
                 channel: 149,
@@ -241,9 +248,80 @@ fn busy_peer_data_refreshes_liveness_without_discovering_unknown_peers() {
 }
 
 #[test]
+fn early_syns_wait_for_peer_validation_and_are_bounded_deduplicated_and_expired() {
+    let own = Mac([2, 0, 0, 0, 0, 1]);
+    let peer = Mac([2, 0, 0, 0, 0, 2]);
+    let syn = |source: Mac, destination: Mac, seq: u32, payload: &[u8]| {
+        let mut ethernet = Vec::new();
+        etherparse::PacketBuilder::ethernet2(source.0, destination.0)
+            .ipv6(source.ipv6().octets(), destination.ipv6().octets(), 64)
+            .tcp(12345, 8771, seq, 65535)
+            .syn()
+            .write(&mut ethernet, payload)
+            .unwrap();
+        let frame = protocol::encode_data(
+            &ethernet,
+            seq as u16,
+            seq as u16,
+            Rate::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        (ethernet, frame)
+    };
+    let mut engine = Engine::new(config(own), 0);
+    let (ethernet, frame) = syn(peer, own, 1, &[]);
+    assert!(engine.receive(&frame, 0).unwrap().0.is_empty());
+    assert!(engine.receive(&frame, 1).unwrap().0.is_empty());
+    assert!(engine.peers.is_empty());
+    assert_eq!(engine.stats.rx_syn_buffered, 1);
+    // Foreign unicast and SYNs containing application data are never staged.
+    engine
+        .receive(&syn(peer, Mac([2, 0, 0, 0, 0, 3]), 2, &[]).1, 2)
+        .unwrap();
+    engine.receive(&syn(peer, own, 3, &[1]).1, 3).unwrap();
+    assert_eq!(engine.stats.rx_syn_buffered, 1);
+    let (released, _) = engine
+        .receive(&mif(peer, 518, 1, &Sequence::fixed(6)), 4)
+        .unwrap();
+    assert_eq!(released, [ethernet]);
+    assert_eq!(engine.stats.rx_syn_released, 1);
+    assert!(
+        engine
+            .receive(&mif(peer, 518, 1, &Sequence::fixed(6)), 5)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    let mut expired = Engine::new(config(own), 0);
+    expired.receive(&frame, 0).unwrap();
+    assert!(
+        expired
+            .receive(&mif(peer, 518, 1, &Sequence::fixed(6)), 2_000_000)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    assert_eq!(expired.stats.rx_syn_expired, 1);
+    let mut bounded = Engine::new(config(own), 0);
+    for n in 0..130 {
+        bounded.receive(&syn(peer, own, n, &[]).1, 0).unwrap();
+    }
+    assert_eq!(bounded.stats.dropped, 2);
+    assert_eq!(
+        bounded
+            .receive(&mif(peer, 518, 1, &Sequence::fixed(6)), 1)
+            .unwrap()
+            .0
+            .len(),
+        128
+    );
+}
+
+#[test]
 fn discovery_plan_ranks_overlap_and_falls_back_without_publishing_failed_tunes() {
     use owl_rs::channel::ChannelPlan;
-    let cycle = SLOT_US * 16;
     let mut peer = Sequence::fixed(149);
     peer.slots[0] = [6, 0x51];
     peer.slots[1] = [44, 0x80];
@@ -264,60 +342,152 @@ fn discovery_plan_ranks_overlap_and_falls_back_without_publishing_failed_tunes()
         [149, 6, 44]
     );
     let mut plan = ChannelPlan::new(6, 6, vec![6, 44, 149]);
-    assert_eq!(plan.desired(0, Some(&peer), false), Some(6));
+    assert_eq!(plan.desired(Some(&peer), false), Some(6));
+    assert!(plan.discovering);
     assert!(!plan.applied(6));
-    assert_eq!(plan.desired(3 * cycle, Some(&peer), false), Some(149));
+    assert_eq!(plan.desired(Some(&peer), true), Some(149));
+    assert!(!plan.discovering);
     // A request alone, including a failed request, cannot alter the schedule.
     assert_eq!(plan.transmit_channel, 6);
     plan.failed(149);
-    assert_eq!(plan.desired(3 * cycle + 1, Some(&peer), false), Some(44));
+    assert_eq!(plan.desired(Some(&peer), true), Some(44));
     assert!(plan.applied(44));
     assert_eq!(plan.transmit_channel, 44);
-    let next = 3 * cycle + 10_000_000;
-    assert_eq!(plan.desired(next, Some(&peer), true), Some(44));
-    assert!(!plan.discovering);
-    assert_eq!(plan.desired(next + 1, Some(&peer), false), Some(6));
+    // A paused exchange or a changed sync parent must not trigger discovery
+    // visits or channel hopping. The next exchange re-evaluates the schedule.
+    assert_eq!(plan.desired(Some(&Sequence::fixed(6)), true), Some(44));
+    assert_eq!(plan.desired(None, true), Some(44));
+    assert_eq!(plan.desired(Some(&peer), false), Some(6));
     assert!(plan.discovering);
-    assert!(!plan.applied(6)); // Discovery never replaces the transmit schedule.
+    assert!(!plan.applied(6));
     assert_eq!(plan.transmit_channel, 44);
-    // A slow IBSS tune must still leave a full discovery window after arriving.
-    plan.discovery_ready(6, next + 2 * cycle);
-    assert_eq!(
-        plan.desired(next + 3 * cycle - 1, Some(&peer), false),
-        Some(6)
-    );
-    assert_eq!(plan.desired(next + 3 * cycle, Some(&peer), false), Some(44));
-    assert_eq!(plan.desired(next + 3 * cycle + 1, None, false), Some(6));
-    assert!(plan.applied(6)); // Without a sync parent, return to our preferred channel.
+    assert_eq!(plan.desired(Some(&Sequence::fixed(6)), true), Some(6));
+    assert!(!plan.discovering); // Channel 6 can itself be the best transfer channel.
+    assert!(plan.applied(6));
     plan.failed(44);
     plan.failed(6);
-    assert_eq!(plan.desired(next + 3 * cycle + 2, Some(&peer), false), None);
+    assert_eq!(plan.desired(Some(&peer), true), None);
+    assert_eq!(plan.desired(Some(&peer), false), None);
 }
 
 #[test]
-fn discovery_advertises_constant_transmit_slots_and_data_waits_for_overlap() {
+fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
     let own = Mac([2, 0, 0, 0, 0, 1]);
     let peer = Mac([2, 0, 0, 0, 0, 2]);
     let mut cfg = config(own);
-    cfg.channel = 149;
+    cfg.channel = 6;
     cfg.strategy = Strategy::Pin;
     let mut engine = Engine::new(cfg, 0);
     let mut sequence = Sequence::fixed(149);
     sequence.slots[0] = [6, 0x51];
     engine.receive(&mif(peer, 518, 10, &sequence), 0).unwrap();
     engine.tick(0);
-    assert!(!engine.send_ready(peer, 10_000));
-    assert!(engine.send_ready(peer, SLOT_US + 10_000));
+    assert!(engine.send_ready(peer, 10_000));
+    assert!(!engine.send_ready(peer, SLOT_US + 10_000));
     let bytes = engine.action_frame_on_channel(3, 10_000, 6);
     let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
         panic!("action frame");
     };
-    assert_eq!(action.sequence, Some(Sequence::fixed(149)));
-    engine.set_transmit_channel(44);
-    let bytes = engine.action_frame_on_channel(3, 10_000, 44);
+    assert_eq!(action.sequence, Some(Sequence::fixed(6)));
+    engine.set_operating_channel(owl_rs::channel::ChannelDefinition::new(149, 20).unwrap());
+    assert!(!engine.send_ready(peer, 10_000));
+    assert!(engine.send_ready(peer, SLOT_US + 10_000));
+    let bytes = engine.action_frame_on_channel(3, 10_000, 149);
     let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
         panic!("action frame");
     };
-    assert_eq!(action.sequence, Some(Sequence::fixed(44)));
+    assert_eq!(action.sequence, Some(Sequence::fixed(149)));
+    engine.set_operating_channel(owl_rs::channel::ChannelDefinition::new(6, 20).unwrap());
+    assert!(engine.send_ready(peer, 10_000));
     assert!(!engine.send_ready(peer, SLOT_US + 10_000));
+    for (width, class) in [(80, 128), (40, 126), (20, 124)] {
+        let definition = owl_rs::channel::ChannelDefinition::new(149, width).unwrap();
+        engine.set_operating_channel(definition);
+        engine.tick(10_000); // Following a parent must not erase the confirmed width.
+        for subtype in [0, 3] {
+            let bytes = engine.action_frame_on_channel(subtype, 10_000, 149);
+            let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
+                panic!("action frame")
+            };
+            assert_eq!(action.sequence.unwrap().slots, [[149, class]; 16]);
+        }
+    }
+    let mut sparse =
+        Sequence::fixed_definition(owl_rs::channel::ChannelDefinition::new(149, 80).unwrap());
+    sparse.slots[1] = [0, 0];
+    let mut cfg = config(own);
+    cfg.channel = 149;
+    cfg.fixed_radio = false;
+    cfg.operating_channel = Some(owl_rs::channel::ChannelDefinition::new(149, 20).unwrap());
+    let mut shared = Engine::new(cfg, 0);
+    shared.receive(&mif(peer, 518, 10, &sparse), 0).unwrap();
+    shared.tick(0);
+    // A wider parent must not overwrite our AP's width or unavailable slots.
+    assert_eq!(shared.sequence.slots[0], [149, 124]);
+    assert_eq!(shared.sequence.slots[1], [0, 0]);
+}
+
+#[test]
+fn hardware_capabilities_use_current_band_and_awdl_wire_layout() {
+    use protocol::{BandCapabilities, HtCapabilities, RadioCapabilities, VhtCapabilities};
+    fn tags(frame: &[u8]) -> std::collections::BTreeMap<u8, Vec<u8>> {
+        let rt_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+        let mut bytes = &frame[rt_len + 24 + 16..];
+        let mut tags = std::collections::BTreeMap::new();
+        while !bytes.is_empty() {
+            let len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+            tags.insert(bytes[0], bytes[3..3 + len].to_vec());
+            bytes = &bytes[3 + len..];
+        }
+        tags
+    }
+    let ht = HtCapabilities {
+        cap_info: 0x01ff,
+        ampdu_params: 3,
+        rx_mask: [255, 255, 0, 0],
+    };
+    let mut cfg = config(Mac([2, 0, 0, 0, 0, 1]));
+    cfg.capabilities = RadioCapabilities {
+        ghz2: BandCapabilities {
+            ht: Some(ht.clone()),
+            vht: None,
+        },
+        ghz5: BandCapabilities {
+            ht: Some(ht),
+            vht: Some(VhtCapabilities {
+                cap_info: 0x338001b0,
+                rx_mcs_map: 0xfffa,
+                rx_highest: 0x1234,
+                tx_mcs_map: 0xfffa,
+                tx_highest: 0x5678,
+            }),
+        },
+    };
+    let mut engine = Engine::new(cfg, 0);
+    let two = tags(&engine.action_frame_on_channel(3, 0, 6));
+    assert_eq!(two[&7], [0, 0, 0xff, 1, 3, 0xff, 0xff, 0, 0]);
+    assert!(!two.contains_key(&17));
+    let five = tags(&engine.action_frame_on_channel(3, 0, 149));
+    assert_eq!(five[&7], two[&7]);
+    assert_eq!(
+        five[&17],
+        [
+            191, 12, 0xb0, 1, 0x80, 0x33, 0xfa, 0xff, 0x34, 0x12, 0xfa, 0xff, 0x78, 0x56
+        ]
+    );
+    for (mask, expected) in [
+        ([0xff, 0, 0, 0], vec![0, 0, 0xff, 1, 3, 0xff, 0, 0]),
+        (
+            [0xff, 0xff, 0xff, 0x7f],
+            vec![0, 0, 0xff, 1, 3, 0xff, 0xff, 0xff, 0x7f, 0, 0],
+        ),
+    ] {
+        engine.config.capabilities.ghz2.ht.as_mut().unwrap().rx_mask = mask;
+        assert_eq!(tags(&engine.action_frame_on_channel(3, 0, 6))[&7], expected);
+    }
+    let psf = tags(&engine.action_frame_on_channel(0, 0, 149));
+    assert!(!psf.contains_key(&7) && !psf.contains_key(&17));
+    engine.config.capabilities = RadioCapabilities::default();
+    let absent = tags(&engine.action_frame_on_channel(3, 0, 149));
+    assert!(!absent.contains_key(&7) && !absent.contains_key(&17));
 }

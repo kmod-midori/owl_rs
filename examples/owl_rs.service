@@ -1,5 +1,5 @@
 [Unit]
-Description=Native Rust AirDrop control service (idle until send/receive)
+Description=Native Rust AirDrop control service (idle until send or BLE wake)
 After=NetworkManager.service bluetooth.service
 Wants=bluetooth.service
 

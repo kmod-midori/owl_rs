@@ -9,9 +9,11 @@
 #     inject or hear AWDL while associated. Works without an AP and only
 #     reconnects a previously connected station.
 # mon_mac:
-#   station: the monitor carries the station's MAC, used by the AWDL runtime.
-#   own: the monitor uses a separate locally administered MAC derived from the
-#     station's MAC. The runtime uses the monitor's actual address.
+#   station: shared mode uses the current station MAC; exclusive mode uses the
+#     random MAC generated once per daemon start, including the ACK interface.
+#   own: exclusive mode derives a separate monitor address from the random MAC.
+#     Shared mode always reuses the current station MAC. The runtime uses the
+#     monitor's actual address.
 # reconnect: reconnect after deleting the monitor interface, for drivers whose
 #   station stops receiving afterward.
 # mt76_pm: disable mt76 runtime power management and deep sleep for the session,

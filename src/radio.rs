@@ -94,9 +94,9 @@ impl Profile {
         Ok(profile)
     }
 }
-pub(crate) async fn nmcli(args: &[&str]) -> Result<String> {
+pub(crate) async fn nmcli(timeout: Duration, args: &[&str]) -> Result<String> {
     let p = tokio::time::timeout(
-        Duration::from_secs(15),
+        timeout,
         Command::new("nmcli").args(args).kill_on_drop(true).output(),
     )
     .await
@@ -157,9 +157,13 @@ pub struct Probe {
     pub ap_channel: Option<u8>,
     pub channels: Vec<u8>,
     pub active_monitor: bool,
+    pub capabilities: crate::protocol::RadioCapabilities,
+    pub operating_channel: Option<crate::channel::ChannelDefinition>,
+    pub tuning: Vec<crate::channel::ChannelDefinition>,
 }
-pub async fn probe(args: &RadioArgs) -> Result<Probe> {
-    probe_with(args, &Netlink::new()?).await
+pub async fn probe(args: &RadioArgs, timeouts: &crate::timeouts::Timeouts) -> Result<Probe> {
+    timeouts.validate()?;
+    probe_with(args, &Netlink::with_timeout(timeouts.netlink)?).await
 }
 async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     let iface = if args.interface == "auto" {
@@ -168,7 +172,7 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     } else {
         net.interface(&args.interface).await?
     };
-    let station = iface.name;
+    let station = iface.name.clone();
     interface_name(&station)?;
     interface_name(&args.monitor)?;
     interface_name(&args.host_interface)?;
@@ -199,8 +203,8 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     let linked = net.linked_frequency(&station, false).await?;
     let associated = linked.is_some();
     let ap_channel = linked.and_then(channel);
-    let (allowed, active_monitor) = net.phy_capabilities(iface.phy).await?;
-    let allowed: Vec<_> = allowed.into_iter().filter_map(channel).collect();
+    let caps = net.phy_capabilities(iface.phy).await?;
+    let allowed: Vec<_> = caps.frequencies.into_iter().filter_map(channel).collect();
     let order = if profile.exclusive_backend == Backend::ActiveMonitor {
         [6, 44, 149]
     } else {
@@ -218,11 +222,16 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
         associated,
         ap_channel,
         channels,
-        active_monitor,
+        active_monitor: caps.active_monitor,
+        capabilities: caps.radio,
+        operating_channel: iface.channel_definition(),
+        tuning: caps.tuning,
     })
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Journal {
+    #[serde(default)]
+    timeouts: crate::timeouts::Timeouts,
     pid: u32,
     stamp: String,
     station: String,
@@ -243,13 +252,25 @@ pub struct Radio {
     pub probe: Probe,
     pub channel: u8,
     pub transmit_channel: u8,
+    pub operating_channel: Option<crate::channel::ChannelDefinition>,
     state: Journal,
     journal: PathBuf,
     _lock: File,
     net: Netlink,
+    mac: Mac,
 }
 impl Radio {
-    pub async fn prepare(args: &RadioArgs, run_dir: &Path) -> Result<Self> {
+    pub async fn prepare(
+        args: &RadioArgs,
+        run_dir: &Path,
+        session_mac: Mac,
+        timeouts: &crate::timeouts::Timeouts,
+    ) -> Result<Self> {
+        timeouts.validate()?;
+        anyhow::ensure!(
+            session_mac.valid_unicast(),
+            "AWDL MAC must be nonzero and unicast"
+        );
         if !nix::unistd::geteuid().is_root() {
             bail!("radio setup requires root; run this command with sudo");
         }
@@ -263,8 +284,8 @@ impl Radio {
         lock.try_lock_exclusive()
             .context("another owl_rs process owns the radio")?;
         let journal = run_dir.join("radio.json");
-        recover_file(&journal).await?;
-        let net = Netlink::new()?;
+        recover_file(&journal, None).await?;
+        let net = Netlink::with_timeout(timeouts.netlink)?;
         let probe = probe_with(args, &net).await?;
         if !probe.profile.tested && !args.allow_untested {
             bail!(
@@ -334,13 +355,16 @@ impl Radio {
             }
         }
         let up = net.is_up(&probe.station).await?;
-        let nm = nmcli(&[
-            "-g",
-            "GENERAL.NM-MANAGED,GENERAL.CON-UUID",
-            "device",
-            "show",
-            &probe.station,
-        ])
+        let nm = nmcli(
+            timeouts.network_manager,
+            &[
+                "-g",
+                "GENERAL.NM-MANAGED,GENERAL.CON-UUID",
+                "device",
+                "show",
+                &probe.station,
+            ],
+        )
         .await
         .ok();
         let managed = nm.as_deref().and_then(|s| match s.lines().next()? {
@@ -359,6 +383,7 @@ impl Radio {
             );
         }
         let state = Journal {
+            timeouts: *timeouts,
             pid: std::process::id(),
             stamp: process_stamp(std::process::id())?,
             station: probe.station.clone(),
@@ -375,17 +400,40 @@ impl Radio {
             profile: probe.profile.clone(),
             pm: None,
         };
+        // Shared injection/ACKs may require the associated station address.
+        let mac = if probe.profile.mode == Mode::Shared {
+            probe.mac
+        } else {
+            session_mac
+        };
         let mut radio = Self {
+            mac,
             probe,
             channel: channels[0],
             transmit_channel,
+            operating_channel: None,
             state,
             journal,
             _lock: lock,
             net,
         };
         radio.persist()?;
-        if let Err(error) = radio.setup(&channels).await {
+        let setup = async {
+            radio.setup(&channels).await?;
+            radio.operating_channel = Some(
+                radio
+                    .net
+                    .interface(&radio.state.monitor)
+                    .await?
+                    .channel_definition()
+                    .or(radio.operating_channel)
+                    .or(radio.probe.operating_channel)
+                    .context("radio did not report its channel width and center frequency")?,
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = setup {
             if let Err(cleanup) = radio.shutdown().await {
                 tracing::error!("radio rollback failed: {cleanup:#}");
             }
@@ -437,9 +485,16 @@ impl Radio {
         } else {
             &self.state.monitor
         };
-        let _ = nmcli(&["device", "set", name, "managed", "no"]).await;
-        let mut mac = self.state.mac;
-        if !ibss && self.state.profile.mon_mac == MonMac::Own {
+        let _ = nmcli(
+            self.state.timeouts.network_manager,
+            &["device", "set", name, "managed", "no"],
+        )
+        .await;
+        let mut mac = self.mac;
+        if !ibss
+            && self.state.profile.mode == Mode::Exclusive
+            && self.state.profile.mon_mac == MonMac::Own
+        {
             mac.0[0] = (mac.0[0] | 2) & !1;
             mac.0[5] ^= 1;
         }
@@ -456,18 +511,28 @@ impl Radio {
             self.state.touched = true;
             self.persist()?;
             if self.state.managed == Some(true) {
-                nmcli(&["device", "set", &station, "managed", "no"]).await?;
+                nmcli(
+                    self.state.timeouts.network_manager,
+                    &["device", "set", &station, "managed", "no"],
+                )
+                .await?;
             }
             // No disassociate command is issued for an offline station.
             self.net.set_up(&station, false).await?;
             if self.state.profile.exclusive_backend == Backend::ActiveMonitor {
                 self.net.set_type(&station, IfType::Monitor).await?;
-                self.net.set_mac(&station, self.state.mac).await?;
+                self.net.set_mac(&station, self.mac).await?;
                 self.net.set_up(&station, true).await?;
                 self.create(false, true).await?;
                 let mut tuned = Err(anyhow::anyhow!("no allowed AWDL channel"));
                 for &c in channels {
-                    tuned = self.net.tune(&self.state.monitor, freq(c)?).await;
+                    tuned = self
+                        .net
+                        .tune(&self.state.monitor, c, 20)
+                        .await
+                        .map(|definition| {
+                            self.operating_channel = Some(definition);
+                        });
                     if tuned.is_ok() {
                         self.channel = c;
                         break;
@@ -478,7 +543,15 @@ impl Radio {
                 self.create(true, false).await?;
                 let mut chosen = None;
                 for &c in channels {
-                    if join_ibss(&self.net, &self.state.ibss, c).await.is_ok() {
+                    if join_ibss(
+                        &self.net,
+                        &self.state.ibss,
+                        c,
+                        self.state.timeouts.ibss_ready,
+                    )
+                    .await
+                    .is_ok()
+                    {
                         chosen = Some(c);
                         break;
                     }
@@ -519,7 +592,7 @@ impl Radio {
     }
 }
 async fn restore(state: &Journal) -> Result<()> {
-    let net = Netlink::new()?;
+    let net = Netlink::with_timeout(state.timeouts.netlink)?;
     let mut errors = Vec::new();
     if state.mon_created
         && Path::new(&format!("/sys/class/net/{}", state.monitor)).exists()
@@ -549,13 +622,16 @@ async fn restore(state: &Journal) -> Result<()> {
             net.set_mac(&state.station, state.mac).await?;
             net.set_up(&state.station, state.up).await?;
             if let Some(managed) = state.managed {
-                nmcli(&[
-                    "device",
-                    "set",
-                    &state.station,
-                    "managed",
-                    if managed { "yes" } else { "no" },
-                ])
+                nmcli(
+                    state.timeouts.network_manager,
+                    &[
+                        "device",
+                        "set",
+                        &state.station,
+                        "managed",
+                        if managed { "yes" } else { "no" },
+                    ],
+                )
                 .await?;
             }
             Ok::<_, anyhow::Error>(())
@@ -569,16 +645,19 @@ async fn restore(state: &Journal) -> Result<()> {
     if (state.touched || state.profile.reconnect)
         && state.managed == Some(true)
         && let Some(uuid) = &state.connection
-        && let Err(e) = nmcli(&[
-            "--wait",
-            "10",
-            "connection",
-            "up",
-            "uuid",
-            uuid,
-            "ifname",
-            &state.station,
-        ])
+        && let Err(e) = nmcli(
+            state.timeouts.network_manager,
+            &[
+                "--wait",
+                &state.timeouts.reconnect.as_secs_f64().ceil().to_string(),
+                "connection",
+                "up",
+                "uuid",
+                uuid,
+                "ifname",
+                &state.station,
+            ],
+        )
         .await
     {
         errors.push(e.to_string());
@@ -588,11 +667,14 @@ async fn restore(state: &Journal) -> Result<()> {
     }
     Ok(())
 }
-async fn recover_file(journal: &Path) -> Result<()> {
+async fn recover_file(journal: &Path, timeouts: Option<&crate::timeouts::Timeouts>) -> Result<()> {
     if !journal.exists() {
         return Ok(());
     }
-    let state: Journal = serde_json::from_slice(&std::fs::read(journal)?)?;
+    let mut state: Journal = serde_json::from_slice(&std::fs::read(journal)?)?;
+    if let Some(timeouts) = timeouts {
+        state.timeouts = *timeouts;
+    }
     if process_stamp(state.pid).is_ok_and(|s| s == state.stamp) {
         bail!("radio journal belongs to live PID {}", state.pid);
     }
@@ -601,7 +683,8 @@ async fn recover_file(journal: &Path) -> Result<()> {
     std::fs::remove_file(journal)?;
     Ok(())
 }
-pub async fn recover(run_dir: &Path) -> Result<()> {
+pub async fn recover(run_dir: &Path, timeouts: &crate::timeouts::Timeouts) -> Result<()> {
+    timeouts.validate()?;
     if !nix::unistd::geteuid().is_root() {
         bail!("recovery requires root");
     }
@@ -614,13 +697,13 @@ pub async fn recover(run_dir: &Path) -> Result<()> {
         .open(run_dir.join("radio.lock"))?;
     lock.try_lock_exclusive()
         .context("radio still owned by a running process")?;
-    recover_file(&run_dir.join("radio.json")).await
+    recover_file(&run_dir.join("radio.json"), Some(timeouts)).await
 }
 
-async fn join_ibss(net: &Netlink, iface: &str, channel: u8) -> Result<()> {
+async fn join_ibss(net: &Netlink, iface: &str, channel: u8, ready: Duration) -> Result<()> {
     let frequency = freq(channel)?;
     net.join_ibss(iface, frequency).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + ready;
     loop {
         if tokio::time::timeout_at(deadline, net.linked_frequency(iface, true))
             .await
@@ -635,9 +718,14 @@ async fn join_ibss(net: &Netlink, iface: &str, channel: u8) -> Result<()> {
     }
     bail!("IBSS did not become ready on channel {channel}")
 }
-pub async fn tune_ibss(net: &Netlink, iface: &str, channel: u8) -> Result<()> {
+pub async fn tune_ibss(
+    net: &Netlink,
+    iface: &str,
+    channel: u8,
+    timeouts: crate::timeouts::Timeouts,
+) -> Result<()> {
     if net.linked_frequency(iface, true).await?.is_some() {
         net.leave_ibss(iface).await?;
     }
-    join_ibss(net, iface, channel).await
+    join_ibss(net, iface, channel, timeouts.ibss_ready).await
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{
-    channel::ChannelPlan,
+    channel::{ChannelDefinition, ChannelPlan},
     engine::{Config, Engine, Event},
     netlink::Netlink,
     protocol::{MAX_FRAME, Mac},
@@ -24,6 +24,7 @@ use wl_nl80211::Nl80211InterfaceType as IfType;
 
 #[derive(Clone, Debug)]
 pub struct Options {
+    pub timeouts: crate::timeouts::Timeouts,
     pub input: String,
     pub host: String,
     pub listen_only: bool,
@@ -33,8 +34,16 @@ pub struct Options {
     pub summary: Option<String>,
     pub channel_plan: Option<ChannelPlan>,
     pub ibss_interface: Option<String>,
-    /// Confirmed physical channel from operation-scoped radio setup.
-    pub initial_channel: Option<u8>,
+    /// Shared AP contexts must never be retuned.
+    pub retune: bool,
+}
+fn tcp_frame(ethernet: &[u8]) -> bool {
+    matches!(
+        etherparse::SlicedPacket::from_ethernet(ethernet)
+            .ok()
+            .and_then(|p| p.transport),
+        Some(etherparse::TransportSlice::Tcp(_))
+    )
 }
 struct OwnedPacket {
     header: PacketHeader,
@@ -50,37 +59,33 @@ impl PacketCodec for Codec {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TuneRequest {
+    channel: u8,
+    max_width: u32,
+}
 async fn channel_worker(
     net: Netlink,
     iface: String,
     ibss: Option<String>,
-    mut rx: mpsc::Receiver<u8>,
-    results: mpsc::Sender<(u8, Result<()>)>,
+    mut rx: mpsc::Receiver<TuneRequest>,
+    results: mpsc::Sender<(TuneRequest, Result<ChannelDefinition>)>,
+    timeouts: crate::timeouts::Timeouts,
 ) {
-    while let Some(channel) = rx.recv().await {
+    while let Some(request) = rx.recv().await {
         let result = if let Some(ibss) = &ibss {
             time::timeout(
-                Duration::from_secs(15),
-                crate::radio::tune_ibss(&net, ibss, channel),
+                timeouts.ibss_tune,
+                crate::radio::tune_ibss(&net, ibss, request.channel, timeouts),
             )
             .await
             .context("IBSS retune timed out")
             .and_then(|result| result)
+            .and_then(|()| ChannelDefinition::new(request.channel, 20).map_err(Into::into))
         } else {
-            let frequency = match channel {
-                6 => 2437,
-                36 => 5180,
-                44 => 5220,
-                149 => 5745,
-                _ => 0,
-            };
-            if frequency == 0 {
-                Err(anyhow::anyhow!("unsupported radio channel {channel}"))
-            } else {
-                net.tune(&iface, frequency).await
-            }
+            net.tune(&iface, request.channel, request.max_width).await
         };
-        if results.send((channel, result)).await.is_err() {
+        if results.send((request, result)).await.is_err() {
             break;
         }
     }
@@ -146,27 +151,24 @@ pub struct Control {
     pub cancel: tokio_util::sync::CancellationToken,
     pub ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub snapshot: watch::Sender<serde_json::Value>,
+    pub(crate) policy: watch::Receiver<crate::visibility::Policy>,
+    pub(crate) traffic: watch::Receiver<usize>,
 }
 pub async fn controlled(config: Config, opts: Options, control: Control) -> Result<()> {
     live(config, &opts, Some(control)).await
 }
-async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> Result<()> {
-    let net = Netlink::new()?;
+async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) -> Result<()> {
+    let net = Netlink::with_timeout(opts.timeouts.netlink)?;
     crate::radio::interface_name(&opts.input)?;
     crate::radio::interface_name(&opts.host)?;
     let radio = net.interface(&opts.input).await?;
     if radio.kind != IfType::Monitor {
         bail!("AWDL diagnostics require a prepared monitor interface");
     }
-    let initial_channel = opts.initial_channel.or_else(|| {
-        radio.frequency.and_then(|f| match f {
-            2437 => Some(6),
-            5180 => Some(36),
-            5220 => Some(44),
-            5745 => Some(149),
-            _ => None,
-        })
-    });
+    let initial_definition = config
+        .operating_channel
+        .or_else(|| radio.channel_definition());
+    config.operating_channel = initial_definition;
     // Before opening TAP, reject existing names rather than adopting another process's device.
     if !opts.listen_only && Path::new(&format!("/sys/class/net/{}", opts.host)).exists() {
         bail!("host interface {} already exists", opts.host);
@@ -175,7 +177,7 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
         .snaplen(MAX_FRAME as i32)
         .promisc(true)
         .immediate_mode(true)
-        .timeout(1)
+        .timeout(opts.timeouts.capture_read.as_millis().max(1) as i32)
         .open()?
         .setnonblock()?;
     if cap.get_datalink() != pcap::Linktype::IEEE802_11_RADIOTAP {
@@ -242,11 +244,21 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
         opts.ibss_interface.clone(),
         channel_rx,
         result_tx,
+        opts.timeouts,
     ));
     let mut plan = opts.channel_plan.clone();
-    let mut applied_channel = initial_channel;
+    let mut applied_definition = initial_definition;
+    let mut applied_request = initial_definition.map(|d| TuneRequest {
+        channel: d.channel,
+        max_width: if opts.channel_plan.is_some() {
+            20
+        } else {
+            d.width_mhz
+        },
+    });
     let mut pending_channel = None;
     let start = Instant::now();
+    let advertised_port = config.airdrop_port;
     let mut engine = Engine::new(config, 0);
     let mut clean = time::interval(Duration::from_secs(1));
     let mut stats = time::interval(Duration::from_secs(10));
@@ -256,7 +268,7 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
     let mut queue: VecDeque<PendingPacket> = VecDeque::new();
     let mut psf_at = 110 * 1024;
     let mut mif_at = 0;
-    let mut last_unicast = None;
+    let mut last_tcp = None;
     let mut draining = None;
     let mut last_traffic = 0;
     info!("WLAN device: {} (addr {})", opts.input, engine.config.mac);
@@ -281,17 +293,20 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                 _ = usr1.recv() => info!(?engine.stats, "STATISTICS"),
                 _ = stats.tick() => log_stats(&engine),
                 response = result_rx.recv(), if pending_channel.is_some() => {
-                    let (channel, result) = response.context("channel worker stopped")?;
-                    ensure_channel_reply(pending_channel, channel)?;
+                    let (request, result) = response.context("channel worker stopped")?;
                     pending_channel = None;
                     match result {
-                        Ok(()) => {
-                            applied_channel = Some(channel);
-                            if let Some(plan) = &mut plan { plan.discovery_ready(channel, elapsed_us(start)); }
+                        Ok(definition) => {
+                            applied_definition = Some(definition);
+                            applied_request = Some(request);
+                            engine.set_operating_channel(definition);
+                            mif_at = 0;
+                            psf_at = 0;
+                            info!(?definition, "committed AWDL channel definition");
                         }
                         Err(error) => {
-                            warn!(channel, "channel request failed: {error:#}");
-                            if let Some(plan) = &mut plan { plan.failed(channel); }
+                            warn!(channel=request.channel, "channel request failed: {error:#}");
+                            if let Some(plan) = &mut plan { plan.failed(request.channel); }
                             else { return Err(error); }
                         }
                     }
@@ -306,7 +321,8 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                     if let Some(c) = &control {
                         let mut snapshot = serde_json::to_value(engine.summary())?;
                         if let Some(plan) = &plan { snapshot["channel_plan"] = serde_json::to_value(plan)?; }
-                        snapshot["physical_channel"] = serde_json::to_value(applied_channel)?;
+                        snapshot["physical_channel"] = serde_json::to_value(applied_definition.map(|d| d.channel))?;
+                        snapshot["physical_channel_definition"] = serde_json::to_value(applied_definition)?;
                         let _ = c.snapshot.send(snapshot);
                     }
                 },
@@ -325,7 +341,7 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                             }
                             if let Some(tap) = &tap {
                                 for frame in frames {
-                                    if !Mac(frame[..6].try_into()?).multicast() { last_unicast = Some(elapsed_us(start)); }
+                                    if tcp_frame(&frame) { last_tcp = Some(elapsed_us(start)); }
                                     send_tap(tap, &frame).await.context("deliver AWDL Ethernet frame to TAP")?;
                                 }
                             }
@@ -350,11 +366,11 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                     // HTTP/TLS shutdown only writes into the kernel/TAP. Keep AWDL
                     // alive until queued replies, FINs and discovery goodbyes have
                     // been injected, with a quiet interval for their ACKs. A lost
-                    // peer cannot prolong restoration past the queue's 2s budget.
+                    // peer cannot prolong restoration past the configured drain budget.
                     if let Some(since) = draining
-                        && (now - since >= 2_000_000
-                            || (queue.is_empty() && now - since >= 100_000
-                                && now - last_traffic >= 100_000)) {
+                        && (now - since >= opts.timeouts.radio_drain.as_micros() as i64
+                            || (queue.is_empty() && now - since >= opts.timeouts.radio_quiet.as_micros() as i64
+                                && now - last_traffic >= opts.timeouts.radio_quiet.as_micros() as i64)) {
                         break;
                     }
                     // Observation must not retune an interface owned by another session.
@@ -365,26 +381,41 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                     let desired = if let Some(plan) = &mut plan {
                         let parent = engine.peers.get(&engine.election.sync)
                             .filter(|p| p.valid).and_then(|p| p.sequence.as_ref());
-                        let busy = draining.is_some()
-                            || last_unicast.is_some_and(|t| now - t < 2_000_000)
-                            || queue.iter().any(|p| !Mac(p.ethernet[..6].try_into().expect("Ethernet header")).multicast());
-                        plan.desired(now, parent, busy).context("no usable AWDL channel remains")?
+                        // Discover/TLS traffic stays on discovery. An approved
+                        // transfer holds its chosen channel, including final TCP
+                        // acknowledgements queued after its transport lease ends.
+                        let busy = control.as_ref().is_some_and(|c| *c.traffic.borrow() > 0)
+                            || (!plan.discovering && (
+                                last_tcp.is_some_and(|t| now - t < opts.timeouts.queued_packet.as_micros() as i64)
+                                || queue.iter().any(|p| tcp_frame(&p.ethernet))
+                            ));
+                        plan.desired(parent, busy).context("no usable AWDL channel remains")?
                     } else { engine.current_channel(now) };
-                    if desired != 0 && applied_channel != Some(desired) {
-                        applied_channel = None;
-                        pending_channel = Some(desired);
-                        channel_tx.send(desired).await.context("channel worker stopped")?;
+                    let request = TuneRequest {
+                        channel: desired,
+                        max_width: if desired == 6 || opts.ibss_interface.is_some()
+                            || plan.as_ref().is_some_and(|p| p.discovering) { 20 } else { 80 },
+                    };
+                    if desired != 0 && opts.retune && applied_request != Some(request) {
+                        applied_definition = None;
+                        pending_channel = Some(request);
+                        channel_tx.send(request).await.context("channel worker stopped")?;
                         continue;
                     }
                     if let Some(plan) = &mut plan
-                        && applied_channel == Some(desired) && plan.applied(desired) {
-                        info!(channel=desired, "committed fixed transmit schedule");
-                        engine.set_transmit_channel(desired);
+                        && applied_definition.is_some_and(|d| d.channel == desired) {
+                        plan.applied(desired);
                     }
-                    let on_channel = desired != 0 && applied_channel == Some(desired);
+                    let on_channel = desired != 0 && applied_definition.is_some_and(|d| d.channel == desired);
                     if on_channel {
+                        if let Some(control) = &control {
+                            engine.config.airdrop_port = control.policy.borrow().mode.enabled().then_some(advertised_port).flatten();
+                        }
                         if now >= mif_at {
                             if !inject(stream.capture_mut(), &engine.action_frame_on_channel(3, now, desired))? { continue; }
+                            if engine.stats.tx_action == 0 {
+                                debug!(channel=desired, "first AWDL action frame submitted to radio");
+                            }
                             engine.stats.tx_action += 1;
                             mif_at = now + engine.clock.next_us(now) + SLOT_MIDDLE;
                         }
@@ -408,11 +439,11 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                             // Recheck current time and the applied channel for every frame.
                             let transmit_now = elapsed_us(start);
                             let known = dst.multicast() || engine.peers.get(&dst).is_some_and(|p| p.valid);
-                            if transmit_now - packet.queued_us > 2_000_000 || !known {
+                            if transmit_now - packet.queued_us > opts.timeouts.queued_packet.as_micros() as i64 || !known {
                                 engine.stats.dropped += 1;
                                 continue;
                             }
-                            if applied_channel != Some(engine.current_channel(transmit_now)) {
+                            if applied_definition.is_none_or(|d| d.channel != engine.current_channel(transmit_now)) {
                                 queue.push_back(packet);
                                 continue;
                             }
@@ -423,7 +454,7 @@ async fn live(config: Config, opts: &Options, mut control: Option<Control>) -> R
                                     if dst.multicast() {
                                         engine.stats.tx_multicast += 1;
                                     } else {
-                                        last_unicast = Some(transmit_now);
+                                        if tcp_frame(&packet.ethernet) { last_tcp = Some(transmit_now); }
                                         engine.stats.tx_unicast += 1;
                                     }
                                 },
@@ -563,13 +594,6 @@ fn log_stats(engine: &Engine) {
     );
 }
 
-fn ensure_channel_reply(pending: Option<u8>, channel: u8) -> Result<()> {
-    if pending != Some(channel) {
-        bail!("unexpected channel tuning result");
-    }
-    Ok(())
-}
-
 async fn wait_cancel(control: &Option<Control>) {
     if let Some(c) = control {
         c.cancel.cancelled().await;
@@ -592,6 +616,9 @@ mod tests {
         let peer = Mac([2, 0, 0, 0, 0, 2]);
         let mut engine = Engine::new(
             Config {
+                peer_timeout: crate::timeouts::Timeouts::default().peer_idle,
+                retry_timeout: crate::timeouts::Timeouts::default().retry_cache,
+                pending_timeout: crate::timeouts::Timeouts::default().queued_packet,
                 mac: own,
                 name: "fixture".into(),
                 airdrop_port: None,
@@ -604,6 +631,8 @@ mod tests {
                 widen: 4,
                 filter_rssi: false,
                 rate: Rate::default(),
+                capabilities: Default::default(),
+                operating_channel: None,
             },
             0,
         );
@@ -613,6 +642,7 @@ mod tests {
             &Advertisement {
                 mac: peer,
                 name: "fixture",
+                capabilities: &Default::default(),
                 sequence: &sequence,
                 election: &Election::own(peer),
                 channel: 6,

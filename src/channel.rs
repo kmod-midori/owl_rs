@@ -26,6 +26,58 @@ impl Encoding {
         if self == Self::Simple { 1 } else { 2 }
     }
 }
+/// Primary 20 MHz channel and the complete kernel channel definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ChannelDefinition {
+    pub channel: u8,
+    pub width_mhz: u32,
+    pub center_frequency_mhz: u32,
+}
+impl ChannelDefinition {
+    pub fn new(channel: u8, width_mhz: u32) -> Result<Self, Error> {
+        let primary = Self::frequency(channel)?;
+        let center_frequency_mhz = match (channel, width_mhz) {
+            (_, 20) => primary,
+            (6 | 36 | 44 | 149, 40) => primary + 10,
+            (36 | 44, 80) => 5210,
+            (149, 80) => 5775,
+            _ => return Err(Error::Invalid("radio channel width")),
+        };
+        Ok(Self {
+            channel,
+            width_mhz,
+            center_frequency_mhz,
+        })
+    }
+    pub fn frequency(channel: u8) -> Result<u32, Error> {
+        match channel {
+            6 => Ok(2437),
+            36 => Ok(5180),
+            44 => Ok(5220),
+            149 => Ok(5745),
+            _ => Err(Error::Invalid("radio channel")),
+        }
+    }
+    pub fn opclass(self) -> u8 {
+        match (self.channel, self.width_mhz) {
+            (6, 20) => 81,
+            (6, 40) if self.center_frequency_mhz > 2437 => 83,
+            (6, 40) => 84,
+            (36 | 44, 20) => 115,
+            (36 | 44, 40)
+                if self.center_frequency_mhz > Self::frequency(self.channel).unwrap_or(0) =>
+            {
+                116
+            }
+            (36 | 44, 40) => 117,
+            (149, 20) => 124,
+            (149, 40) => 126,
+            (_, 80) => 128,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Sequence {
     pub encoding: Encoding,
@@ -33,9 +85,34 @@ pub struct Sequence {
 }
 impl Sequence {
     pub fn fixed(channel: u8) -> Self {
+        match ChannelDefinition::new(channel, 20) {
+            Ok(definition) => Self::fixed_definition(definition),
+            Err(_) => Self {
+                encoding: Encoding::Opclass,
+                slots: [[channel, 0]; SLOTS],
+            },
+        }
+    }
+    pub fn fixed_definition(definition: ChannelDefinition) -> Self {
         Self {
             encoding: Encoding::Opclass,
-            slots: [[channel, if channel > 14 { 0x80 } else { 0x51 }]; SLOTS],
+            slots: [[definition.channel, definition.opclass()]; SLOTS],
+        }
+    }
+    /// Preserve availability while describing the width we actually serve.
+    pub fn with_definition(&self, definition: ChannelDefinition) -> Self {
+        Self {
+            encoding: Encoding::Opclass,
+            slots: std::array::from_fn(|i| {
+                let channel = self.channel(i);
+                if channel == definition.channel {
+                    [channel, definition.opclass()]
+                } else if self.encoding == Encoding::Opclass {
+                    self.slots[i]
+                } else {
+                    Self::fixed(channel).slots[0]
+                }
+            }),
         }
     }
     pub fn channel(&self, i: usize) -> u8 {
@@ -187,7 +264,7 @@ impl Clock {
     }
 }
 
-/// Operation-scoped discovery visits are separate from the advertised fixed schedule.
+/// Idle discovery and a fixed, operation-scoped transfer channel.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChannelPlan {
     pub discovery_channel: u8,
@@ -197,11 +274,8 @@ pub struct ChannelPlan {
     pub failed_channels: Vec<u8>,
     pub discovering: bool,
     #[serde(skip)]
-    deadline_us: i64,
-    #[serde(skip)]
-    discovery_duration_us: i64,
+    selected: Option<u8>,
 }
-const CYCLE_US: i64 = SLOT_US * SLOTS as i64;
 impl ChannelPlan {
     pub fn new(discovery: u8, preferred: u8, allowed: Vec<u8>) -> Self {
         Self {
@@ -211,42 +285,32 @@ impl ChannelPlan {
             allowed_channels: allowed,
             failed_channels: Vec::new(),
             discovering: true,
-            deadline_us: 3 * CYCLE_US,
-            discovery_duration_us: 3 * CYCLE_US,
+            selected: None,
         }
     }
-    /// A sync-parent schedule implies follower mode. A root uses its preference.
-    pub fn desired(&mut self, now: i64, parent: Option<&Sequence>, busy: bool) -> Option<u8> {
-        if now >= self.deadline_us {
-            if self.discovering {
-                self.discovering = false;
-                self.deadline_us = now + 10_000_000;
-            } else if !busy && !self.failed_channels.contains(&self.discovery_channel) {
-                self.discovering = true;
-                self.discovery_duration_us = CYCLE_US;
-                self.deadline_us = now + CYCLE_US;
-            }
+    /// Choose once per exchange; remain on discovery while no exchange is active.
+    pub fn desired(&mut self, parent: Option<&Sequence>, busy: bool) -> Option<u8> {
+        self.discovering = !busy;
+        if !busy {
+            self.selected = None;
+            return (!self.failed_channels.contains(&self.discovery_channel))
+                .then_some(self.discovery_channel);
         }
-        if self.discovering && !self.failed_channels.contains(&self.discovery_channel) {
-            return Some(self.discovery_channel);
+        if let Some(channel) = self.selected {
+            return Some(channel);
         }
-        // A failed discovery tune goes straight to the transmit candidates.
-        self.discovering = false;
         let own = Sequence::fixed(self.preferred_channel);
-        let channels = parent
+        self.selected = parent
             .unwrap_or(&own)
-            .ranked_channels(&self.allowed_channels, self.preferred_channel);
-        channels
+            .ranked_channels(&self.allowed_channels, self.preferred_channel)
             .into_iter()
-            .find(|c| !self.failed_channels.contains(c))
-    }
-    /// Tuning latency must not consume the actual discovery dwell window.
-    pub fn discovery_ready(&mut self, channel: u8, now: i64) {
-        if self.discovering && channel == self.discovery_channel {
-            self.deadline_us = now + self.discovery_duration_us;
-        }
+            .find(|c| !self.failed_channels.contains(c));
+        self.selected
     }
     pub fn failed(&mut self, channel: u8) {
+        if self.selected == Some(channel) {
+            self.selected = None;
+        }
         if !self.failed_channels.contains(&channel) {
             self.failed_channels.push(channel);
         }

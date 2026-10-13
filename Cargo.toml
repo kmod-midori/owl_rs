@@ -7,42 +7,47 @@ license = "GPL-3.0-or-later"
 description = "AirDrop CLI and daemon with safe Rust AWDL"
 
 [dependencies]
+anyhow = "1"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 bytes = "1"
-etherparse = "0.19"
+clap = { version = "4", features = ["derive"] }
+cms = "0.2"
 cpio-archive = "0.10"
+crc32fast = "1"
+etherparse = "0.19"
 flate2 = "1"
 fs2 = "0.4"
+futures-util = "0.3"
 hickory-proto = { version = "0.25", default-features = false, features = ["mdns"] }
 http-body-util = "0.1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 nix = { version = "0.31", features = ["user", "fs"] }
 openssl = "0.10"
-plist = "1"
-socket2 = { version = "0.6", features = ["all"] }
-tempfile = "3"
-tokio-openssl = "0.6"
-tokio-util = { version = "0.7", features = ["rt", "io"] }
-uuid = { version = "1", features = ["v4"] }
-walkdir = "2"
-toml = "0.9"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-crc32fast = "1"
-futures-util = "0.3"
 pcap = { version = "2", features = ["capture-stream"] }
+plist = "1"
 radiotap = "1"
+rtnetlink = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "sync", "net", "io-util", "fs"] }
-tun-rs = { version = "2", features = ["async_tokio"] }
+tokio-openssl = "0.6"
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+toml = "0.9"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rtnetlink = "0.23"
+tun-rs = { version = "2", features = ["async_tokio"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
 wl-nl80211 = "0.8"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

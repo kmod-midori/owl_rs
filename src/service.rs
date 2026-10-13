@@ -3,14 +3,16 @@
 use crate::{
     archive::{self, Item},
     ble::Wake,
-    channel::{ChannelPlan, Strategy},
     discovery::Discovery,
-    engine::Config,
     identity::Identity,
+    link::Link,
     protocol::{Mac, Rate},
-    radio::{Mode, Radio, RadioArgs},
-    runtime,
+    radio::RadioArgs,
+    session::{Activity, Lease},
+    timeouts::Timeouts,
     transfer::{Receiver, Sender, Transfer},
+    transport::Transport,
+    visibility::{self, Policy, Visibility},
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
@@ -25,7 +27,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, oneshot, watch},
+    sync::{Mutex, watch},
 };
 use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
@@ -33,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 pub struct Options {
     #[command(flatten)]
     pub radio: RadioArgs,
+    #[arg(skip)]
+    #[serde(default)]
+    pub timeouts: Timeouts,
     #[arg(long, default_value = "owl-rs")]
     pub name: String,
     /// User who owns the control socket, identity and received files (root daemons).
@@ -59,8 +64,8 @@ pub struct Options {
     pub auto_accept: bool,
     #[arg(long,default_value_t=4*1024*1024*1024)]
     pub max_bytes: u64,
-    /// Limit the daemon or active session lifetime in seconds.
-    #[arg(long)]
+    /// Limit the daemon lifetime or one outgoing operation in seconds.
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
     pub duration: Option<u64>,
     #[arg(long)]
     pub save: Option<String>,
@@ -72,6 +77,20 @@ pub struct Options {
     /// Experimental advertised local election counter (fixed, not availability-window timing).
     #[arg(long, default_value_t = 0)]
     pub election_counter: u32,
+}
+impl Options {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.name.is_empty() && self.name.len() <= 64,
+            "name must be 1..64 bytes"
+        );
+        ensure!(self.max_bytes > 0, "max-bytes must be positive");
+        ensure!(
+            self.duration.is_none_or(|s| (1..=86400).contains(&s)),
+            "duration must be 1..86400 seconds"
+        );
+        self.timeouts.validate()
+    }
 }
 pub fn owner(name: Option<&str>) -> Result<(u32, u32, PathBuf)> {
     if let Some(name) = name {
@@ -95,171 +114,21 @@ pub fn owner(name: Option<&str>) -> Result<(u32, u32, PathBuf)> {
         nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?.context("user not found")?;
     Ok((uid, user.gid.as_raw(), user.dir))
 }
-const RECEIVE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
-
-struct Network {
-    radio: Option<Radio>,
-    task: Option<tokio::task::JoinHandle<Result<()>>>,
-    cancel: CancellationToken,
-    snapshot: watch::Receiver<serde_json::Value>,
-    mac: Mac,
-    address: SocketAddrV6,
-    interface: Option<String>,
-}
-impl Network {
-    async fn start(opts: &Options) -> Result<Self> {
-        let cancel = CancellationToken::new();
-        let (tx, snapshot) = watch::channel(serde_json::json!({}));
-        if opts.no_radio {
-            ensure!(
-                opts.listen.ip().is_loopback(),
-                "--no-radio listener must be loopback; use radio setup for AWDL"
-            );
-            let std::net::IpAddr::V6(ip) = opts.listen.ip() else {
-                bail!("AirDrop requires an IPv6 listener");
-            };
-            return Ok(Self {
-                radio: None,
-                task: None,
-                cancel,
-                snapshot,
-                mac: Mac([2, 0, 0, 0, 0, 1]),
-                address: SocketAddrV6::new(ip, opts.listen.port(), 0, 0),
-                interface: None,
-            });
-        }
-        let radio = Radio::prepare(&opts.radio, &opts.run_dir).await?;
-        let mut network = Self {
-            radio: Some(radio),
-            task: None,
-            cancel,
-            snapshot,
-            mac: Mac([0; 6]),
-            address: SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, opts.listen.port(), 0, 0),
-            interface: Some(opts.radio.host_interface.clone()),
-        };
-        if let Err(error) = network.initialize(opts, tx).await {
-            return match network.stop().await {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("AWDL runtime/restoration failed: {cleanup:#}")))
-                }
-            };
-        }
-        Ok(network)
-    }
-    async fn initialize(
-        &mut self,
-        opts: &Options,
-        tx: watch::Sender<serde_json::Value>,
-    ) -> Result<()> {
-        let net = crate::netlink::Netlink::new()?;
-        let radio = self.radio.as_ref().context("radio has not been prepared")?;
-        let mac =
-            std::fs::read_to_string(format!("/sys/class/net/{}/address", opts.radio.monitor))?
-                .trim()
-                .parse::<Mac>()?;
-        let config = Config {
-            airdrop_port: Some(opts.listen.port()),
-            mac,
-            name: mac.0.iter().map(|b| format!("{b:02x}")).collect(),
-            channel: radio.transmit_channel,
-            strategy: if radio.probe.profile.mode == Mode::Exclusive {
-                Strategy::Pin
-            } else {
-                Strategy::Intersect
-            },
-            fixed_radio: radio.probe.profile.mode == Mode::Exclusive,
-            metric_first: radio.probe.profile.mode == Mode::Exclusive,
-            election_metric: opts.election_metric,
-            election_counter: opts.election_counter,
-            widen: 4,
-            filter_rssi: false,
-            rate: opts.rate,
-        };
-        let ropts = runtime::Options {
-            input: opts.radio.monitor.clone(),
-            host: opts.radio.host_interface.clone(),
-            listen_only: false,
-            duration: None,
-            save: opts.save.clone(),
-            save_invalid: None,
-            summary: None,
-            channel_plan: (radio.probe.profile.mode == Mode::Exclusive).then(|| {
-                ChannelPlan::new(
-                    radio.channel,
-                    radio.transmit_channel,
-                    radio.probe.channels.clone(),
-                )
-            }),
-            ibss_interface: radio.ibss_interface(),
-            initial_channel: Some(radio.channel),
-        };
-        let (ready, rx) = oneshot::channel();
-        let control = runtime::Control {
-            cancel: self.cancel.clone(),
-            ready: Some(ready),
-            snapshot: tx,
-        };
-        self.task = Some(tokio::spawn(runtime::controlled(config, ropts, control)));
-        tokio::time::timeout(Duration::from_secs(15), rx)
-            .await
-            .context("AWDL startup readiness timed out")?
-            .context("AWDL stopped before startup readiness")?;
-        ensure!(
-            !self.task.as_ref().unwrap().is_finished(),
-            "AWDL stopped during startup"
-        );
-        // NetworkManager must not autoconfigure the temporary Ethernet TAP.
-        if let Err(e) =
-            crate::radio::nmcli(&["device", "set", &opts.radio.host_interface, "managed", "no"])
-                .await
-        {
-            tracing::warn!("could not mark AWDL TAP unmanaged: {e:#}");
-        }
-        // The runtime brings up its TAP with nodad before reporting readiness.
-        // Verify the specific link-local address before binding HTTPS.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !net.address_ready(&opts.radio.host_interface, mac).await? {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("AWDL link-local IPv6 address did not become ready")??;
-        let index = crate::discovery::scope(&opts.radio.host_interface)?;
-        self.mac = mac;
-        self.address = SocketAddrV6::new(mac.ipv6(), opts.listen.port(), 0, index);
-        Ok(())
-    }
-    async fn stop(&mut self) -> Result<()> {
-        self.cancel.cancel();
-        let mut error = None;
-        if let Some(task) = self.task.take()
-            && let Err(e) = task.await.map_err(anyhow::Error::from).and_then(|v| v)
-        {
-            error = Some(e);
-        }
-        if let Some(radio) = &mut self.radio {
-            radio.shutdown().await?;
-        }
-        if let Some(e) = error {
-            tracing::error!("AWDL runtime exited: {e:#}");
-            return Err(e);
-        }
-        Ok(())
-    }
-}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Command {
     Status,
+    Discoverable {
+        mode: Visibility,
+        #[serde(default)]
+        contacts_file: Option<PathBuf>,
+    },
     Peers {
         timeout: u64,
     },
     Transfers,
     Accept {
-        id: String,
+        id: Option<String>,
     },
     Reject {
         id: String,
@@ -268,11 +137,6 @@ pub enum Command {
         id: String,
     },
     Stop,
-    Receive {
-        once: bool,
-        #[serde(default)]
-        options: serde_json::Value,
-    },
     Send {
         to: String,
         direct: Option<SocketAddrV6>,
@@ -310,11 +174,12 @@ async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Ve
 #[derive(Clone)]
 struct State {
     receiver: Receiver,
-    sender: Option<Sender>,
+    sender: Sender,
     discovery: Discovery,
     cancel: CancellationToken,
     snapshot: watch::Receiver<serde_json::Value>,
     scope: u32,
+    activity: Arc<Activity>,
 }
 impl State {
     async fn names(
@@ -322,9 +187,7 @@ impl State {
         deadline: tokio::time::Instant,
     ) -> Vec<(crate::discovery::Peer, Option<String>)> {
         use futures_util::{StreamExt, stream};
-        let Some(sender) = &self.sender else {
-            return Vec::new();
-        };
+        let sender = &self.sender;
         let mut candidates: Vec<_> = self
             .discovery
             .list()
@@ -346,14 +209,25 @@ impl State {
                             .iter()
                             .any(|(p, _)| *p.address.ip() == mac.ipv6())
                     {
-                        candidates.push((crate::discovery::Peer::from_awdl(mac, self.scope), true));
+                        candidates.push((
+                            crate::discovery::Peer::from_awdl(
+                                mac,
+                                self.scope,
+                                self.sender.timeouts.discovery_fallback,
+                            ),
+                            true,
+                        ));
                     }
                 }
             }
         }
         stream::iter(candidates)
             .map(|(peer, fallback)| async move {
-                let end = deadline.min(tokio::time::Instant::now() + Duration::from_secs(8));
+                let end =
+                    deadline.min(tokio::time::Instant::now() + self.sender.timeouts.name_probe);
+                let Ok(_exchange) = self.activity.acquire() else {
+                    return (peer, None, fallback);
+                };
                 let name = tokio::time::timeout_at(end, sender.discover(peer.address))
                     .await
                     .ok()
@@ -372,7 +246,7 @@ impl State {
             .await
     }
     async fn named_peers(&self, seconds: u64) -> Vec<serde_json::Value> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(1, 300));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(1, 86400));
         loop {
             let peers = self.names(deadline).await;
             if !peers.is_empty() || tokio::time::Instant::now() >= deadline {
@@ -397,7 +271,7 @@ impl State {
             );
             return Ok(address);
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(1, 300));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(1, 86400));
         loop {
             for peer in self.discovery.list().await {
                 if peer.id.eq_ignore_ascii_case(to) {
@@ -423,17 +297,13 @@ impl State {
     ) -> Result<serde_json::Value> {
         match command {
             Command::Status => Ok(
-                serde_json::json!({"name":self.receiver.name,"awdl":self.snapshot.borrow().clone(),"sending":[],"transfers":self.receiver.transfers().await}),
+                serde_json::json!({"name":self.receiver.name,"visibility":self.receiver.visibility(),"awdl":self.snapshot.borrow().clone(),"sending":[],"transfers":self.receiver.transfers().await}),
             ),
             Command::Peers { timeout } => {
-                ensure!(
-                    self.sender.is_some(),
-                    "receive session does not browse outgoing receivers"
-                );
                 Ok(serde_json::to_value(self.named_peers(timeout).await)?)
             }
             Command::Transfers => Ok(serde_json::to_value(self.receiver.transfers().await)?),
-            Command::Accept { id } => {
+            Command::Accept { id: Some(id) } => {
                 self.receiver.decide(&id, true).await?;
                 Ok(serde_json::json!({"accepted":id}))
             }
@@ -441,7 +311,10 @@ impl State {
                 self.receiver.decide(&id, false).await?;
                 Ok(serde_json::json!({"rejected":id}))
             }
-            Command::Cancel { .. } | Command::Stop | Command::Receive { .. } => {
+            Command::Cancel { .. }
+            | Command::Stop
+            | Command::Discoverable { .. }
+            | Command::Accept { id: None } => {
                 bail!("command requires the control service")
             }
             Command::Send {
@@ -453,10 +326,7 @@ impl State {
                 icon,
                 ..
             } => {
-                let sender = self
-                    .sender
-                    .as_ref()
-                    .context("receive-only session cannot send")?;
+                let sender = &self.sender;
                 ensure!(
                     urls.len() <= 4096 && items.len() <= 4096,
                     "too many transfer items"
@@ -475,7 +345,7 @@ impl State {
                     _ = cancel.cancelled() => Err(anyhow::anyhow!("send cancelled")),
                     result = async {
                         let address = self.target(&to, direct, timeout).await?;
-                        sender.send(address, items, urls, archive.as_ref().map(|f| f.path().into()), icon).await
+                        sender.send_with_activity(address, items, urls, archive.as_ref().map(|f| f.path().into()), icon, Some(&self.activity)).await
                     } => result,
                 };
                 let id = result?;
@@ -537,13 +407,15 @@ async fn signals(cancel: CancellationToken, duration: Option<u64>) {
         } => cancel.cancel(),
     }
 }
+async fn expires(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 pub type Request = (Command, Option<tempfile::NamedTempFile>);
-async fn session(opts: Options, active: Active, request: Request) -> Result<()> {
-    ensure!(
-        !opts.name.is_empty() && opts.name.len() <= 64,
-        "name must be 1..64 bytes"
-    );
-    ensure!(opts.max_bytes > 0, "max-bytes must be positive");
+async fn session(active: &Active) -> Result<()> {
+    let opts = &active.opts;
     let (uid, gid, home) = owner(opts.owner.as_deref())?;
     let keys = opts
         .keys
@@ -576,164 +448,166 @@ async fn session(opts: Options, active: Active, request: Request) -> Result<()> 
         !active.cancel.is_cancelled(),
         "session cancelled before startup"
     );
-    let mut network = Network::start(&opts).await?;
-    let mut wake = if opts.no_bluetooth || opts.no_radio {
-        None
-    } else {
-        match Wake::start(opts.bluetooth_adapter.as_deref(), identity.hashes).await {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!(
-                    "BLE unavailable: {e:#}; receivers may require the AirDrop screen open"
-                );
-                None
-            }
-        }
+    let link_opts = crate::link::Options {
+        radio: opts.radio.clone(),
+        run_dir: opts.run_dir.clone(),
+        loopback: if opts.no_radio {
+            let std::net::IpAddr::V6(ip) = opts.listen.ip() else {
+                bail!("AirDrop requires an IPv6 listener")
+            };
+            Some(ip)
+        } else {
+            None
+        },
+        service_port: opts.listen.port(),
+        timeouts: opts.timeouts,
+        save: opts.save.clone(),
+        rate: opts.rate,
+        election_metric: opts.election_metric,
+        election_counter: opts.election_counter,
     };
+    let mut link = Link::start(
+        &link_opts,
+        active.policy.clone(),
+        active.mac,
+        active.activity.traffic(),
+    )
+    .await?;
     let result = async {
-        let receiving = matches!(request.0, Command::Receive { .. });
-        let once = matches!(request.0, Command::Receive { once: true, .. });
         let receiver = Receiver::new(
-            opts.name.clone(),
-            identity.clone(),
-            output,
-            opts.max_bytes,
-            opts.auto_accept,
-            if nix::unistd::geteuid().is_root() {
-                Some((uid, gid))
-            } else {
-                None
-            },
-        ).with_once(once);
-        let sender = (!receiving).then(|| Sender {
+            opts.name.clone(), identity.clone(), output, opts.max_bytes,
+            opts.auto_accept, nix::unistd::geteuid().is_root().then_some((uid, gid)),
+        )
+        .with_policy(active.policy.clone())
+        .with_activity(active.activity.clone()).with_timeouts(opts.timeouts);
+        let sender = Sender {
             name: opts.name.clone(),
-            id: network.mac.0.iter().map(|b| format!("{b:02x}")).collect(),
-            identity,
-            tag: wake.as_ref().map(|w| w.tag),
-            ask_timeout: Duration::from_secs(60),
-        });
-        let discovery = if receiving { Discovery::receiving() } else { Discovery::default() };
-        // Keep AWDL alive until discovery has sent its goodbye and services drained.
-        let cancel = active.cancel.clone();
-        let mut tasks = tokio::task::JoinSet::new();
-        let listener = crate::transfer::listener(network.address.into(), network.interface.as_deref()).await?;
-        tasks.spawn({
-            let cancel = cancel.clone();
-            let receiver = receiver.clone();
-            async move {
-                receiver
-                    .serve(listener, cancel)
-                    .await
-                    .context("AirDrop HTTPS server")
-            }
-        });
-        if let Some(interface) = &network.interface {
-            tasks.spawn({
-                let interface = interface.clone();
-                let discovery = discovery.clone();
-                let cancel = cancel.clone();
-                let id = network.mac.0.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                let address = *network.address.ip();
-                let port = network.address.port();
-                let snapshot = network.snapshot.clone();
-                async move {
-                    discovery
-                        .run(&interface, &id, address, port, cancel, snapshot)
-                        .await
-                        .context("mDNS discovery")
-                }
-            });
-        }
+            id: link.mac.0.iter().map(|b| format!("{b:02x}")).collect(),
+            identity, tag: None, timeouts: opts.timeouts,
+        };
+        let bluetooth = !opts.no_bluetooth && !opts.no_radio;
+        let mut transport = Transport::start(
+            receiver, sender, &link, active.policy.clone(), opts.listen.port(),
+            bluetooth, opts.bluetooth_adapter.clone(),
+        ).await?;
         let state = State {
-            receiver,
-            sender,
-            discovery,
-            cancel: cancel.clone(),
-            snapshot: network.snapshot.clone(),
-            scope: network.address.scope_id(),
+            receiver: transport.receiver.clone(),
+            sender: transport.sender.clone(),
+            discovery: transport.discovery.clone(),
+            cancel: active.cancel.clone(),
+            snapshot: link.snapshot.clone(), scope: link.scope,
+            activity: active.activity.clone(),
         };
-        *active.live.lock().await = Some(state.clone());
-        tracing::info!(id=%active.id, kind=active.kind, address=%network.address, "AirDrop session ready");
-        let operation = tokio::select! {
-            _ = cancel.cancelled() => {
-                if receiving { Ok(()) } else { Err(anyhow::anyhow!("send cancelled")) }
+        *active.live.lock().await = Some(state);
+        active.phase.send_replace(Phase::Ready);
+        tracing::info!(id=%active.id, address=%link.address, "AirDrop session ready");
+        let result = tokio::select! {
+            _ = active.cancel.cancelled() => Ok(()),
+            _ = active.activity.idle(active.policy.clone()) => Ok(()),
+            done = transport.tasks.join_next() => match done {
+                Some(result) => result.context("AirDrop service task").and_then(|r| r),
+                None => Err(anyhow::anyhow!("AirDrop transport stopped")),
             },
-            _ = async {
-                if let Some(seconds) = opts.duration {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                } else { std::future::pending().await }
-            } => {
-                if receiving { Ok(()) } else { Err(anyhow::anyhow!("send session duration expired")) }
-            },
-            result = state.command(request.0, request.1), if !receiving => {
-                match result {
-                    Ok(value) => { *active.result.lock().await = Some(value); Ok(()) },
-                    Err(error) => Err(error),
-                }
-            },
-            done = tasks.join_next() => {
-                match done {
-                    Some(result) => result.context("AirDrop service task").and_then(|r| r),
-                    None => Err(anyhow::anyhow!("AirDrop services stopped")),
-                }
-            },
-            _ = async {
-                loop {
-                    if network.task.as_ref().is_some_and(|t| t.is_finished()) { break; }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            } => Err(anyhow::anyhow!("AWDL runtime stopped")),
+            _ = async { while !link.stopped() { tokio::time::sleep(Duration::from_millis(250)).await; } } => Err(anyhow::anyhow!("AWDL link stopped")),
         };
-        if once && operation.is_ok()
-            && state.receiver.transfers().await.iter().any(|t| t.state == "completed") {
-            // HTTPS has drained, but leave the radio and advertisements active
-            // briefly so the phone can finish its transfer UI before teardown.
-            tracing::info!(seconds=RECEIVE_COMPLETION_GRACE.as_secs(), "receive completed; keeping AWDL active before teardown");
-            tokio::select! {
-                _ = tokio::time::sleep(RECEIVE_COMPLETION_GRACE) => (),
-                _ = cancel.cancelled() => (),
-            }
-        }
-        cancel.cancel();
-        let drained = tokio::time::timeout(Duration::from_secs(2), async {
-            while tasks.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-        }
-        operation
-    }
-    .await;
-    if let Some(wake) = &mut wake {
-        wake.stop().await;
-    }
-    let cleanup = network.stop().await;
+        active.phase.send_replace(Phase::Closing);
+        active.activity.close();
+        active.cancel.cancel();
+        transport.stop().await;
+        result
+    }.await;
+    // The transport has sent its goodbyes and released its sockets before the
+    // link drains queued frames and restores the WLAN journal.
+    let cleanup = link.stop().await;
     match (result, cleanup) {
-        (Err(e), Err(cleanup)) => {
-            Err(e.context(format!("runtime/restoration failed: {cleanup:#}")))
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("link restoration failed: {cleanup:#}")))
         }
         (result, Ok(())) => result,
-        (Ok(()), Err(e)) => Err(e),
+        (Ok(()), Err(error)) => Err(error),
     }
 }
 
 #[derive(Clone)]
+enum Phase {
+    Starting,
+    Ready,
+    Closing,
+    Stopped(Option<String>),
+}
+#[derive(Clone)]
 struct Active {
+    mac: Mac,
     id: String,
-    kind: &'static str,
+    opts: Options,
     cancel: CancellationToken,
     live: Arc<Mutex<Option<State>>>,
-    result: Arc<Mutex<Option<serde_json::Value>>>,
+    phase: watch::Sender<Phase>,
+    policy: watch::Receiver<Policy>,
+    activity: Arc<Activity>,
+    sending: watch::Sender<std::collections::BTreeSet<String>>,
+}
+impl Active {
+    async fn ready(&self) -> Result<State> {
+        let mut phase = self.phase.subscribe();
+        loop {
+            let current = phase.borrow_and_update().clone();
+            match current {
+                Phase::Ready => {
+                    return self
+                        .live
+                        .lock()
+                        .await
+                        .clone()
+                        .context("AirDrop transport stopped");
+                }
+                Phase::Closing => bail!("AirDrop session is closing"),
+                Phase::Stopped(error) => {
+                    bail!("{}", error.as_deref().unwrap_or("AirDrop session stopped"))
+                }
+                Phase::Starting => (),
+            }
+            phase
+                .changed()
+                .await
+                .context("AirDrop session task stopped")?;
+        }
+    }
+    async fn stopped(&self) -> Result<()> {
+        let mut phase = self.phase.subscribe();
+        loop {
+            if let Phase::Stopped(error) = phase.borrow_and_update().clone() {
+                return error.map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
+            }
+            phase
+                .changed()
+                .await
+                .context("AirDrop session task stopped")?;
+        }
+    }
+}
+struct Sending {
+    lease: Lease,
+    ids: watch::Sender<std::collections::BTreeSet<String>>,
+    id: String,
+}
+impl Drop for Sending {
+    fn drop(&mut self) {
+        self.ids.send_modify(|ids| {
+            ids.remove(&self.id);
+        });
+    }
 }
 #[derive(Clone)]
 struct Daemon {
+    mac: Mac,
     opts: Options,
     cancel: CancellationToken,
     active: Arc<Mutex<Option<Active>>>,
     history: Arc<Mutex<Vec<Transfer>>>,
     sessions: tokio_util::task::TaskTracker,
+    visibility: Arc<visibility::Control>,
+    ble: watch::Receiver<bool>,
 }
 fn merge_options(base: &mut serde_json::Value, overrides: &serde_json::Value) -> Result<()> {
     if overrides.is_null() {
@@ -747,7 +621,7 @@ fn merge_options(base: &mut serde_json::Value, overrides: &serde_json::Value) ->
         let slot = target
             .get_mut(key)
             .with_context(|| format!("unknown session option {key}"))?;
-        if key == "radio" {
+        if key == "radio" || key == "timeouts" {
             merge_options(slot, value)?;
         } else {
             *slot = value.clone();
@@ -756,6 +630,54 @@ fn merge_options(base: &mut serde_json::Value, overrides: &serde_json::Value) ->
     Ok(())
 }
 impl Daemon {
+    async fn bluetooth(&self, listening: watch::Sender<bool>) {
+        let (wakes, mut requests) = tokio::sync::mpsc::channel(1);
+        let scanner = tokio::spawn({
+            let adapter = self.opts.bluetooth_adapter.clone();
+            let timeouts = self.opts.timeouts;
+            let policy = self.visibility.tx.subscribe();
+            let cancel = self.cancel.clone();
+            async move {
+                loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let result = crate::ble::listen(
+                        adapter.as_deref(),
+                        policy.clone(),
+                        cancel.clone(),
+                        wakes.clone(),
+                        listening.clone(),
+                        timeouts,
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!("BLE wake listener unavailable: {error:#}");
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(timeouts.ble_retry) => (),
+                    }
+                }
+            }
+        });
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                Some(hint) = requests.recv() => {
+                    if !self.visibility.tx.borrow().mode.enabled() { continue; }
+                    let result = tokio::select! {
+                        _ = self.cancel.cancelled() => break,
+                        result = self.activate(&serde_json::Value::Null, Some(hint), false) => result,
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!("BLE activation: {error:#}");
+                    }
+                }
+            }
+        }
+        let _ = scanner.await;
+    }
     async fn serve_control(&self, listener: UnixListener, uid: u32) -> Result<()> {
         let clients = Arc::new(tokio::sync::Semaphore::new(16));
         let mut connections = tokio::task::JoinSet::new();
@@ -804,6 +726,7 @@ impl Daemon {
             owner(opts.owner.as_deref())?.0 == owner(self.opts.owner.as_deref())?.0,
             "session owner must match the daemon owner"
         );
+        opts.validate()?;
         Ok(opts)
     }
     async fn live(&self) -> Result<State> {
@@ -812,7 +735,7 @@ impl Daemon {
             .lock()
             .await
             .clone()
-            .context("no active AirDrop session; start send or receive")?;
+            .context("no active AirDrop session; send or enable BLE discoverability")?;
         active
             .live
             .lock()
@@ -820,63 +743,191 @@ impl Daemon {
             .clone()
             .context("AirDrop session is starting")
     }
-    async fn start(
+    async fn activate(
         &self,
-        request: Request,
+        overrides: &serde_json::Value,
+        wake: Option<crate::ble::WakeHint>,
+        outgoing: bool,
+    ) -> Result<(Active, Option<Lease>)> {
+        loop {
+            let revision = if let Some(hint) = wake {
+                let policy = self.visibility.tx.borrow().clone();
+                ensure!(
+                    crate::ble::eligible(hint, policy.clone()).await,
+                    "BLE wake does not match the current receiving policy"
+                );
+                Some(policy.revision)
+            } else {
+                None
+            };
+            let mut current = self.active.lock().await;
+            if let Some(active) = current.as_ref() {
+                if active.activity.closed() || active.cancel.is_cancelled() {
+                    let active = active.clone();
+                    drop(current);
+                    active.stopped().await?;
+                    continue;
+                }
+                let mut requested = serde_json::to_value(&active.opts)?;
+                merge_options(&mut requested, overrides)?;
+                requested["duration"] = serde_json::Value::Null;
+                let requested: Options = serde_json::from_value(requested)?;
+                ensure!(
+                    serde_json::to_value(requested)? == serde_json::to_value(&active.opts)?,
+                    "session settings differ from the active link; cancel it before changing settings"
+                );
+                let lease = if outgoing {
+                    match active.activity.acquire() {
+                        Ok(lease) => Some(lease),
+                        Err(_) if active.activity.closed() => {
+                            let active = active.clone();
+                            drop(current);
+                            active.stopped().await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                let refreshed = revision.map(|revision| {
+                    let policy = self.visibility.tx.borrow();
+                    if policy.revision != revision {
+                        return None;
+                    }
+                    Some(active.activity.wake())
+                });
+                if matches!(refreshed, Some(None)) {
+                    drop(current);
+                    continue;
+                }
+                if let Some(Some(Err(error))) = refreshed {
+                    if active.activity.closed() {
+                        let active = active.clone();
+                        drop(current);
+                        drop(lease);
+                        active.stopped().await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if wake.is_some() {
+                    tracing::debug!("eligible BLE wake refreshed session deadline");
+                }
+                return Ok((active.clone(), lease));
+            }
+            ensure!(!self.cancel.is_cancelled(), "daemon is stopping");
+            if wake.is_some() {
+                ensure!(
+                    self.visibility.tx.borrow().mode.enabled(),
+                    "receiving is off"
+                );
+            }
+            let mut opts = self.options(overrides)?;
+            opts.duration = None;
+            let timeouts = opts.timeouts;
+            let active = Active {
+                mac: self.mac,
+                id: uuid::Uuid::new_v4().to_string(),
+                opts,
+                cancel: self.cancel.child_token(),
+                live: Arc::default(),
+                phase: watch::channel(Phase::Starting).0,
+                policy: self.visibility.tx.subscribe(),
+                activity: Activity::new(timeouts),
+                sending: watch::channel(Default::default()).0,
+            };
+            let lease = if outgoing {
+                Some(active.activity.acquire()?)
+            } else {
+                None
+            };
+            if let Some(revision) = revision {
+                let policy = self.visibility.tx.borrow();
+                if policy.revision != revision {
+                    drop(policy);
+                    drop(current);
+                    continue;
+                }
+                active.activity.wake()?;
+            }
+            *current = Some(active.clone());
+            if wake.is_some() {
+                tracing::info!("eligible AirDrop BLE wake; starting radio session");
+            }
+            let daemon = self.clone();
+            let worker = active.clone();
+            self.sessions.spawn(async move {
+                let result = session(&worker).await;
+                worker.activity.close();
+                if let Some(live) = worker.live.lock().await.take() {
+                    let mut history = daemon.history.lock().await;
+                    history.extend(live.receiver.transfers().await);
+                    let extra = history.len().saturating_sub(256);
+                    history.drain(..extra);
+                }
+                *daemon.active.lock().await = None;
+                let error = result.err().map(|error| format!("{error:#}"));
+                if let Some(error) = &error {
+                    tracing::warn!(%error, "AirDrop session stopped");
+                }
+                worker.phase.send_replace(Phase::Stopped(error));
+                worker.cancel.cancel();
+            });
+            return Ok((active, lease));
+        }
+    }
+    async fn send(
+        &self,
+        command: Command,
+        archive: Option<tempfile::NamedTempFile>,
         client_cancel: CancellationToken,
     ) -> Result<serde_json::Value> {
-        let (kind, overrides) = match &request.0 {
-            Command::Receive { options, .. } => ("receive", options),
-            Command::Send { options, .. } => ("send", options),
-            _ => bail!("not a session request"),
+        let Command::Send { options, .. } = &command else {
+            unreachable!()
         };
-        let opts = self.options(overrides)?;
-        let active = Active {
-            id: uuid::Uuid::new_v4().to_string(),
-            kind,
-            cancel: client_cancel,
-            live: Arc::default(),
-            result: Arc::default(),
+        let deadline = self
+            .options(options)?
+            .duration
+            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+        let (active, lease) = tokio::select! {
+            _ = client_cancel.cancelled() => bail!("send cancelled"),
+            _ = expires(deadline) => bail!("send duration expired"),
+            result = self.activate(options, None, true) => result?,
         };
-        {
-            let mut current = self.active.lock().await;
-            ensure!(
-                current.is_none(),
-                "an AirDrop session is already active; finish or cancel it first"
-            );
-            *current = Some(active.clone());
-        }
-        let daemon = self.clone();
-        let (reply, result) = oneshot::channel();
-        self.sessions.spawn(async move {
-            let outcome = session(opts, active.clone(), request).await;
-            let mut received = Vec::new();
-            if let Some(live) = active.live.lock().await.take() {
-                let transfers = live.receiver.transfers().await;
-                received.extend(
-                    transfers
-                        .iter()
-                        .filter(|t| t.state == "completed")
-                        .map(|t| t.offer.id.clone()),
-                );
-                let mut history = daemon.history.lock().await;
-                history.extend(transfers);
-                let extra = history.len().saturating_sub(256);
-                history.drain(..extra);
-            }
-            *daemon.active.lock().await = None;
-            let outcome = match outcome {
-                Ok(()) => Ok(active
-                    .result
-                    .lock()
-                    .await
-                    .take()
-                    .unwrap_or_else(|| serde_json::json!({"received":received}))),
-                Err(error) => Err(error),
-            };
-            let _ = reply.send(outcome);
+        let id = uuid::Uuid::new_v4().to_string();
+        active.sending.send_modify(|ids| {
+            ids.insert(id.clone());
         });
-        result.await.context("session task stopped")?
+        let sending = Sending {
+            lease: lease.context("missing send lifetime")?,
+            ids: active.sending.clone(),
+            id,
+        };
+        let mut wake = None;
+        let result = tokio::select! {
+            _ = client_cancel.cancelled() => Err(anyhow::anyhow!("send cancelled")),
+            _ = active.cancel.cancelled() => Err(anyhow::anyhow!("AirDrop session cancelled")),
+            _ = expires(deadline) => Err(anyhow::anyhow!("send duration expired")),
+            result = async {
+                let mut state = active.ready().await?;
+                if !active.opts.no_bluetooth && !active.opts.no_radio {
+                    match Wake::start(active.opts.bluetooth_adapter.as_deref(), [0; 8], active.opts.timeouts).await {
+                        Ok(advertisement) => { state.sender.tag = Some(advertisement.tag); wake = Some(advertisement); },
+                        Err(error) => tracing::warn!("BLE wake unavailable: {error:#}"),
+                    }
+                }
+                state.command(command, archive).await
+            } => result,
+        };
+        if let Some(wake) = &mut wake {
+            wake.stop().await;
+        }
+        if result.is_ok() {
+            sending.lease.complete();
+        }
+        drop(sending);
+        result
     }
     async fn command(
         &self,
@@ -885,28 +936,63 @@ impl Daemon {
         client_cancel: CancellationToken,
     ) -> Result<serde_json::Value> {
         match command {
-            Command::Receive { .. } | Command::Send { .. } => {
-                self.start((command, archive), client_cancel).await
+            Command::Send { .. } => self.send(command, archive, client_cancel).await,
+            Command::Peers { .. } => {
+                let active = self
+                    .active
+                    .lock()
+                    .await
+                    .clone()
+                    .context("no active AirDrop session")?;
+                let _lease = active.activity.acquire()?;
+                tokio::select! {
+                    _ = client_cancel.cancelled() => bail!("peer discovery cancelled"),
+                    _ = active.cancel.cancelled() => bail!("AirDrop session cancelled"),
+                    result = async { active.ready().await?.command(command, None).await } => result,
+                }
             }
+            Command::Discoverable {
+                mode,
+                contacts_file,
+            } => {
+                self.visibility.set(mode, contacts_file).await?;
+                Ok(serde_json::json!({"visibility": mode}))
+            }
+            Command::Accept { id: None } => loop {
+                if let Ok(live) = self.live().await
+                    && let Some(id) = live.receiver.accept_next().await?
+                {
+                    return Ok(serde_json::json!({"accepted": id}));
+                }
+                tokio::select! {
+                    _ = client_cancel.cancelled() => bail!("accept cancelled"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => (),
+                }
+            },
             Command::Status => {
+                let mode = self.visibility.tx.borrow().mode;
+                let listening = *self.ble.borrow();
                 let active = self.active.lock().await.clone();
                 if let Some(active) = active {
                     let live = active.live.lock().await.clone();
                     let mut value = if let Some(live) = live {
                         live.command(Command::Status, None).await?
                     } else {
-                        serde_json::json!({"name":self.opts.name,"awdl":{},"sending":[],"transfers":[]})
+                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"awdl":{},"sending":[],"transfers":[]})
                     };
-                    value["sending"] = if active.kind == "send" {
-                        serde_json::json!([active.id])
-                    } else {
-                        serde_json::json!([])
+                    value["ble"] = serde_json::json!({"listening":listening});
+                    value["timeouts"] = serde_json::to_value(active.opts.timeouts)?;
+                    value["sending"] = serde_json::to_value(active.sending.borrow().clone())?;
+                    let phase = match &*active.phase.borrow() {
+                        Phase::Starting => "starting",
+                        Phase::Ready => "active",
+                        _ => "closing",
                     };
-                    value["session"] = serde_json::json!({"id":active.id,"kind":active.kind,"phase":if active.live.lock().await.is_some(){"active"}else{"starting"}});
+                    value["session"] = serde_json::json!({"id":active.id,"phase":phase});
                     Ok(value)
                 } else {
                     Ok(
-                        serde_json::json!({"name":self.opts.name,"session":null,"awdl":{},"sending":[],"transfers":self.history.lock().await.clone()}),
+                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"session":null,"awdl":{},"sending":[],"transfers":self.history.lock().await.clone(),"timeouts":self.opts.timeouts}),
                     )
                 }
             }
@@ -940,7 +1026,8 @@ impl Daemon {
         );
         let mut reader = BufReader::new(socket);
         let command: Command = serde_json::from_slice(
-            &tokio::time::timeout(Duration::from_secs(10), read_line(&mut reader)).await??,
+            &tokio::time::timeout(self.opts.timeouts.control_request, read_line(&mut reader))
+                .await??,
         )?;
         let archive = if let Command::Send {
             bytes,
@@ -964,7 +1051,7 @@ impl Daemon {
                 let file = tempfile::NamedTempFile::new()?;
                 let mut writer = tokio::fs::File::from_std(file.reopen()?);
                 let n = tokio::time::timeout(
-                    Duration::from_secs(600),
+                    self.opts.timeouts.control_archive,
                     tokio::io::copy(&mut (&mut reader).take(*bytes), &mut writer),
                 )
                 .await??;
@@ -1006,7 +1093,8 @@ impl Daemon {
     }
 }
 pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
-    let (uid, gid, _) = owner(opts.owner.as_deref())?;
+    opts.validate()?;
+    let (uid, gid, home) = owner(opts.owner.as_deref())?;
     std::fs::create_dir_all(&opts.run_dir)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -1029,12 +1117,26 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
         )?;
     }
     let cancel = CancellationToken::new();
+    let (listening, ble) = watch::channel(false);
     let daemon = Daemon {
+        mac: Mac::random().context("generate daemon MAC")?,
         opts: opts.clone(),
         cancel: cancel.clone(),
         active: Arc::default(),
         history: Arc::default(),
         sessions: tokio_util::task::TaskTracker::new(),
+        visibility: visibility::Control::new(crate::contact_book::default_path(&home)),
+        ble,
+    };
+    let bluetooth = if initial.is_none() && !opts.no_bluetooth && !opts.no_radio {
+        Some(tokio::spawn({
+            let daemon = daemon.clone();
+            async move {
+                daemon.bluetooth(listening).await;
+            }
+        }))
+    } else {
+        None
     };
     let server = tokio::spawn({
         let daemon = daemon.clone();
@@ -1049,7 +1151,8 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
         },
     ));
     tracing::info!(control=%socket_path.display(), "AirDrop control ready; radio and HTTPS inactive");
-    let result = if let Some(request) = initial {
+    let initial_is_send = initial.is_some();
+    let mut result = if let Some(request) = initial {
         daemon
             .command(request.0, request.1, cancel.child_token())
             .await
@@ -1062,9 +1165,18 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
             _ = async { loop { if server.is_finished() {break;} tokio::time::sleep(Duration::from_millis(100)).await;} } => Err(anyhow::anyhow!("control server stopped")),
         }
     };
+    if initial_is_send && result.is_ok() {
+        let active = daemon.active.lock().await.clone();
+        if let Some(active) = active {
+            result = result.and(active.stopped().await);
+        }
+    }
     cancel.cancel();
     daemon.sessions.close();
     daemon.sessions.wait().await;
+    if let Some(task) = bluetooth {
+        let _ = task.await;
+    }
     let cleanup = server
         .await
         .context("control server task")
@@ -1073,4 +1185,313 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
     let _ = signal.await;
     let _ = std::fs::remove_file(&socket_path);
     result.and(cleanup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct TestArgs {
+        #[command(flatten)]
+        options: Options,
+    }
+
+    // One lifecycle regression covers reuse, both directions, policy changes,
+    // independent cancellation and ordered cleanup.
+    #[tokio::test]
+    async fn shared_session_reuses_link_and_survives_independent_transfer_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let bind = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let address = bind.local_addr().unwrap();
+        drop(bind);
+        let mut opts =
+            TestArgs::parse_from(["test", "--no-radio", "--no-bluetooth", "--auto-accept"]).options;
+        opts.listen = address;
+        opts.run_dir = temp.path().join("run");
+        opts.keys = Some(temp.path().join("keys"));
+        opts.output = Some(temp.path().join("received"));
+        let (_, ble) = watch::channel(false);
+        let daemon = Daemon {
+            mac: Mac::random().unwrap(),
+            opts,
+            cancel: CancellationToken::new(),
+            active: Arc::default(),
+            history: Arc::default(),
+            sessions: tokio_util::task::TaskTracker::new(),
+            visibility: visibility::Control::new(temp.path().join("contacts")),
+            ble,
+        };
+        assert!(
+            daemon
+                .activate(
+                    &serde_json::Value::Null,
+                    Some(crate::ble::WakeHint { hashes: [0; 8] }),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert!(!temp.path().join("keys").exists());
+        daemon
+            .visibility
+            .set(Visibility::Everyone, None)
+            .await
+            .unwrap();
+        assert!(
+            daemon
+                .options(&serde_json::json!({"duration":u64::MAX}))
+                .is_err()
+        );
+        let (active, _) = daemon
+            .activate(
+                &serde_json::Value::Null,
+                Some(crate::ble::WakeHint { hashes: [0; 8] }),
+                false,
+            )
+            .await
+            .unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(5), active.ready())
+            .await
+            .unwrap()
+            .unwrap();
+        let (again, _) = daemon
+            .activate(
+                &serde_json::Value::Null,
+                Some(crate::ble::WakeHint { hashes: [0; 8] }),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.id, again.id);
+        let contact_path = temp.path().join("contacts");
+        std::fs::write(&contact_path, "friend@example.com\n").unwrap();
+        daemon
+            .visibility
+            .set(Visibility::Contacts, None)
+            .await
+            .unwrap();
+        let hash = openssl::sha::sha256(b"friend@example.com");
+        let mut hashes = [0; 8];
+        hashes[..2].copy_from_slice(&hash[..2]);
+        let matched = crate::ble::WakeHint { hashes };
+        let unmatched = crate::ble::WakeHint {
+            hashes: [hash[0] ^ 255; 8],
+        };
+        assert!(
+            daemon
+                .activate(&serde_json::Value::Null, Some(unmatched), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            daemon
+                .activate(&serde_json::Value::Null, Some(matched), false)
+                .await
+                .unwrap()
+                .0
+                .id,
+            active.id
+        );
+        std::fs::write(contact_path, "").unwrap();
+        assert!(
+            daemon
+                .activate(&serde_json::Value::Null, Some(matched), false)
+                .await
+                .is_err()
+        );
+        daemon
+            .visibility
+            .set(Visibility::Everyone, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon
+                .activate(&serde_json::Value::Null, Some(unmatched), false)
+                .await
+                .unwrap()
+                .0
+                .id,
+            active.id
+        );
+        assert_eq!(active.mac, daemon.mac);
+        assert_eq!(daemon.mac.0[0] & 3, 2);
+        let bad = temp.path().join("invalid-contacts");
+        std::fs::write(&bad, [255]).unwrap();
+        assert!(
+            daemon
+                .visibility
+                .set(Visibility::Contacts, Some(bad))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.receiver.visibility(), Visibility::Everyone);
+        assert!(
+            daemon
+                .activate(&serde_json::json!({"radio":{"channel":44}}), None, true)
+                .await
+                .is_err()
+        );
+        let peer = crate::discovery::Peer::from_awdl(
+            Mac([2, 0, 0, 0, 0, 2]),
+            0,
+            Timeouts::default().discovery_fallback,
+        );
+        state
+            .discovery
+            .peers
+            .write()
+            .await
+            .insert(peer.id.clone(), peer.clone());
+        let listed = daemon
+            .command(
+                Command::Peers { timeout: 1 },
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["id"], peer.id);
+        assert!(listed[0]["name"].is_null());
+        let remote_identity = Identity::load(&temp.path().join("remote-keys"), "fixture").unwrap();
+        let remote = Receiver::new(
+            "fixture".into(),
+            remote_identity.clone(),
+            temp.path().join("remote-received"),
+            1024 * 1024,
+            false,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let remote_address = match listener.local_addr().unwrap() {
+            std::net::SocketAddr::V6(a) => a,
+            _ => unreachable!(),
+        };
+        let remote_cancel = CancellationToken::new();
+        let remote_task = tokio::spawn({
+            let remote = remote.clone();
+            let cancel = remote_cancel.clone();
+            async move { remote.serve(listener, cancel).await }
+        });
+        let send_cancel = CancellationToken::new();
+        let send = tokio::spawn({
+            let daemon = daemon.clone();
+            let cancel = send_cancel.clone();
+            async move {
+                daemon
+                    .command(
+                        Command::Send {
+                            to: "fixture".into(),
+                            direct: Some(remote_address),
+                            items: vec![],
+                            urls: vec!["https://example.com/outgoing".into()],
+                            bytes: 0,
+                            icon: None,
+                            timeout: 1,
+                            options: serde_json::Value::Null,
+                        },
+                        None,
+                        cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if remote
+                    .transfers()
+                    .await
+                    .iter()
+                    .any(|t| t.state == "pending")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
+        assert_eq!(active.sending.borrow().len(), 1);
+        assert_eq!(*active.activity.traffic().borrow(), 0); // Pending approval stays on discovery.
+        let incoming = Sender {
+            name: "fixture".into(),
+            id: "fixture".into(),
+            identity: remote_identity,
+            tag: None,
+            timeouts: Timeouts {
+                approval: Duration::from_secs(2),
+                ..Timeouts::default()
+            },
+        };
+        let address = match address {
+            std::net::SocketAddr::V6(a) => a,
+            _ => unreachable!(),
+        };
+        incoming.discover(address).await.unwrap();
+        assert_eq!(*active.activity.traffic().borrow(), 0); // HTTPS discovery cannot select a transfer channel.
+        incoming
+            .send(
+                address,
+                vec![],
+                vec!["https://example.com/incoming".into()],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            state
+                .receiver
+                .transfers()
+                .await
+                .iter()
+                .any(|t| t.state == "completed")
+        );
+        daemon.visibility.set(Visibility::Off, None).await.unwrap();
+        assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
+        send_cancel.cancel();
+        assert!(send.await.unwrap().is_err());
+        assert!(active.sending.borrow().is_empty());
+        assert!(!active.activity.closed());
+        tokio::time::timeout(Duration::from_secs(10), active.stopped())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(daemon.active.lock().await.is_none());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert_eq!(
+            daemon
+                .history
+                .lock()
+                .await
+                .iter()
+                .filter(|t| t.state == "completed")
+                .count(),
+            1
+        );
+        daemon
+            .visibility
+            .set(Visibility::Everyone, None)
+            .await
+            .unwrap();
+        let (next, _) = daemon
+            .activate(
+                &serde_json::Value::Null,
+                Some(crate::ble::WakeHint { hashes: [0; 8] }),
+                false,
+            )
+            .await
+            .unwrap();
+        next.ready().await.unwrap();
+        assert_ne!(active.id, next.id);
+        assert_eq!(active.mac, next.mac);
+        daemon.visibility.set(Visibility::Off, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), next.stopped())
+            .await
+            .unwrap()
+            .unwrap();
+        remote_cancel.cancel();
+        remote_task.await.unwrap().unwrap();
+    }
 }

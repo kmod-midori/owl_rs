@@ -15,15 +15,19 @@ check:
 probe *ARGS:
     cargo run --locked -- probe "$@"
 
-# Idle foreground control service. send/receive activate session services.
+# Foreground daemon: receiving starts on BLE after discoverable is enabled.
 daemon *ARGS: build
     sudo target/release/owl_rs daemon "$@"
 
-receive *ARGS: build
-    sudo target/release/owl_rs receive "$@"
+discoverable MODE *ARGS:
+    target/release/owl_rs discoverable "$@"
 
 send TO *FILES: build
     sudo target/release/owl_rs send "$@"
+
+# Local contact management needs neither root nor an active daemon.
+contact *ARGS: build
+    target/release/owl_rs contact "$@"
 
 peers *ARGS:
     target/release/owl_rs peers "$@"
@@ -34,7 +38,7 @@ status *ARGS:
 transfers *ARGS:
     target/release/owl_rs transfers "$@"
 
-accept ID *ARGS:
+accept *ARGS:
     target/release/owl_rs accept "$@"
 
 reject ID *ARGS:

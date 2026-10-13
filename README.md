@@ -1,8 +1,8 @@
 # owl_rs
 
 A Linux AirDrop CLI and daemon with a safe Rust AWDL implementation. Send and
-receive files, folders and links. Supports AirDrop's Everyone mode; Contacts Only
-is not implemented.
+receive files, folders and links. Receive from everyone or verified contacts;
+sending to Contacts Only recipients is not implemented.
 
 ## Build
 
@@ -25,31 +25,35 @@ Unlock the iPhone and set AirDrop to **Everyone for 10 Minutes**.
 
 ```sh
 just send 'Example Phone' /path/to/photo.png
-just receive --name 'Example Computer'
 ```
 
-To send from the phone, select **Example Computer** in Share → AirDrop. Incoming
-offers require approval; in another terminal:
+To receive, run the daemon in one terminal:
 
 ```sh
-just transfers
-just accept TRANSFER_ID
-# Or decline:
-just reject TRANSFER_ID
+just daemon --name 'Example Computer'
 ```
 
-For a single transfer with automatic acceptance:
+In another terminal, enable receiving and wait to accept the next offer:
 
 ```sh
-just receive --once --auto-accept
+just discoverable everyone
+just accept
+# Or restrict receiving to your contact list:
+just contact add friend@example.com
+just discoverable contacts
+# Disable incoming discovery and BLE wake-up:
+just discoverable off
 ```
 
-Received files go to `~/Downloads/AirDrop/` by default. Each operation sets up
-the radio and services, then tears them down and restores Wi-Fi. Ctrl+C ends a
-session and waits for cleanup. Only one session can run at a time.
+Opening Share → AirDrop on the phone sends a BLE wake request. The daemon starts
+a shared Wi-Fi/HTTPS session, then restores Wi-Fi after its transfers finish or
+inactivity. `accept TRANSFER_ID` and `reject TRANSFER_ID` select specific offers;
+`daemon --auto-accept` skips manual approval. Received files go to
+`~/Downloads/AirDrop/` by default.
 
-`send` and `receive` work standalone. An optional `just daemon` keeps an idle
-control service running; the radio and HTTPS activate only for an operation.
+Discoverability starts **off** and applies until the daemon stops. `send` works
+standalone or through the daemon. Incoming and outgoing transfers share one
+active session. See [Usage](docs/usage.md) for runtime controls and Contacts Only receiving.
 
 ## Documentation
 

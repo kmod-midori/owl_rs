@@ -22,12 +22,16 @@ selections. There is no automatic fallback between backends.
 ## Modes and backends
 
 Shared mode preserves AP association and requires its primary channel to be
-6, 44 or 149. Discovery and transmission stay on that channel.
+6, 44 or 149. Discovery and transmission stay on that channel, reusing the
+current station address.
 
 Exclusive mode saves NetworkManager ownership, the station's MAC/up state and
 any connected AP's connection UUID. It disconnects Wi-Fi for the session and
-restores saved state afterward. With no connected AP, disassociation and
-reassociation are skipped. The backend supplies the radio's channel context:
+restores saved state afterward. A cryptographically random, locally administered
+unicast MAC is generated at each daemon start and reused for exclusive sessions
+until the daemon exits. A restart generates a new MAC. The original station MAC
+is retained in the recovery journal and restored during cleanup. With no
+connected AP, disassociation and reassociation are skipped. The backend supplies the radio's channel context:
 
 - **IBSS:** `owlibss0` joins AWDL BSSID `00:25:00:ff:94:73` on the selected
   channel, supplying context and hardware ACKs. Passive `owlmon0` captures and
@@ -46,7 +50,9 @@ settings. Existing monitor/TAP names are rejected rather than adopted.
 Exclusive mode separates discovery/negotiation from transmission:
 
 ```sh
-just receive --discovery-channel 6 --channel 149 --auto-accept
+just daemon --discovery-channel 6 --channel 149 --auto-accept
+# In another terminal:
+just discoverable everyone
 ```
 
 These flags also apply to `send` and to daemon session defaults.
@@ -56,10 +62,21 @@ availability. Disabled, radar and no-IR channels are excluded.
 
 The local master uses its transmit preference. A follower chooses the usable
 channel with the greatest overlap with the elected parent's schedule; failed
-tunes fall back to other candidates. Advertised slots remain on the committed
-transmit channel during temporary discovery visits, and data waits until the
-radio returns to that channel. `status` exposes `channel_plan` and
-`physical_channel`. Timing, overlap ranking and tuning acknowledgments are
+tunes fall back to other candidates. Idle sessions stay on the discovery
+channel. TLS, `/Discover` and `/Ask` approval stay on discovery while no transfer
+is active. Approved file transfers select and hold a transfer channel through
+upload and TCP shutdown, then return to discovery after queued/recent TCP
+traffic clears. There are no discovery detours during a transfer.
+Advertised slots follow the successfully tuned channel. `status` exposes `channel_plan` and
+`physical_channel` and `physical_channel_definition` (primary, width and center
+frequency). Active-monitor transfers use the widest permitted 5 GHz context,
+trying 80, 40 and 20 MHz in order; channel 6 and idle discovery use 20 MHz.
+Rejected widths fall back on the same primary before trying another channel.
+Every width change waits for kernel ACK before advertising it, and checks
+readback when the kernel exposes it. Active/passive monitor setups may omit
+readback; see the protocol notes.
+Shared mode preserves the AP's width. `probe` lists permitted tuning candidates.
+Timing, overlap ranking and tuning acknowledgments are
 described in [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 
 `--rate 12` or `--rate mcs7-sgi` selects the data injection rate. Experimental

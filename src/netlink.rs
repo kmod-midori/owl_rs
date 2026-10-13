@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Scoped Tokio netlink connections; kernel ACKs complete every mutation.
-use crate::protocol::Mac;
+use crate::channel::ChannelDefinition;
+use crate::protocol::{BandCapabilities, HtCapabilities, Mac, RadioCapabilities, VhtCapabilities};
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, TryStreamExt};
 use rtnetlink::{
@@ -15,9 +16,9 @@ use rtnetlink::{
 use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 use wl_nl80211::{
-    Nl80211Attr as Attr, Nl80211BandInfo, Nl80211BssInfo, Nl80211Command as Cmd, Nl80211Features,
-    Nl80211FrequencyInfo as FreqInfo, Nl80211Handle, Nl80211HtWiphyChannelType,
-    Nl80211InterfaceType as IfType, Nl80211Message,
+    Nl80211Attr as Attr, Nl80211BandInfo, Nl80211BandType, Nl80211BssInfo, Nl80211ChannelWidth,
+    Nl80211Command as Cmd, Nl80211Features, Nl80211FrequencyInfo as FreqInfo, Nl80211Handle,
+    Nl80211HtWiphyChannelType, Nl80211InterfaceType as IfType, Nl80211Message,
     packet_core::{
         DefaultNla, Emitable, NLA_F_NESTED, NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage,
         NetlinkPayload,
@@ -28,6 +29,7 @@ use wl_nl80211::{
 #[derive(Clone)]
 pub struct Netlink(Arc<Connections>);
 struct Connections {
+    timeout: Duration,
     route: rtnetlink::Handle,
     wifi: Nl80211Handle,
     route_task: JoinHandle<()>,
@@ -46,14 +48,88 @@ pub struct Interface {
     pub phy: u32,
     pub kind: IfType,
     pub frequency: Option<u32>,
+    pub width_mhz: Option<u32>,
+    pub center_frequency_mhz: Option<u32>,
 }
-async fn bounded<T, E: Into<anyhow::Error>>(
-    f: impl Future<Output = std::result::Result<T, E>>,
-) -> Result<T> {
-    tokio::time::timeout(Duration::from_secs(5), f)
-        .await
-        .context("netlink request timed out")?
-        .map_err(Into::into)
+impl Interface {
+    pub fn channel_definition(&self) -> Option<ChannelDefinition> {
+        let channel = match self.frequency? {
+            2437 => 6,
+            5180 => 36,
+            5220 => 44,
+            5745 => 149,
+            _ => return None,
+        };
+        let definition = ChannelDefinition {
+            channel,
+            width_mhz: self.width_mhz?,
+            center_frequency_mhz: self.center_frequency_mhz?,
+        };
+        (definition.opclass() != 0).then_some(definition)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct PhyCapabilities {
+    pub frequencies: Vec<u32>,
+    pub active_monitor: bool,
+    pub radio: RadioCapabilities,
+    pub tuning: Vec<ChannelDefinition>,
+}
+// Wiphy dumps split each band's attributes across multiple messages. Keep partial
+// HT/VHT data until the whole dump has arrived; missing attributes are not defaults.
+#[derive(Default)]
+struct BandDump {
+    ht_cap: Option<u16>,
+    ht_mcs: Option<[u8; 4]>,
+    ampdu_factor: Option<u8>,
+    ampdu_density: Option<u8>,
+    vht_cap: Option<u32>,
+    vht_mcs: Option<wl_nl80211::Ieee80211VhtMcsInfo>,
+}
+impl BandDump {
+    fn update(&mut self, attr: Nl80211BandInfo) {
+        match attr {
+            Nl80211BandInfo::HtCapa(c) => self.ht_cap = Some(c.bits()),
+            Nl80211BandInfo::HtMcsSet(m) => {
+                self.ht_mcs = Some([m.rx_mask[0], m.rx_mask[1], m.rx_mask[2], m.rx_mask[3]])
+            }
+            Nl80211BandInfo::HtAmpduFactor(f) => self.ampdu_factor = Some(f),
+            Nl80211BandInfo::HtAmpduDensity(d) => self.ampdu_density = Some(d),
+            Nl80211BandInfo::VhtCap(c) => self.vht_cap = Some(c.bits()),
+            Nl80211BandInfo::VhtMcsSet(m) => self.vht_mcs = Some(m),
+            _ => (),
+        }
+    }
+    fn capabilities(self) -> BandCapabilities {
+        let ht = match (
+            self.ht_cap,
+            self.ht_mcs,
+            self.ampdu_factor,
+            self.ampdu_density,
+        ) {
+            (Some(cap_info), Some(rx_mask), Some(f), Some(d))
+                if rx_mask.iter().any(|b| *b != 0) && f <= 3 && d <= 7 =>
+            {
+                Some(HtCapabilities {
+                    cap_info,
+                    rx_mask,
+                    ampdu_params: f | (d << 2),
+                })
+            }
+            _ => None,
+        };
+        let vht = match (self.vht_cap, self.vht_mcs) {
+            (Some(cap_info), Some(m)) if m.rx_mcs_map != 0xffff => Some(VhtCapabilities {
+                cap_info,
+                rx_mcs_map: m.rx_mcs_map,
+                rx_highest: m.rx_highest,
+                tx_mcs_map: m.tx_mcs_map,
+                tx_highest: m.tx_highest,
+            }),
+            _ => None,
+        };
+        BandCapabilities { ht, vht }
+    }
 }
 
 // Stable Linux UAPI attributes not yet given typed variants by wl-nl80211.
@@ -86,13 +162,127 @@ fn tx_frequency(info: &[FreqInfo]) -> Option<u32> {
         }
     })
 }
+fn tuning_candidates(
+    radio: &RadioCapabilities,
+    frequencies: &std::collections::BTreeMap<u32, Vec<FreqInfo>>,
+) -> Vec<ChannelDefinition> {
+    let mut candidates = Vec::new();
+    for channel in [6, 36, 44, 149] {
+        for width in [80, 40, 20] {
+            // Discovery and 2.4 GHz traffic retain the interoperable HT20 context.
+            if channel == 6 && width != 20 {
+                continue;
+            }
+            let Ok(definition) = ChannelDefinition::new(channel, width) else {
+                continue;
+            };
+            let caps = radio.for_channel(channel);
+            if width == 80 && caps.vht.is_none() {
+                continue;
+            }
+            if width == 40 && !caps.ht.as_ref().is_some_and(|ht| ht.cap_info & 2 != 0) {
+                continue;
+            }
+            let primary = ChannelDefinition::frequency(channel).unwrap();
+            if width == 40
+                && frequencies
+                    .get(&primary)
+                    .is_none_or(|info| info.contains(&FreqInfo::NoHt40Plus))
+            {
+                continue;
+            }
+            let first = definition.center_frequency_mhz - width / 2 + 10;
+            let last = definition.center_frequency_mhz + width / 2 - 10;
+            if (first..=last).step_by(20).all(|f| {
+                frequencies.get(&f).is_some_and(|info| {
+                    tx_frequency(info).is_some()
+                        && (width != 80 || !info.contains(&FreqInfo::No80Mhz))
+                        && (width != 40 || f == primary || !info.contains(&FreqInfo::NoHt40Minus))
+                })
+            }) {
+                candidates.push(definition);
+            }
+        }
+    }
+    candidates
+}
+
+fn decode_phy(attributes: impl IntoIterator<Item = Attr>) -> PhyCapabilities {
+    let mut frequency_info = std::collections::BTreeMap::<u32, Vec<FreqInfo>>::new();
+    let mut active_monitor = false;
+    let (mut ghz2, mut ghz5) = (BandDump::default(), BandDump::default());
+    for attr in attributes {
+        match attr {
+            Attr::Features(flags) => {
+                active_monitor |= flags.contains(Nl80211Features::ActiveMonitor)
+            }
+            Attr::WiphyBands(bands) => {
+                for band in bands {
+                    for attr in band.info {
+                        if let Nl80211BandInfo::Freqs(freqs) = &attr {
+                            for freq in freqs {
+                                if let Some(f) = freq.info.iter().find_map(|a| {
+                                    if let FreqInfo::Freq(f) = a {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                }) {
+                                    frequency_info
+                                        .entry(f)
+                                        .or_default()
+                                        .extend(freq.info.clone());
+                                }
+                            }
+                        }
+                        match band.kind {
+                            Nl80211BandType::Band2GHz => ghz2.update(attr),
+                            Nl80211BandType::Band5GHz => ghz5.update(attr),
+                            _ => (),
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    let radio = RadioCapabilities {
+        ghz2: ghz2.capabilities(),
+        ghz5: ghz5.capabilities(),
+    };
+    let tuning = tuning_candidates(&radio, &frequency_info);
+    PhyCapabilities {
+        frequencies: frequency_info
+            .values()
+            .filter_map(|info| tx_frequency(info))
+            .collect(),
+        active_monitor,
+        radio,
+        tuning,
+    }
+}
+
 impl Netlink {
+    async fn bounded<T, E: Into<anyhow::Error>>(
+        &self,
+        f: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T> {
+        tokio::time::timeout(self.0.timeout, f)
+            .await
+            .context("netlink request timed out")?
+            .map_err(Into::into)
+    }
+
     pub fn new() -> Result<Self> {
+        Self::with_timeout(crate::timeouts::Timeouts::default().netlink)
+    }
+    pub fn with_timeout(timeout: Duration) -> Result<Self> {
         let (route, route_handle, _) =
             rtnetlink::new_connection().context("open routing netlink")?;
         let (wifi, wifi_handle, _) =
             wl_nl80211::new_connection().context("open wireless netlink")?;
         Ok(Self(Arc::new(Connections {
+            timeout,
             route: route_handle,
             wifi: wifi_handle,
             route_task: tokio::spawn(route),
@@ -100,7 +290,7 @@ impl Netlink {
         })))
     }
     pub async fn link(&self, name: &str) -> Result<LinkMessage> {
-        bounded(
+        self.bounded(
             self.0
                 .route
                 .link()
@@ -118,7 +308,7 @@ impl Netlink {
     pub async fn set_up(&self, name: &str, up: bool) -> Result<()> {
         let builder = LinkUnspec::new_with_index(self.index(name).await?);
         let msg = if up { builder.up() } else { builder.down() }.build();
-        bounded(self.0.route.link().set(msg).execute())
+        self.bounded(self.0.route.link().set(msg).execute())
             .await
             .with_context(|| format!("set {name} up={up}"))
     }
@@ -126,7 +316,7 @@ impl Netlink {
         let msg = LinkUnspec::new_with_index(self.index(name).await?)
             .address(mac.0.to_vec())
             .build();
-        bounded(self.0.route.link().set(msg).execute())
+        self.bounded(self.0.route.link().set(msg).execute())
             .await
             .context("set interface MAC")
     }
@@ -140,7 +330,7 @@ impl Netlink {
             attributes,
         }));
         msg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
-        bounded(async {
+        self.bounded(async {
             let mut responses = handle.request(msg).await?;
             while let Some(response) = responses.next().await {
                 match response?.payload {
@@ -157,23 +347,28 @@ impl Netlink {
         .with_context(|| format!("nl80211 {cmd:?}"))
     }
     pub async fn interfaces(&self) -> Result<Vec<Interface>> {
-        let msgs: Vec<_> = bounded(async {
-            self.0
-                .wifi
-                .interface()
-                .get(vec![])
-                .execute()
-                .await
-                .try_collect()
-                .await
-        })
-        .await?;
+        let msgs: Vec<_> = self
+            .bounded(async {
+                self.0
+                    .wifi
+                    .interface()
+                    .get(vec![])
+                    .execute()
+                    .await
+                    .try_collect()
+                    .await
+            })
+            .await?;
         let mut interfaces = Vec::new();
         for msg in msgs {
             let (mut index, mut name, mut phy, mut kind, mut frequency) =
                 (None, None, None, None, None);
+            let (mut width_mhz, mut center_frequency_mhz) = (None, None);
             for attr in msg.payload.attributes {
                 match attr {
+                    Attr::ChannelWidth(Nl80211ChannelWidth::Mhz(w)) => width_mhz = Some(w),
+                    Attr::ChannelWidth(Nl80211ChannelWidth::NoHt20) => width_mhz = Some(20),
+                    Attr::CenterFreq1(f) => center_frequency_mhz = Some(f),
                     Attr::IfIndex(v) => index = Some(v),
                     Attr::IfName(v) => name = Some(v),
                     Attr::Wiphy(v) => phy = Some(v),
@@ -189,6 +384,8 @@ impl Netlink {
                 phy: phy.context("missing Wi-Fi PHY")?,
                 kind: kind.context("missing Wi-Fi type")?,
                 frequency,
+                width_mhz,
+                center_frequency_mhz,
             });
         }
         Ok(interfaces)
@@ -205,17 +402,18 @@ impl Netlink {
     /// associated; status 2 is an IBSS join. Authentication alone is not a link.
     pub async fn linked_frequency(&self, name: &str, ibss: bool) -> Result<Option<u32>> {
         let index = self.index(name).await?;
-        let msgs: Vec<_> = bounded(async {
-            self.0
-                .wifi
-                .scan()
-                .dump(index)
-                .execute()
-                .await
-                .try_collect()
-                .await
-        })
-        .await?;
+        let msgs: Vec<_> = self
+            .bounded(async {
+                self.0
+                    .wifi
+                    .scan()
+                    .dump(index)
+                    .execute()
+                    .await
+                    .try_collect()
+                    .await
+            })
+            .await?;
         for msg in msgs {
             for attr in msg.payload.attributes {
                 if let Attr::Bss(info) = attr
@@ -235,45 +433,25 @@ impl Netlink {
         }
         Ok(None)
     }
-    pub async fn phy_capabilities(&self, phy: u32) -> Result<(Vec<u32>, bool)> {
-        let msgs: Vec<_> = bounded(async {
-            self.0
-                .wifi
-                .wireless_physic()
-                .get()
-                .wiphy_index(phy)
-                .execute()
-                .await
-                .try_collect()
-                .await
-        })
-        .await?;
-        let mut frequencies = Vec::new();
-        let mut active_monitor = false;
-        for msg in msgs {
-            for attr in msg.payload.attributes {
-                match attr {
-                    Attr::Features(flags) => {
-                        active_monitor |= flags.contains(Nl80211Features::ActiveMonitor)
-                    }
-                    Attr::WiphyBands(bands) => {
-                        for band in bands {
-                            for attr in band.info {
-                                if let Nl80211BandInfo::Freqs(freqs) = attr {
-                                    frequencies
-                                        .extend(freqs.iter().filter_map(|f| tx_frequency(&f.info)));
-                                }
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-            }
-        }
-        frequencies.sort_unstable();
-        frequencies.dedup();
-        Ok((frequencies, active_monitor))
+    pub async fn phy_capabilities(&self, phy: u32) -> Result<PhyCapabilities> {
+        let msgs: Vec<_> = self
+            .bounded(async {
+                self.0
+                    .wifi
+                    .wireless_physic()
+                    .get()
+                    .wiphy_index(phy)
+                    .execute()
+                    .await
+                    .try_collect()
+                    .await
+            })
+            .await?;
+        Ok(decode_phy(
+            msgs.into_iter().flat_map(|msg| msg.payload.attributes),
+        ))
     }
+
     pub async fn set_type(&self, name: &str, kind: IfType) -> Result<()> {
         let mut attrs = vec![Attr::IfIndex(self.index(name).await?), Attr::IfType(kind)];
         if kind == IfType::Monitor {
@@ -308,17 +486,66 @@ impl Netlink {
         )
         .await
     }
-    pub async fn tune(&self, name: &str, frequency: u32) -> Result<()> {
+    /// Try the widest permitted definition first; kernel rejection narrows it.
+    pub async fn tune(&self, name: &str, channel: u8, max_width: u32) -> Result<ChannelDefinition> {
+        let iface = self.interface(name).await?;
+        let caps = self.phy_capabilities(iface.phy).await?;
+        let mut error = anyhow::anyhow!("no permitted channel definition for {channel}");
+        for definition in caps
+            .tuning
+            .into_iter()
+            .filter(|d| d.channel == channel && d.width_mhz <= max_width)
+        {
+            match self.set_channel(name, iface.index, definition).await {
+                Ok(actual) => return Ok(actual),
+                Err(e) => {
+                    tracing::warn!(
+                        channel,
+                        width_mhz = definition.width_mhz,
+                        "channel definition rejected: {e:#}"
+                    );
+                    error = e;
+                }
+            }
+        }
+        Err(error).with_context(|| format!("tune {name} to channel {channel}"))
+    }
+    async fn set_channel(
+        &self,
+        name: &str,
+        index: u32,
+        definition: ChannelDefinition,
+    ) -> Result<ChannelDefinition> {
         self.wifi_request(
             Cmd::SetWiphy,
             vec![
-                Attr::IfIndex(self.index(name).await?),
-                Attr::WiphyFreq(frequency),
-                Attr::WiphyChannelType(Nl80211HtWiphyChannelType::Ht20),
+                Attr::IfIndex(index),
+                Attr::WiphyFreq(ChannelDefinition::frequency(definition.channel)?),
+                Attr::ChannelWidth(Nl80211ChannelWidth::Mhz(definition.width_mhz)),
+                Attr::CenterFreq1(definition.center_frequency_mhz),
             ],
         )
-        .await
-        .with_context(|| format!("tune {name} to {frequency} MHz"))
+        .await?;
+        // mac80211 may omit monitor readback when an active monitor is open
+        // beside a passive one: get_channel requires open_count == virt_monitors
+        // in the absence of a per-vif channel context. The ACK is still binding.
+        let observed = self.interface(name).await?;
+        let actual = match observed.channel_definition() {
+            Some(actual) => actual,
+            None if observed.frequency.is_none() => {
+                tracing::debug!(
+                    ?definition,
+                    "monitor channel readback unavailable; using acknowledged definition"
+                );
+                definition
+            }
+            None => bail!("kernel reported an unsupported or incomplete channel definition"),
+        };
+        anyhow::ensure!(
+            actual == definition,
+            "kernel channel definition differs: requested {definition:?}, got {actual:?}"
+        );
+        Ok(actual)
     }
     pub async fn join_ibss(&self, name: &str, frequency: u32) -> Result<()> {
         self.wifi_request(
@@ -352,19 +579,20 @@ impl Netlink {
         message
             .attributes
             .push(AddressAttribute::Flags(AddressFlags::Nodad));
-        bounded(req.execute()).await
+        self.bounded(req.execute()).await
     }
     pub async fn address_ready(&self, name: &str, mac: Mac) -> Result<bool> {
-        let msgs: Vec<_> = bounded(
-            self.0
-                .route
-                .address()
-                .get()
-                .set_link_index_filter(self.index(name).await?)
-                .execute()
-                .try_collect(),
-        )
-        .await?;
+        let msgs: Vec<_> = self
+            .bounded(
+                self.0
+                    .route
+                    .address()
+                    .get()
+                    .set_link_index_filter(self.index(name).await?)
+                    .execute()
+                    .try_collect(),
+            )
+            .await?;
         Ok(msgs.iter().any(|msg| {
             let mut flags = AddressFlags::from_bits_retain(msg.header.flags.bits().into());
             let mut matches = false;
@@ -382,7 +610,7 @@ impl Netlink {
     pub async fn neighbor(&self, name: &str, mac: Mac, add: bool) -> Result<()> {
         let index = self.index(name).await?;
         if add {
-            bounded(
+            self.bounded(
                 self.0
                     .route
                     .neighbours()
@@ -400,7 +628,8 @@ impl Netlink {
                 .push(NeighbourAttribute::Destination(NeighbourAddress::Inet6(
                     mac.ipv6(),
                 )));
-            bounded(self.0.route.neighbours().del(msg).execute()).await
+            self.bounded(self.0.route.neighbours().del(msg).execute())
+                .await
         }
     }
 }
@@ -409,6 +638,115 @@ impl Netlink {
 mod tests {
     use super::*;
     use wl_nl80211::packet_core::{Nla, NlaBuffer, NlasIterator};
+    #[test]
+    fn split_phy_replies_merge_by_band_without_guessing_missing_fields() {
+        use wl_nl80211::{
+            Ieee80211HtCaps, Ieee80211HtMcsInfo, Ieee80211VhtCapInfo, Ieee80211VhtMcsInfo,
+            Nl80211Band, packet_core::Parseable,
+        };
+        let mut mcs = [0; 16];
+        mcs[..2].copy_from_slice(&[255, 255]);
+        mcs[4] = 1; // MCS 32 cannot be represented in compact AWDL HT.
+        let ht = vec![
+            Nl80211BandInfo::HtMcsSet(Ieee80211HtMcsInfo::parse(&mcs[..]).unwrap()),
+            Nl80211BandInfo::HtCapa(Ieee80211HtCaps::from_bits_retain(0x01ff)),
+            Nl80211BandInfo::HtAmpduFactor(3),
+        ];
+        let band = |kind, info| Attr::WiphyBands(vec![Nl80211Band { kind, info }]);
+        let first = band(Nl80211BandType::Band2GHz, ht.clone());
+        assert!(decode_phy([first.clone()]).radio.ghz2.ht.is_none());
+        let mut five = ht;
+        five.extend([
+            Nl80211BandInfo::HtAmpduDensity(0),
+            Nl80211BandInfo::VhtCap(Ieee80211VhtCapInfo::from_bits_retain(0x318001b0)),
+            Nl80211BandInfo::VhtMcsSet(Ieee80211VhtMcsInfo {
+                rx_mcs_map: 0xfffa,
+                rx_highest: 0,
+                tx_mcs_map: 0xfffa,
+                tx_highest: 0,
+            }),
+        ]);
+        let caps = decode_phy([
+            first,
+            band(Nl80211BandType::Band5GHz, five),
+            band(
+                Nl80211BandType::Band2GHz,
+                vec![Nl80211BandInfo::HtAmpduDensity(6)],
+            ),
+            band(
+                Nl80211BandType::Band5GHz,
+                vec![Nl80211BandInfo::Freqs(vec![])],
+            ),
+        ])
+        .radio;
+        assert_eq!(caps.ghz2.ht.unwrap().ampdu_params, 27);
+        assert!(caps.ghz2.vht.is_none());
+        let ht = caps.ghz5.ht.unwrap();
+        assert_eq!(
+            (ht.cap_info, ht.ampdu_params, ht.rx_mask),
+            (0x01ff, 3, [255, 255, 0, 0])
+        );
+        assert_eq!(caps.ghz5.vht.unwrap().rx_mcs_map, 0xfffa);
+    }
+
+    #[test]
+    fn wide_channels_require_hardware_and_every_permitted_subchannel() {
+        let mut radio = RadioCapabilities {
+            ghz5: BandCapabilities {
+                ht: Some(HtCapabilities {
+                    cap_info: 2,
+                    ampdu_params: 0,
+                    rx_mask: [255, 0, 0, 0],
+                }),
+                vht: Some(VhtCapabilities {
+                    cap_info: 0,
+                    rx_mcs_map: 0xfffe,
+                    rx_highest: 0,
+                    tx_mcs_map: 0xfffe,
+                    tx_highest: 0,
+                }),
+            },
+            ..Default::default()
+        };
+        let mut frequencies = std::collections::BTreeMap::new();
+        for f in [2437, 5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805] {
+            frequencies.insert(f, vec![FreqInfo::Freq(f)]);
+        }
+        let widths = |radio: &RadioCapabilities,
+                      freqs: &std::collections::BTreeMap<u32, Vec<FreqInfo>>,
+                      c| {
+            tuning_candidates(radio, freqs)
+                .into_iter()
+                .filter(|d| d.channel == c)
+                .map(|d| (d.width_mhz, d.center_frequency_mhz, d.opclass()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(&radio, &frequencies, 6), [(20, 2437, 81)]);
+        assert_eq!(
+            widths(&radio, &frequencies, 44),
+            [(80, 5210, 128), (40, 5230, 116), (20, 5220, 115)]
+        );
+        assert_eq!(
+            widths(&radio, &frequencies, 149),
+            [(80, 5775, 128), (40, 5755, 126), (20, 5745, 124)]
+        );
+        frequencies.get_mut(&5785).unwrap().push(FreqInfo::No80Mhz);
+        assert_eq!(
+            widths(&radio, &frequencies, 149),
+            [(40, 5755, 126), (20, 5745, 124)]
+        );
+        frequencies.get_mut(&5765).unwrap().push(FreqInfo::NoIr);
+        assert_eq!(widths(&radio, &frequencies, 149), [(20, 5745, 124)]);
+        frequencies
+            .get_mut(&5220)
+            .unwrap()
+            .push(FreqInfo::NoHt40Plus);
+        radio.ghz5.vht = None;
+        assert_eq!(widths(&radio, &frequencies, 44), [(20, 5220, 115)]);
+        frequencies.remove(&5180);
+        assert!(widths(&radio, &frequencies, 36).is_empty());
+    }
+
     #[test]
     fn monitor_flag_nesting_and_regulatory_exclusions() {
         let active = monitor_flags(true);

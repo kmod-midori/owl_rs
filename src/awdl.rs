@@ -84,7 +84,8 @@ fn parse_channel(s: &str) -> Result<u8, String> {
         Err("use channel 6, 36, 44, or 149".into())
     }
 }
-pub async fn run(args: Arguments) -> Result<()> {
+pub async fn run(args: Arguments, timeouts: owl_rs::timeouts::Timeouts) -> Result<()> {
+    timeouts.validate()?;
     let offline = args.input.read.is_some();
     let input = match args.input.read {
         Some(path) => path
@@ -112,7 +113,17 @@ pub async fn run(args: Arguments) -> Result<()> {
             .into()
     });
     ensure!(name.len() <= 64, "name must be at most 64 bytes");
+    let capabilities = if offline {
+        Default::default()
+    } else {
+        let net = owl_rs::netlink::Netlink::with_timeout(timeouts.netlink)?;
+        let iface = net.interface(&input).await?;
+        net.phy_capabilities(iface.phy).await?.radio
+    };
     let config = Config {
+        peer_timeout: timeouts.peer_idle,
+        retry_timeout: timeouts.retry_cache,
+        pending_timeout: timeouts.queued_packet,
         airdrop_port: None,
         mac,
         name,
@@ -125,8 +136,11 @@ pub async fn run(args: Arguments) -> Result<()> {
         widen: args.widen as usize,
         filter_rssi: !args.no_rssi_filter,
         rate: args.rate,
+        capabilities,
+        operating_channel: None,
     };
     let opts = Options {
+        timeouts,
         input,
         host: args.host_interface,
         listen_only: args.listen_only,
@@ -136,7 +150,7 @@ pub async fn run(args: Arguments) -> Result<()> {
         summary: args.summary,
         channel_plan: None,
         ibss_interface: None,
-        initial_channel: None,
+        retune: true,
     };
     if offline {
         runtime::replay(config, &opts).await

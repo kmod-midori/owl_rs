@@ -49,6 +49,12 @@ impl FromStr for Mac {
     }
 }
 impl Mac {
+    pub fn random() -> Result<Self, openssl::error::ErrorStack> {
+        let mut bytes = [0; 6];
+        openssl::rand::rand_bytes(&mut bytes)?;
+        bytes[0] = (bytes[0] | 2) & !1;
+        Ok(Self(bytes))
+    }
     pub fn multicast(self) -> bool {
         self.0[0] & 1 != 0
     }
@@ -486,10 +492,46 @@ fn le16(v: &mut Vec<u8>, n: u16) {
 fn le32(v: &mut Vec<u8>, n: u32) {
     v.extend_from_slice(&n.to_le_bytes());
 }
+/// AWDL's compact HT field carries RX MCS 0–31, not the full IEEE HT MCS set.
+#[derive(Clone, Debug, Serialize)]
+pub struct HtCapabilities {
+    pub cap_info: u16,
+    pub ampdu_params: u8,
+    pub rx_mask: [u8; 4],
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct VhtCapabilities {
+    pub cap_info: u32,
+    pub rx_mcs_map: u16,
+    pub rx_highest: u16,
+    pub tx_mcs_map: u16,
+    pub tx_highest: u16,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BandCapabilities {
+    pub ht: Option<HtCapabilities>,
+    pub vht: Option<VhtCapabilities>,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RadioCapabilities {
+    pub ghz2: BandCapabilities,
+    pub ghz5: BandCapabilities,
+}
+impl RadioCapabilities {
+    pub fn for_channel(&self, channel: u8) -> &BandCapabilities {
+        if channel <= 14 {
+            &self.ghz2
+        } else {
+            &self.ghz5
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Advertisement<'a> {
     pub mac: Mac,
     pub name: &'a str,
+    pub capabilities: &'a BandCapabilities,
     pub sequence: &'a Sequence,
     pub election: &'a Election,
     pub channel: u8,
@@ -545,7 +587,30 @@ pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u
     tlv(&mut out, 24, &e);
     tlv(&mut out, 6, &[0; 9]);
     if subtype == 3 {
-        tlv(&mut out, 7, &[0, 0, 0xce, 0x11, 0x1b, 0xff, 0, 0]);
+        if let Some(ht) = &a.capabilities.ht
+            && let Some(last) = ht.rx_mask.iter().rposition(|b| *b != 0)
+        {
+            let mut value = vec![0, 0];
+            le16(&mut value, ht.cap_info);
+            value.push(ht.ampdu_params);
+            value.extend_from_slice(&ht.rx_mask[..=last]);
+            value.extend_from_slice(&[0, 0]);
+            tlv(&mut out, 7, &value);
+        }
+        if let Some(vht) = &a.capabilities.vht {
+            // IEEE VHT Capability IE (191, length 12) inside AWDL container 17.
+            let mut value = vec![191, 12];
+            le32(&mut value, vht.cap_info);
+            for n in [
+                vht.rx_mcs_map,
+                vht.rx_highest,
+                vht.tx_mcs_map,
+                vht.tx_highest,
+            ] {
+                le16(&mut value, n);
+            }
+            tlv(&mut out, 17, &value);
+        }
         let name = &a.name.as_bytes()[..a.name.len().min(64)];
         let mut arpa = vec![3, name.len() as u8];
         arpa.extend_from_slice(name);

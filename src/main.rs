@@ -2,10 +2,14 @@
 #![forbid(unsafe_code)]
 mod awdl;
 use anyhow::{Result, ensure};
-use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
+use clap::{
+    ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource,
+};
 use owl_rs::{
-    archive, radio,
+    archive, contact_book, radio,
     service::{self, Command, Options},
+    timeouts::Timeouts,
+    visibility::Visibility,
 };
 use std::{net::SocketAddrV6, path::PathBuf};
 #[derive(Parser)]
@@ -16,18 +20,82 @@ struct Cli {
     verbose: u8,
     #[command(subcommand)]
     command: Action,
+    #[command(flatten)]
+    timeouts: Timeouts,
+}
+#[derive(Args)]
+struct ContactArgs {
+    /// Use a different Contacts Only receiving list.
+    #[arg(long, global = true)]
+    contacts_file: Option<PathBuf>,
+    /// Select the user's list; under sudo, defaults to the invoking user.
+    #[arg(long, global = true)]
+    owner: Option<String>,
+    #[command(subcommand)]
+    command: ContactAction,
+}
+#[derive(Subcommand)]
+enum ContactAction {
+    /// Add Apple ID emails or international phone numbers; duplicates are ignored.
+    Add {
+        #[arg(required = true, num_args = 1..)]
+        identifiers: Vec<String>,
+    },
+    /// Show normalized identifiers, one per line.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove matching emails or phone numbers, including alternate formatting.
+    Remove {
+        #[arg(required = true, num_args = 1..)]
+        identifiers: Vec<String>,
+    },
+}
+impl ContactArgs {
+    fn run(self) -> Result<()> {
+        let (uid, gid, home) = service::owner(self.owner.as_deref())?;
+        let path = self
+            .contacts_file
+            .unwrap_or_else(|| contact_book::default_path(&home));
+        match self.command {
+            ContactAction::List { json } => {
+                let entries = contact_book::list(&path)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else {
+                    for entry in entries {
+                        println!("{entry}");
+                    }
+                }
+            }
+            ContactAction::Add { identifiers } => {
+                let count = contact_book::Book::new(path, Some((uid, gid))).add(&identifiers)?;
+                println!("Added {count} contact(s).");
+            }
+            ContactAction::Remove { identifiers } => {
+                let count = contact_book::Book::new(path, Some((uid, gid))).remove(&identifiers)?;
+                println!("Removed {count} contact(s).");
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Subcommand)]
 enum Action {
-    /// Run the idle control service; send/receive activate the radio and HTTPS.
+    /// Manage the local contact list used for Contacts Only receiving.
+    Contact(ContactArgs),
+    /// Run the control daemon; enabled BLE wake requests start receiving sessions.
     Daemon(Options),
-    /// Receive transfers; inspect pending offers with transfers, then accept/reject.
-    Receive {
-        #[command(flatten)]
-        options: Options,
-        /// Exit after one successful file or link transfer.
+    /// Set runtime receiving visibility and BLE wake-up on the running daemon.
+    Discoverable {
+        #[arg(value_enum)]
+        mode: Visibility,
+        #[arg(long, default_value = "/run/owl_rs")]
+        run_dir: PathBuf,
+        /// Select the list for contacts mode; otherwise reuse the current list.
         #[arg(long)]
-        once: bool,
+        contacts_file: Option<PathBuf>,
     },
     /// Send files, folders, or links; use a running daemon or start a temporary session.
     Send {
@@ -42,14 +110,14 @@ enum Action {
         /// Bypass mDNS with an IPv6 socket address, including %scope for link-local.
         #[arg(long)]
         direct: Option<SocketAddrV6>,
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 60, value_parser=clap::value_parser!(u64).range(1..=86400))]
         timeout: u64,
     },
-    /// List outgoing receivers during an active send session.
+    /// List observed AirDrop receivers during an active session.
     Peers {
         #[arg(long, default_value = "/run/owl_rs")]
         run_dir: PathBuf,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, value_parser=clap::value_parser!(u64).range(1..=86400))]
         timeout: u64,
     },
     /// Show AWDL statistics, active sends, and transfer state.
@@ -62,8 +130,9 @@ enum Action {
         #[arg(long, default_value = "/run/owl_rs")]
         run_dir: PathBuf,
     },
+    /// Accept a specific offer, or wait for and accept the next pending offer.
     Accept {
-        id: String,
+        id: Option<String>,
         #[arg(long, default_value = "/run/owl_rs")]
         run_dir: PathBuf,
     },
@@ -96,6 +165,17 @@ enum Action {
 fn main() -> Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
+    ensure!(
+        matches!(
+            &cli.command,
+            Action::Daemon(_)
+                | Action::Send { .. }
+                | Action::Probe(_)
+                | Action::Recover { .. }
+                | Action::Awdl(_)
+        ) || !Timeouts::explicit(&matches),
+        "timeout flags configure daemon/send or radio diagnostics; configure the running daemon at startup"
+    );
     let session_matches = matches.subcommand().map(|(_, args)| args);
     tracing_subscriber::fmt()
         .with_ansi(false)
@@ -116,25 +196,30 @@ fn main() -> Result<()> {
         .build()?
         .block_on(async {
             let (dir, command) = match cli.command {
-                Action::Daemon(options) => return service::run(options, None).await,
-                Action::Receive { options, once } => {
-                    let command = Command::Receive {
-                        once,
-                        options: overrides(&options, session_matches.unwrap())?,
-                    };
-                    if !service::control_available(&options.run_dir).await? {
-                        return service::run(options, Some((command, None))).await;
-                    }
-                    (options.run_dir, command)
+                Action::Daemon(mut options) => {
+                    options.timeouts = cli.timeouts;
+                    return service::run(options, None).await;
                 }
+                Action::Discoverable {
+                    mode,
+                    run_dir,
+                    contacts_file,
+                } => (
+                    run_dir,
+                    Command::Discoverable {
+                        mode,
+                        contacts_file: contacts_file.map(std::path::absolute).transpose()?,
+                    },
+                ),
                 Action::Send {
-                    options,
+                    mut options,
                     to,
                     files,
                     url,
                     direct,
                     timeout,
                 } => {
+                    options.timeouts = cli.timeouts;
                     ensure!(
                         !files.is_empty() || !url.is_empty(),
                         "choose files or --url"
@@ -186,14 +271,19 @@ fn main() -> Result<()> {
                 Action::Probe(args) => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&radio::probe(&args).await?)?
+                        serde_json::to_string_pretty(&radio::probe(&args, &cli.timeouts).await?)?
                     );
                     return Ok(());
                 }
-                Action::Recover { run_dir } => return radio::recover(&run_dir).await,
-                Action::Awdl(args) => return awdl::run(args).await,
+                Action::Recover { run_dir } => {
+                    return radio::recover(&run_dir, &cli.timeouts).await;
+                }
+                Action::Awdl(args) => return awdl::run(args, cli.timeouts).await,
+                Action::Contact(args) => {
+                    return tokio::task::spawn_blocking(move || args.run()).await?;
+                }
             };
-            let value = if matches!(command, Command::Receive { .. }) {
+            let value = if matches!(command, Command::Accept { id: None }) {
                 foreground_client(&dir, command, None).await?
             } else {
                 service::client(&dir, command, None).await?
@@ -208,11 +298,12 @@ fn overrides(options: &Options, matches: &clap::ArgMatches) -> Result<serde_json
     fn explicit(value: &mut serde_json::Value, matches: &clap::ArgMatches) {
         if let Some(object) = value.as_object_mut() {
             object.retain(|key, value| {
-                if key == "radio" {
+                if key == "radio" || key == "timeouts" {
                     explicit(value, matches);
                     !value.as_object().unwrap().is_empty()
                 } else {
-                    matches.value_source(key) == Some(ValueSource::CommandLine)
+                    matches.try_contains_id(key).unwrap_or(false)
+                        && matches.value_source(key) == Some(ValueSource::CommandLine)
                 }
             });
         }
@@ -236,51 +327,51 @@ async fn foreground_client(
             _ = tokio::signal::ctrl_c() => (),
             _ = term.recv() => (),
         }
-        // Dropping the request closes IPC; the daemon then cancels this session.
+        // Dropping the request closes IPC; the daemon then cancels this operation.
     }
-    tracing::info!("cancelling session; waiting for WLAN restoration");
-    tokio::time::timeout(std::time::Duration::from_secs(90), async {
-        loop {
-            match service::client(dir, Command::Status, None).await {
-                Ok(status) if !status["session"].is_null() => (),
-                _ => break,
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!("session restoration is still running; inspect status or recover")
-    })?;
-    anyhow::bail!("session cancelled")
+    // The daemon cancels this operation and retains any other session users.
+    anyhow::bail!("operation cancelled")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn awdl_requires_one_input_and_accepts_global_logging() {
+    fn cli_timeout_overrides_preserve_explicit_values() {
         Cli::command().debug_assert();
-        let cli =
-            Cli::try_parse_from(["owl_rs", "awdl", "--read", "capture.pcap", "--verbose"]).unwrap();
-        assert!(matches!(cli.command, Action::Awdl(_)));
-        assert_eq!(cli.verbose, 1);
-        assert!(
-            Cli::try_parse_from(["owl_rs", "awdl", "--interface", "owlmon0", "--listen-only"])
-                .is_ok()
-        );
-        for args in [
-            vec!["owl_rs", "awdl"],
-            vec![
-                "owl_rs",
-                "awdl",
-                "--read",
-                "capture.pcap",
-                "--interface",
-                "owlmon0",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
+        for value in ["0", "-1", "NaN", "inf", "90000"] {
+            assert!(
+                Cli::try_parse_from(["owl_rs", "daemon", "--ble-idle-timeout", value]).is_err()
+            );
         }
+        assert!(
+            Cli::try_parse_from(["owl_rs", "daemon", "--duration", "18446744073709551615"])
+                .is_err()
+        );
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "owl_rs",
+                "--ble-idle-timeout",
+                "12.5",
+                "send",
+                "fixture",
+                "--url",
+                "https://example.com/",
+                "--approval-timeout",
+                "0.5",
+                "--completion-grace",
+                "0",
+            ])
+            .unwrap();
+        let parsed = Cli::from_arg_matches(&matches).unwrap();
+        let Action::Send { mut options, .. } = parsed.command else {
+            unreachable!()
+        };
+        options.timeouts = parsed.timeouts;
+        let changed = overrides(&options, matches.subcommand().unwrap().1).unwrap();
+        assert_eq!(
+            changed["timeouts"],
+            serde_json::json!({"ble_idle":12.5,"approval":0.5,"completion_grace":0.0})
+        );
     }
 }

@@ -8,7 +8,37 @@ use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, info};
 
 const MAX_PEERS: usize = 512;
-const PEER_TIMEOUT: i64 = 5_000_000;
+const MAX_PENDING_SYNS: usize = 128;
+struct PendingSyn {
+    source: Mac,
+    key: (u16, u16, u32),
+    ethernet: Vec<u8>,
+    sequence: u16,
+    queued_us: i64,
+}
+fn syn_key(ethernet: &[u8], source: Mac, local: Mac) -> Option<(u16, u16, u32)> {
+    if ethernet.get(..6)? != local.0 || ethernet.get(6..12)? != source.0 {
+        return None;
+    }
+    let packet = etherparse::SlicedPacket::from_ethernet(ethernet).ok()?;
+    let Some(etherparse::NetSlice::Ipv6(ip)) = packet.net else {
+        return None;
+    };
+    if ip.header().source_addr() != source.ipv6() || ip.header().destination_addr() != local.ipv6()
+    {
+        return None;
+    }
+    let Some(etherparse::TransportSlice::Tcp(tcp)) = packet.transport else {
+        return None;
+    };
+    (tcp.syn() && !tcp.fin() && !tcp.rst() && tcp.payload().is_empty()).then(|| {
+        (
+            tcp.source_port(),
+            tcp.destination_port(),
+            tcp.sequence_number(),
+        )
+    })
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Peer {
     pub mac: Mac,
@@ -49,6 +79,9 @@ impl Peer {
 }
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub peer_timeout: std::time::Duration,
+    pub retry_timeout: std::time::Duration,
+    pub pending_timeout: std::time::Duration,
     pub mac: Mac,
     pub name: String,
     pub airdrop_port: Option<u16>,
@@ -61,6 +94,16 @@ pub struct Config {
     pub widen: usize,
     pub filter_rssi: bool,
     pub rate: Rate,
+    pub capabilities: protocol::RadioCapabilities,
+    pub operating_channel: Option<crate::channel::ChannelDefinition>,
+}
+impl Config {
+    fn fixed_sequence(&self, channel: u8) -> Sequence {
+        self.operating_channel
+            .filter(|d| d.channel == channel)
+            .map(Sequence::fixed_definition)
+            .unwrap_or_else(|| Sequence::fixed(channel))
+    }
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
@@ -70,6 +113,9 @@ pub struct Stats {
     pub rx_unknown: u64,
     pub rx_ignored: u64,
     pub rx_duplicates: u64,
+    pub rx_syn_buffered: u64,
+    pub rx_syn_released: u64,
+    pub rx_syn_expired: u64,
     pub tx_action: u64,
     pub tx_data: u64,
     pub tx_backpressure: u64,
@@ -104,6 +150,7 @@ pub struct Engine {
     rotation: Option<usize>,
     pending_rotation: Option<usize>,
     source: Option<Mac>,
+    pending_syns: VecDeque<PendingSyn>,
 }
 impl Engine {
     pub fn new(config: Config, now: i64) -> Self {
@@ -115,7 +162,7 @@ impl Engine {
         Self {
             clock: Clock::new(now),
             election,
-            sequence: Sequence::fixed(config.channel),
+            sequence: config.fixed_sequence(config.channel),
             config,
             peers: BTreeMap::new(),
             stats: Stats::default(),
@@ -125,6 +172,7 @@ impl Engine {
             rotation: None,
             pending_rotation: None,
             source: None,
+            pending_syns: VecDeque::new(),
         }
     }
     pub fn summary(&self) -> Summary<'_> {
@@ -138,6 +186,7 @@ impl Engine {
     }
     pub fn receive(&mut self, bytes: &[u8], now: i64) -> Result<(Vec<Vec<u8>>, Vec<Event>), Error> {
         self.stats.captured += 1;
+        self.expire_syns(now);
         let frame = match protocol::parse(bytes) {
             Ok(Some(f)) => f,
             Ok(None) => {
@@ -157,16 +206,57 @@ impl Engine {
             return Ok((vec![], vec![]));
         }
         match &frame.body {
-            Body::Action(a) => self.action(&frame, a, now).map(|events| (vec![], events)),
+            Body::Action(a) => {
+                let events = self.action(&frame, a, now)?;
+                let frames = if events
+                    .iter()
+                    .any(|e| matches!(e, Event::Added(mac) if *mac == frame.source))
+                {
+                    self.release_syns(frame.source, now)
+                } else {
+                    vec![]
+                };
+                Ok((frames, events))
+            }
             Body::Data(frames) => {
                 let Some(peer) = self.peers.get_mut(&frame.source).filter(|p| p.valid) else {
-                    self.stats.rx_ignored += 1;
+                    // A phone may send its TCP handshake just before its MIF.
+                    // Cache only bare SYNs addressed to us; data cannot promote a peer.
+                    let mut buffered = false;
+                    for ethernet in frames {
+                        if let Some(key) = syn_key(ethernet, frame.source, self.config.mac) {
+                            buffered = true;
+                            if self
+                                .pending_syns
+                                .iter()
+                                .any(|p| p.source == frame.source && p.key == key)
+                            {
+                                continue;
+                            }
+                            if self.pending_syns.len() == MAX_PENDING_SYNS {
+                                self.pending_syns.pop_front();
+                                self.stats.dropped += 1;
+                            }
+                            self.pending_syns.push_back(PendingSyn {
+                                source: frame.source,
+                                key,
+                                ethernet: ethernet.clone(),
+                                sequence: frame.sequence,
+                                queued_us: now,
+                            });
+                            self.stats.rx_syn_buffered += 1;
+                        }
+                    }
+                    if !buffered {
+                        self.stats.rx_ignored += 1;
+                    }
                     return Ok((vec![], vec![]));
                 };
                 // Fully parsed data, including retries, proves a known peer is alive.
                 // Busy phones may skip action frames while uploading.
                 peer.last_seen_us = now;
-                peer.recent.retain(|&(_, time)| now - time < 500_000);
+                peer.recent
+                    .retain(|&(_, time)| now - time < self.config.retry_timeout.as_micros() as i64);
                 if frame.retry && peer.recent.iter().any(|&(seq, _)| seq == frame.sequence) {
                     self.stats.rx_duplicates += 1;
                     return Ok((vec![], vec![]));
@@ -190,6 +280,32 @@ impl Engine {
                 Ok((out, vec![]))
             }
         }
+    }
+    fn expire_syns(&mut self, now: i64) {
+        let before = self.pending_syns.len();
+        let timeout = self.config.pending_timeout.as_micros() as i64;
+        self.pending_syns
+            .retain(|p| now.saturating_sub(p.queued_us) < timeout);
+        self.stats.rx_syn_expired += (before - self.pending_syns.len()) as u64;
+    }
+    fn release_syns(&mut self, source: Mac, now: i64) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        for _ in 0..self.pending_syns.len() {
+            let packet = self.pending_syns.pop_front().expect("pending SYN count");
+            if packet.source != source {
+                self.pending_syns.push_back(packet);
+                continue;
+            }
+            let peer = self.peers.get_mut(&source).expect("validated peer");
+            if peer.recent.len() == 128 {
+                peer.recent.pop_front();
+            }
+            peer.recent.push_back((packet.sequence, now));
+            frames.push(packet.ethernet);
+        }
+        self.stats.rx_data += frames.len() as u64;
+        self.stats.rx_syn_released += frames.len() as u64;
+        frames
     }
     fn action(&mut self, f: &Frame, a: &Action, now: i64) -> Result<Vec<Event>, Error> {
         let old = self.peers.get(&f.source);
@@ -252,10 +368,11 @@ impl Engine {
         })
     }
     pub fn tick(&mut self, now: i64) -> Vec<Event> {
+        self.expire_syns(now);
         let expired: Vec<_> = self
             .peers
             .values()
-            .filter(|p| now - p.last_seen_us > PEER_TIMEOUT)
+            .filter(|p| now - p.last_seen_us > self.config.peer_timeout.as_micros() as i64)
             .map(|p| (p.mac, p.valid))
             .collect();
         let mut events = Vec::new();
@@ -322,7 +439,7 @@ impl Engine {
             .get(&self.election.sync)
             .filter(|p| p.sequence.is_some())
         else {
-            self.sequence = Sequence::fixed(self.config.channel);
+            self.sequence = self.config.fixed_sequence(self.config.channel);
             self.source = None;
             self.rotation = None;
             self.pending_rotation = None;
@@ -340,7 +457,7 @@ impl Engine {
                 if c == 0 {
                     return;
                 }
-                Sequence::fixed(c)
+                self.config.fixed_sequence(c)
             }
             Strategy::Widen => src.widen(self.config.widen),
             Strategy::Rotate => {
@@ -396,6 +513,10 @@ impl Engine {
                 seq
             }
         };
+        let sequence = match self.config.operating_channel {
+            Some(definition) => sequence.with_definition(definition),
+            None => sequence,
+        };
         if sequence != self.sequence {
             debug!(source=%peer.mac,?sequence,"following sync master channel sequence");
             self.sequence = sequence;
@@ -450,19 +571,25 @@ impl Engine {
         self.ieee_sequence = (n + 1) & 4095;
         n
     }
-    pub fn set_transmit_channel(&mut self, channel: u8) {
-        self.config.channel = channel;
-        self.sequence = Sequence::fixed(channel);
+    pub fn set_operating_channel(&mut self, definition: crate::channel::ChannelDefinition) {
+        self.config.channel = definition.channel;
+        self.config.operating_channel = Some(definition);
+        self.sequence = if self.config.strategy == Strategy::Pin {
+            Sequence::fixed_definition(definition)
+        } else {
+            self.sequence.with_definition(definition)
+        };
     }
     pub fn action_frame(&mut self, subtype: u8, now: i64) -> Vec<u8> {
         self.action_frame_on_channel(subtype, now, self.current_channel(now))
     }
-    /// A discovery visit changes the physical-channel field, not our fixed schedule.
+    /// Encode the physical channel; the fixed sequence is committed after tuning.
     pub fn action_frame_on_channel(&mut self, subtype: u8, now: i64, channel: u8) -> Vec<u8> {
         let seq = self.next_sequence();
         let a = Advertisement {
             mac: self.config.mac,
             name: &self.config.name,
+            capabilities: self.config.capabilities.for_channel(channel),
             sequence: &self.sequence,
             election: &self.election,
             channel,

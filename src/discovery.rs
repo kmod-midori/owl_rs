@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use crate::visibility::{self, Policy};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -28,18 +29,19 @@ pub struct Peer {
 }
 impl Peer {
     /// A live AWDL neighbor may answer HTTPS before publishing mDNS records.
-    pub fn from_awdl(mac: crate::protocol::Mac, scope: u32) -> Self {
+    pub fn from_awdl(mac: crate::protocol::Mac, scope: u32, expiry: Duration) -> Self {
         Self {
             id: mac.0.iter().map(|b| format!("{b:02x}")).collect(),
             address: SocketAddrV6::new(mac.ipv6(), 8770, 0, scope),
             flags: 128,
-            seen: Some(Instant::now() + Duration::from_secs(2)),
+            seen: Some(Instant::now() + expiry),
         }
     }
 }
 #[derive(Clone, Default)]
 pub struct Discovery {
-    receive_only: bool,
+    policy: Option<tokio::sync::watch::Receiver<Policy>>,
+    timeouts: crate::timeouts::Timeouts,
     pub peers: Arc<RwLock<BTreeMap<String, Peer>>>,
 }
 pub fn scope(interface: &str) -> Result<u32> {
@@ -50,11 +52,13 @@ pub fn scope(interface: &str) -> Result<u32> {
     )
 }
 impl Discovery {
-    pub fn receiving() -> Self {
-        Self {
-            receive_only: true,
-            ..Self::default()
-        }
+    pub(crate) fn with_timeouts(mut self, timeouts: crate::timeouts::Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+    pub(crate) fn with_policy(mut self, policy: tokio::sync::watch::Receiver<Policy>) -> Self {
+        self.policy = Some(policy);
+        self
     }
     pub async fn list(&self) -> Vec<Peer> {
         self.peers
@@ -65,7 +69,7 @@ impl Discovery {
             .cloned()
             .collect()
     }
-    pub async fn run(
+    pub(crate) async fn run(
         &self,
         interface: &str,
         id: &str,
@@ -74,6 +78,10 @@ impl Discovery {
         cancel: CancellationToken,
         snapshot: tokio::sync::watch::Receiver<serde_json::Value>,
     ) -> Result<()> {
+        let mut policy = self
+            .policy
+            .clone()
+            .unwrap_or_else(|| tokio::sync::watch::channel(Policy::everyone()).1);
         let index = scope(interface)?;
         // Match the proven helper: multicast mDNS uses Ethernet directly on the
         // AWDL TAP, independent of host VPN policy routing. pcap owns the native I/O.
@@ -84,7 +92,7 @@ impl Discovery {
         let mut capture = pcap::Capture::from_device(interface)?
             .snaplen(65535)
             .immediate_mode(true)
-            .timeout(1)
+            .timeout(self.timeouts.capture_read.as_millis().max(1) as i32)
             .open()?
             .setnonblock()?;
         anyhow::ensure!(
@@ -152,6 +160,13 @@ impl Discovery {
             answer.emit(&mut encoder)?;
         }
         let answer = wire;
+        let mut goodbye = Message::from_vec(&answer)?;
+        for record in goodbye.answers_mut() {
+            record.set_ttl(0);
+        }
+        let goodbye = goodbye.to_vec()?;
+        let mut advertised = false;
+        let started = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(17));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut step = 0u32;
@@ -162,12 +177,15 @@ impl Discovery {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    let mut goodbye = Message::from_vec(&answer)?;
-                    for record in goodbye.answers_mut() {
-                        record.set_ttl(0);
-                    }
-                    let _ = stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &goodbye.to_vec()?)?);
+                    if advertised { let _ = stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &goodbye)?); }
                     return Ok(());
+                }
+                _ = visibility::changed(&mut policy) => {
+                    if !policy.borrow().mode.enabled() && advertised {
+                        stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &goodbye)?)?;
+                        advertised = false;
+                    }
+                    step = 0;
                 }
                 _ = tick.tick() => {
                     if step == 0 {
@@ -187,8 +205,14 @@ impl Discovery {
                         }
                     }
                     if step < 64 {
-                        stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &answer)?)?;
-                        if step.is_multiple_of(8) && !self.receive_only {
+                        if policy.borrow().mode.enabled() {
+                            stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &answer)?)?;
+                            if !advertised {
+                                tracing::debug!(elapsed_ms=started.elapsed().as_millis(), "first mDNS advertisement submitted to AWDL");
+                            }
+                            advertised = true;
+                        }
+                        if step.is_multiple_of(8) {
                             stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &query)?)?;
                         }
                     }
@@ -206,11 +230,13 @@ impl Discovery {
                     let Some(etherparse::TransportSlice::Udp(udp)) = parsed.transport else { continue; };
                     if udp.source_port() != 5353 || udp.destination_port() != 5353 { continue; }
                     let Ok(msg) = Message::from_vec(udp.payload()) else { continue; };
-                    if last_reply.elapsed() >= Duration::from_millis(100)
+                    if policy.borrow().mode.enabled() && last_reply.elapsed() >= Duration::from_millis(100)
                         && msg.queries().iter().any(|q| q.name() == &service || q.name().to_ascii().starts_with(id))
                     {
                         stream.capture_mut().sendpacket(ethernet_dns(mac.0, address, group, &answer)?)?;
                         last_reply = Instant::now();
+                        advertised = true;
+                        tracing::debug!(elapsed_ms=started.elapsed().as_millis(), "answered incoming AirDrop mDNS query");
                     }
                     for record in msg.answers().iter().chain(msg.additionals()).chain(msg.name_servers()) {
                         let name = record.name().to_ascii().to_lowercase();
@@ -220,7 +246,7 @@ impl Discovery {
                             flags.remove(&name);
                             continue;
                         }
-                        let expiry = Instant::now() + Duration::from_secs(u64::from(record.ttl().min(120)));
+                        let expiry = Instant::now() + Duration::from_secs(u64::from(record.ttl())).min(self.timeouts.discovery_cache);
                         match record.data() {
                             RData::AAAA(AAAA(ip)) if ip.is_unicast_link_local() => {
                                 if addresses.len() < 512 || addresses.contains_key(&name) {

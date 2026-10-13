@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{
     archive::{self, Item},
+    contacts::{PeerCertificate, Verifier, record_data},
     identity::Identity,
+    timeouts::Timeouts,
+    visibility::{self, Policy, Visibility},
 };
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
@@ -26,20 +29,12 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
+    sync::{Mutex, Semaphore, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, Error>;
 const METADATA_LIMIT: usize = 1024 * 1024;
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
-const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const TCP_LINGER_TIMEOUT: Duration = Duration::from_secs(10);
-const RECEIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
-const UPLOAD_IDLE_POLL: Duration = Duration::from_secs(2);
-const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
-const UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 fn full(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into())
         .map_err(|e| match e {})
@@ -54,16 +49,18 @@ pub fn dict(fields: impl IntoIterator<Item = (String, plist::Value)>) -> plist::
     plist::Value::Dictionary(fields.into_iter().collect())
 }
 fn response(code: StatusCode, body: Vec<u8>) -> Response<Body> {
-    let mut builder = Response::builder().status(code);
+    let mut builder = Response::builder()
+        .status(code)
+        .header("Content-Length", body.len());
     if !code.is_success() {
         builder = builder.header("Connection", "close");
     }
     builder.body(full(body)).expect("static response headers")
 }
-async fn metadata(body: Incoming) -> Result<plist::Value> {
+async fn metadata(body: Incoming, timeout: Duration) -> Result<plist::Value> {
     let mut body = body;
     let mut bytes = Vec::new();
-    while let Some(frame) = tokio::time::timeout(Duration::from_secs(20), body.frame()).await? {
+    while let Some(frame) = tokio::time::timeout(timeout, body.frame()).await? {
         if let Ok(data) = frame?.into_data() {
             ensure!(
                 bytes.len() + data.len() <= METADATA_LIMIT,
@@ -160,12 +157,9 @@ pub struct Transfer {
     pub error: Option<String>,
 }
 struct Entry {
+    created: tokio::time::Instant,
     transfer: Transfer,
     decision: Option<oneshot::Sender<bool>>,
-}
-struct Approved {
-    offer: Offer,
-    _permit: Option<OwnedSemaphorePermit>,
 }
 #[derive(Clone)]
 pub struct Receiver {
@@ -177,9 +171,9 @@ pub struct Receiver {
     pub owner: Option<(u32, u32)>,
     entries: Arc<Mutex<BTreeMap<String, Entry>>>,
     upload: Arc<Semaphore>,
-    once: bool,
-    single_offer: Arc<Semaphore>,
-    completed: CancellationToken,
+    activity: Option<Arc<crate::session::Activity>>,
+    timeouts: Timeouts,
+    policy: watch::Receiver<Policy>,
 }
 impl Receiver {
     pub fn new(
@@ -199,14 +193,44 @@ impl Receiver {
             owner,
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             upload: Arc::new(Semaphore::new(4)),
-            once: false,
-            single_offer: Arc::new(Semaphore::new(1)),
-            completed: CancellationToken::new(),
+            activity: None,
+            timeouts: Timeouts::default(),
+            policy: watch::channel(Policy::everyone()).1,
         }
     }
-    pub fn with_once(mut self, once: bool) -> Self {
-        self.once = once;
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
         self
+    }
+    pub(crate) fn with_policy(mut self, policy: watch::Receiver<Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+    pub(crate) fn with_activity(mut self, activity: Arc<crate::session::Activity>) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+    pub(crate) fn visibility(&self) -> Visibility {
+        self.policy.borrow().mode
+    }
+    pub(crate) async fn accept_next(&self) -> Result<Option<String>> {
+        if !self.visibility().enabled() {
+            return Ok(None);
+        }
+        let mut entries = self.entries.lock().await;
+        loop {
+            let next = entries
+                .values_mut()
+                .filter(|entry| entry.transfer.state == "pending" && entry.decision.is_some())
+                .min_by_key(|entry| entry.created);
+            let Some(entry) = next else {
+                return Ok(None);
+            };
+            let id = entry.transfer.offer.id.clone();
+            if entry.decision.take().unwrap().send(true).is_ok() {
+                return Ok(Some(id));
+            }
+        }
     }
     pub async fn transfers(&self) -> Vec<Transfer> {
         self.entries
@@ -241,9 +265,6 @@ impl Receiver {
             e.transfer.bytes = bytes;
             e.transfer.output = out;
             e.transfer.error = error;
-            if state == "completed" && self.once {
-                self.completed.cancel();
-            }
         }
     }
     fn discover(&self) -> Result<Vec<u8>> {
@@ -264,13 +285,13 @@ impl Receiver {
     }
     pub async fn serve(&self, listener: TcpListener, cancel: CancellationToken) -> Result<()> {
         let acceptor = self.identity.acceptor()?;
+        let certificates = Verifier::apple()?;
         let connections = Arc::new(Semaphore::new(32));
         let mut tasks = tokio::task::JoinSet::new();
         let result = async {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    _ = self.completed.cancelled(), if self.once => break,
                     done = tasks.join_next(), if !tasks.is_empty() => {
                         if let Some(Err(e)) = done {
                             tracing::warn!("HTTPS task: {e}");
@@ -278,6 +299,7 @@ impl Receiver {
                     }
                     accept = listener.accept() => {
                         let (socket, peer) = accept?;
+                        tracing::debug!("incoming AirDrop TCP connection");
                         if !peer.ip().is_loopback()
                             && !matches!(peer.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
                         {
@@ -286,11 +308,19 @@ impl Receiver {
                         let Ok(permit) = connections.clone().try_acquire_owned() else {
                             continue;
                         };
+                        let lease = match self.activity.as_ref().map(|activity| activity.acquire()).transpose() {
+                            Ok(lease) => lease,
+                            Err(_) => continue,
+                        };
                         let receiver = self.clone();
-                        let ssl = Ssl::new(acceptor.context())?;
+                        let mut ssl = Ssl::new(acceptor.context())?;
+                        // Request optional identity from the first handshake so a live
+                        // Everyone connection can later be checked in Contacts mode.
+                        if let Some(contacts) = &self.policy.borrow().contacts { contacts.request_certificate(&mut ssl)?; }
+                        else { certificates.request_certificate(&mut ssl)?; }
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let result = receiver.serve_connection(socket, ssl).await;
+                            let result = receiver.serve_connection(socket, ssl, lease).await;
                             if let Err(e) = result {
                                 tracing::debug!(%peer, "HTTPS: {e:#}");
                             }
@@ -300,28 +330,30 @@ impl Receiver {
             }
             Ok::<_, anyhow::Error>(())
         }.await;
-        if self.once && self.completed.is_cancelled() {
-            let _ = tokio::time::timeout(RECEIVER_DRAIN_TIMEOUT, async {
-                while tasks.join_next().await.is_some() {}
-            })
-            .await;
-        }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         result
     }
-    async fn serve_connection(&self, socket: tokio::net::TcpStream, ssl: Ssl) -> Result<()> {
+    async fn serve_connection(
+        &self,
+        socket: tokio::net::TcpStream,
+        ssl: Ssl,
+        lease: Option<crate::session::Lease>,
+    ) -> Result<()> {
         // A TAP write does not mean the phone acknowledged the reply. Retain a
         // final TCP descriptor after Hyper/TLS flushes, while AWDL stays active.
-        let final_socket = self
-            .once
-            .then(|| socket2::SockRef::from(&socket).try_clone())
-            .transpose()?;
-        self.serve_https(socket, ssl).await?;
-        if let Some(socket) = final_socket {
+        let final_socket = socket2::SockRef::from(&socket).try_clone()?;
+        let lifetime = Arc::new(Mutex::new(lease));
+        let completed = self.serve_https(socket, ssl, lifetime.clone()).await?;
+        if completed && let Some(lease) = lifetime.lock().await.as_ref() {
+            lease.complete();
+        }
+        if completed {
+            let socket = final_socket;
+            let linger = self.timeouts.tcp_linger;
             tokio::task::spawn_blocking(move || {
                 socket.set_nonblocking(false)?;
-                socket.set_linger(Some(TCP_LINGER_TIMEOUT))?;
+                socket.set_linger(Some(linger))?;
                 // Only this descriptor remains: close waits for data/FIN ACKs.
                 // Blocking linger must never occupy a Tokio network worker.
                 drop(socket);
@@ -331,77 +363,170 @@ impl Receiver {
         }
         Ok(())
     }
-    async fn serve_https(&self, socket: tokio::net::TcpStream, ssl: Ssl) -> Result<()> {
+    async fn serve_https(
+        &self,
+        socket: tokio::net::TcpStream,
+        ssl: Ssl,
+        lifetime: Arc<Mutex<Option<crate::session::Lease>>>,
+    ) -> Result<bool> {
         let mut stream = tokio_openssl::SslStream::new(ssl, socket)?;
-        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, Pin::new(&mut stream).accept()).await??;
-        let session = Arc::new(Mutex::new(None::<Approved>));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(self.timeouts.tls_handshake, Pin::new(&mut stream).accept()).await??;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "incoming AirDrop TLS ready"
+        );
+        let peer = Arc::new(PeerCertificate::from_tls(stream.ssl()));
+        let session = Arc::new(Mutex::new(None::<Offer>));
         let receiver = self.clone();
-        let service = service_fn(move |req| {
+        let refused = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let refusal = refused.clone();
+        let terminal = finished.clone();
+        let service = service_fn(move |req: Request<Incoming>| {
             let receiver = receiver.clone();
             let session = session.clone();
-            async move { Ok::<_, std::convert::Infallible>(receiver.handle(req, session).await) }
+            let finished = terminal.clone();
+            let peer = peer.clone();
+            let refused = refusal.clone();
+            let lifetime = lifetime.clone();
+            async move {
+                if let Some(activity) = &receiver.activity {
+                    let mut held = lifetime.lock().await;
+                    if held.is_none() {
+                        match activity.acquire() {
+                            Ok(lease) => *held = Some(lease),
+                            Err(_) => {
+                                refused.cancel();
+                                return Ok::<_, std::convert::Infallible>(response(
+                                    StatusCode::FORBIDDEN,
+                                    vec![],
+                                ));
+                            }
+                        }
+                    }
+                }
+                let discovery = req.uri().path() == "/Discover";
+                let upload = req.uri().path() == "/Upload";
+                let ask = req.uri().path() == "/Ask";
+                let response = receiver.handle(req, session.clone(), peer).await;
+                // A completed discovery reply needs no idle keep-alive lease.
+                // Approved offers retain theirs across /Ask -> /Upload and
+                // through the final connection drain and TCP linger.
+                if discovery {
+                    lifetime.lock().await.take();
+                } else if ask
+                    && response.status().is_success()
+                    && session.lock().await.is_some()
+                    && let Some(lease) = lifetime.lock().await.as_mut()
+                {
+                    // Only an approved file transfer changes the radio channel.
+                    // TLS, Discover, and the approval wait stay on discovery.
+                    lease.transmitting();
+                }
+                if !response.status().is_success() {
+                    refused.cancel();
+                } else if upload || (ask && session.lock().await.is_none()) {
+                    finished.cancel();
+                }
+                Ok::<_, std::convert::Infallible>(response)
+            }
         });
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(HTTP_HEADER_TIMEOUT);
+            .header_read_timeout(self.timeouts.http_headers);
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         tokio::pin!(connection);
         tokio::select! {
             result = &mut connection => result?,
-            _ = self.completed.cancelled(), if self.once => {
+            _ = refused.cancelled() => {
+                // Finish the refusal response, then close without waiting for
+                // another request or retaining a success-only linger descriptor.
                 connection.as_mut().graceful_shutdown();
-                tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, connection).await??;
+                match tokio::time::timeout(self.timeouts.rejection_drain, connection).await {
+                    Ok(result) => result?,
+                    Err(_) => tracing::debug!("refusal close deadline reached"),
+                }
+            }
+            _ = finished.cancelled() => {
+                connection.as_mut().graceful_shutdown();
+                tokio::time::timeout(self.timeouts.connection_drain, connection).await??;
             }
         }
         // Dropping Hyper here closes the original descriptor before TCP linger.
-        Ok(())
+        Ok(finished.is_cancelled())
     }
     async fn handle(
         &self,
         req: Request<Incoming>,
-        session: Arc<Mutex<Option<Approved>>>,
+        session: Arc<Mutex<Option<Offer>>>,
+        peer: Arc<PeerCertificate>,
     ) -> Response<Body> {
-        match self.route(req, session).await {
+        let endpoint = match req.uri().path() {
+            "/Discover" => "Discover",
+            "/Ask" => "Ask",
+            "/Upload" => "Upload",
+            _ => "unknown",
+        };
+        let started = tokio::time::Instant::now();
+        let reply = match self.route(req, session, &peer).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("AirDrop request rejected: {e:#}");
                 response(StatusCode::BAD_REQUEST, Vec::new())
             }
-        }
+        };
+        tracing::debug!(
+            endpoint,
+            status = reply.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "incoming AirDrop response ready"
+        );
+        reply
     }
+
     async fn route(
         &self,
         req: Request<Incoming>,
-        session: Arc<Mutex<Option<Approved>>>,
+        session: Arc<Mutex<Option<Offer>>>,
+        peer: &PeerCertificate,
     ) -> Result<Response<Body>> {
         ensure!(req.method() == hyper::Method::POST, "only POST is accepted");
         match req.uri().path() {
             "/Discover" => {
-                let _ = metadata(req.into_body()).await?;
+                let value = metadata(req.into_body(), self.timeouts.metadata_idle).await?;
+                let policy = self.policy.borrow().clone();
+                if policy.mode == Visibility::Off {
+                    return Ok(response(StatusCode::FORBIDDEN, vec![]));
+                }
+                if let Some(contacts) = &policy.contacts
+                    && !contacts.discover(record_data(&value)).await
+                {
+                    return Ok(response(StatusCode::UNAUTHORIZED, vec![]));
+                }
+                if self.policy.borrow().revision != policy.revision {
+                    return Ok(response(StatusCode::FORBIDDEN, vec![]));
+                }
                 Ok(response(StatusCode::OK, self.discover()?))
             }
             "/Ask" => {
                 *session.lock().await = None;
-                let offer = Offer::parse(metadata(req.into_body()).await?)?;
-                let permit = if self.once {
-                    ensure!(
-                        !self.completed.is_cancelled(),
-                        "receive session is complete"
-                    );
-                    let permit = self
-                        .single_offer
-                        .clone()
-                        .try_acquire_owned()
-                        .context("receive --once already has an active offer")?;
-                    ensure!(
-                        !self.completed.is_cancelled(),
-                        "receive session is complete"
-                    );
-                    Some(permit)
-                } else {
-                    None
-                };
+                let value = metadata(req.into_body(), self.timeouts.metadata_idle).await?;
+                let policy = self.policy.borrow().clone();
+                if policy.mode == Visibility::Off {
+                    return Ok(response(StatusCode::FORBIDDEN, vec![]));
+                }
+                if let Some(contacts) = &policy.contacts
+                    && let Err(reason) = contacts.authorize(record_data(&value), peer).await
+                {
+                    tracing::info!(%reason, "Contacts Only offer refused");
+                    return Ok(response(StatusCode::FORBIDDEN, vec![]));
+                }
+                if self.policy.borrow().revision != policy.revision {
+                    return Ok(response(StatusCode::FORBIDDEN, vec![]));
+                }
+                let offer = Offer::parse(value)?;
                 let bytes = offer
                     .items
                     .iter()
@@ -429,6 +554,7 @@ impl Receiver {
                     entries.insert(
                         offer.id.clone(),
                         Entry {
+                            created: tokio::time::Instant::now(),
                             transfer: Transfer {
                                 offer: offer.clone(),
                                 state: "pending".into(),
@@ -444,16 +570,17 @@ impl Receiver {
                 let accepted = if self.auto_accept {
                     true
                 } else {
-                    tokio::time::timeout(Duration::from_secs(60), rx)
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(false)
+                    let mut changes = self.policy.clone();
+                    changes.borrow_and_update();
+                    tokio::select! {
+                        result = tokio::time::timeout(self.timeouts.approval, rx) => result.ok().and_then(Result::ok).unwrap_or(false),
+                        _ = visibility::changed(&mut changes) => false,
+                    }
                 };
                 if let Some(e) = self.entries.lock().await.get_mut(&offer.id) {
                     e.decision.take();
                 }
-                if !accepted {
+                if !accepted || self.policy.borrow().revision != policy.revision {
                     self.update(&offer.id, "rejected", 0, None, None).await;
                     return Ok(response(StatusCode::FORBIDDEN, vec![]));
                 }
@@ -471,23 +598,28 @@ impl Receiver {
                         }
                     }
                 } else {
-                    *session.lock().await = Some(Approved {
-                        offer: offer.clone(),
-                        _permit: permit,
-                    });
+                    *session.lock().await = Some(offer.clone());
                     self.update(&offer.id, "accepted", 0, None, None).await;
                 }
-                Ok(response(StatusCode::OK, self.discover()?))
+                let mut reply = response(StatusCode::OK, self.discover()?);
+                if !offer.urls.is_empty() {
+                    reply.headers_mut().insert(
+                        "Connection",
+                        hyper::header::HeaderValue::from_static("close"),
+                    );
+                }
+                Ok(reply)
             }
             "/Upload" => {
-                let Some(approved) = session.lock().await.take() else {
+                let Some(offer) = session.lock().await.take() else {
                     return Ok(response(StatusCode::FORBIDDEN, vec![]));
                 };
-                let offer = &approved.offer;
-                let result = tokio::time::timeout(UPLOAD_TOTAL_TIMEOUT, self.upload(req, offer))
-                    .await
-                    .context("incoming upload timed out")
-                    .and_then(|r| r);
+                let offer = &offer;
+                let result =
+                    tokio::time::timeout(self.timeouts.upload_total, self.upload(req, offer))
+                        .await
+                        .context("incoming upload timed out")
+                        .and_then(|r| r);
                 match result {
                     Ok((bytes, out, incomplete_http)) => {
                         self.update(&offer.id, "completed", bytes, Some(out), None)
@@ -581,7 +713,7 @@ impl Receiver {
         let mut last_data = tokio::time::Instant::now();
         let mut checked_bytes = None;
         loop {
-            match tokio::time::timeout(UPLOAD_IDLE_POLL, body.frame()).await {
+            match tokio::time::timeout(self.timeouts.upload_check, body.frame()).await {
                 Ok(Some(frame)) => {
                     if let Ok(data) = frame?.into_data() {
                         bytes = bytes
@@ -617,7 +749,7 @@ impl Receiver {
                         }
                     }
                     ensure!(
-                        last_data.elapsed() < UPLOAD_IDLE_TIMEOUT,
+                        last_data.elapsed() < self.timeouts.upload_idle,
                         "upload stalled before a complete archive arrived"
                     );
                 }
@@ -645,7 +777,7 @@ pub struct Sender {
     pub id: String,
     pub identity: Identity,
     pub tag: Option<[u8; 3]>,
-    pub ask_timeout: Duration,
+    pub timeouts: Timeouts,
 }
 struct Connection {
     sender: hyper::client::conn::http1::SendRequest<Body>,
@@ -682,7 +814,7 @@ impl Sender {
                     .parse()?;
             socket.bind(SocketAddrV6::new(mac.ipv6(), 0, 0, address.scope_id()).into())?;
         }
-        let tcp = tokio::time::timeout(Duration::from_secs(15), socket.connect(address.into()))
+        let tcp = tokio::time::timeout(self.timeouts.tcp_connect, socket.connect(address.into()))
             .await
             .context("TCP connection timed out")?
             .with_context(|| format!("connect to {address}"))?;
@@ -690,7 +822,7 @@ impl Sender {
         let mut ssl = config.into_ssl("AirDrop")?;
         ssl.set_verify(openssl::ssl::SslVerifyMode::NONE);
         let mut stream = tokio_openssl::SslStream::new(ssl, tcp)?;
-        tokio::time::timeout(Duration::from_secs(15), Pin::new(&mut stream).connect())
+        tokio::time::timeout(self.timeouts.tls_connect, Pin::new(&mut stream).connect())
             .await
             .context("TLS handshake timed out")?
             .context("AirDrop TLS handshake")?;
@@ -716,18 +848,12 @@ impl Sender {
     }
     pub async fn discover(&self, address: SocketAddrV6) -> Result<String> {
         let mut c = self.connect(address).await?;
-        let mut fields = vec![(
+        let fields = vec![(
             "DeviceSupportFlags".into(),
             plist::Value::Integer(111611u64.into()),
         )];
-        if let Some(record) = &self.identity.record {
-            fields.push((
-                "SenderRecordData".into(),
-                plist::Value::Data(record.clone()),
-            ));
-        }
         let reply = tokio::time::timeout(
-            Duration::from_secs(15),
+            self.timeouts.http_request,
             c.sender
                 .send_request(self.request("/Discover", dict(fields))?),
         )
@@ -737,7 +863,7 @@ impl Sender {
             "Discover returned {}",
             reply.status()
         );
-        let value = metadata(reply.into_body()).await?;
+        let value = metadata(reply.into_body(), self.timeouts.metadata_idle).await?;
         Ok(value
             .as_dictionary()
             .and_then(|d| d.get("ReceiverComputerName"))
@@ -752,6 +878,18 @@ impl Sender {
         urls: Vec<String>,
         file: Option<PathBuf>,
         icon: Option<Vec<u8>>,
+    ) -> Result<String> {
+        self.send_with_activity(address, items, urls, file, icon, None)
+            .await
+    }
+    pub(crate) async fn send_with_activity(
+        &self,
+        address: SocketAddrV6,
+        items: Vec<Item>,
+        urls: Vec<String>,
+        file: Option<PathBuf>,
+        icon: Option<Vec<u8>>,
+        activity: Option<&Arc<crate::session::Activity>>,
     ) -> Result<String> {
         let receiver = self.discover(address).await?;
         tracing::info!(%receiver,%address,"requesting AirDrop transfer");
@@ -790,12 +928,6 @@ impl Sender {
             ),
             ("ConvertMediaFormats".into(), false.into()),
         ];
-        if let Some(record) = &self.identity.record {
-            fields.push((
-                "SenderRecordData".into(),
-                plist::Value::Data(record.clone()),
-            ));
-        }
         if let Some(tag) = self.tag {
             fields.push((
                 "SenderIdentityAuthTag".into(),
@@ -808,7 +940,7 @@ impl Sender {
         }
         let mut c = self.connect(address).await?;
         let reply = tokio::time::timeout(
-            self.ask_timeout,
+            self.timeouts.approval,
             c.sender.send_request(self.request("/Ask", dict(fields))?),
         )
         .await
@@ -820,10 +952,14 @@ impl Sender {
             reply.status()
         );
         tracing::info!(%id,"AirDrop Ask accepted");
-        let _ = metadata(reply.into_body())
+        let _ = metadata(reply.into_body(), self.timeouts.metadata_idle)
             .await
             .context("read Ask response")?;
         if !links {
+            let mut exchange = activity.map(|a| a.acquire()).transpose()?;
+            if let Some(lease) = &mut exchange {
+                lease.transmitting();
+            }
             let file = file.context("file transfer has no archive")?;
             let input = tokio::fs::File::open(file).await?;
             let wire_bytes = input.metadata().await?.len();
@@ -846,10 +982,11 @@ impl Sender {
                 .header("TransferID", &id)
                 .header("TotalBytes", bytes.to_string())
                 .body(body)?;
-            let reply = tokio::time::timeout(Duration::from_secs(600), c.sender.send_request(req))
-                .await
-                .context("Upload timed out")?
-                .context("send Upload")?;
+            let reply =
+                tokio::time::timeout(self.timeouts.upload_total, c.sender.send_request(req))
+                    .await
+                    .context("Upload timed out")?
+                    .context("send Upload")?;
             tracing::info!(%id,status=%reply.status(),"AirDrop upload response");
             ensure!(
                 reply.status().is_success(),
@@ -859,7 +996,7 @@ impl Sender {
             let mut body = reply.into_body();
             let mut size = 0;
             while let Some(frame) =
-                tokio::time::timeout(Duration::from_secs(20), body.frame()).await?
+                tokio::time::timeout(self.timeouts.metadata_idle, body.frame()).await?
             {
                 if let Ok(data) = frame?.into_data() {
                     size += data.len();
@@ -909,4 +1046,60 @@ pub async fn listener(address: SocketAddr, interface: Option<&str>) -> Result<Tc
     socket.listen(32)?;
     socket.set_nonblocking(true)?;
     Ok(TcpListener::from_std(socket.into())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn next_accept_selects_oldest_live_offer_without_reusing_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            dir: dir.path().join("keys"),
+            record: None,
+            hashes: [0; 8],
+        };
+        let receiver = Receiver::new(
+            "fixture".into(),
+            identity,
+            dir.path().join("output"),
+            1024,
+            false,
+            None,
+        );
+        let older = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let newer = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let expired = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let mut decisions = Vec::new();
+        for (index, id) in [&expired, &older, &newer].into_iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            decisions.push(rx);
+            receiver.entries.lock().await.insert(
+                id.clone(),
+                Entry {
+                    created: tokio::time::Instant::now() + Duration::from_millis(index as u64),
+                    transfer: Transfer {
+                        offer: Offer {
+                            id: id.clone(),
+                            sender: "fixture".into(),
+                            items: vec![],
+                            urls: vec![],
+                        },
+                        state: "pending".into(),
+                        bytes: 0,
+                        output: None,
+                        error: None,
+                    },
+                    decision: Some(tx),
+                },
+            );
+        }
+        drop(decisions.remove(0)); // Stale pending entry must not consume the next acceptance.
+        assert_eq!(receiver.accept_next().await.unwrap(), Some(older));
+        assert!(decisions.remove(0).await.unwrap());
+        assert_eq!(receiver.accept_next().await.unwrap(), Some(newer));
+        assert!(decisions.remove(0).await.unwrap());
+        assert_eq!(receiver.accept_next().await.unwrap(), None);
+        assert!(!dir.path().join("output").exists());
+    }
 }

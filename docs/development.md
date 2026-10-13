@@ -21,39 +21,43 @@ Tests focus on critical or error-prone behavior: malformed radio frames,
 encapsulation/MTU bounds, clock rollover, election/channel overlap, retry
 deduplication, injection backpressure, profile validation, archive bounds and
 traversal, connection-bound consent, interrupted HTTP framing, large uploads and
-session teardown. Avoid tests that duplicate other scenarios or library behavior.
+session teardown. Two contact-policy regressions use a synthetic root and
+intermediate, real CMS signatures and TLS metadata requests to test trust,
+signer role, replay, expiry and consent without sending files. Contact-list tests cover normalized matching, batch rejection,
+private file permissions and concurrent updates. Avoid tests that duplicate other scenarios or library behavior.
 
 Builds and captures belong in ignored `build/` and `target/`. Machine-specific
 helpers belong in ignored `dev/`; the justfile optionally imports
 `dev/justfile.local`. Personal device information and captures stay in those
 local directories.
 
-## Local HTTPS testing
+## Local lifecycle testing
 
-Loopback sessions require neither radio nor root. `--no-radio` accepts only an
-IPv6 loopback listener; with radio setup, `--listen` supplies the HTTPS port.
+Automated tests exercise runtime visibility, optional client certificates,
+contact verification and consent over loopback TLS. A simulated BLE callback
+starts a no-radio shared session, overlaps incoming and outgoing work, and checks
+independent cancellation and ordered cleanup. The CLI
+regression uses local control sockets to verify idle toggles, waiting acceptance
+and restart after SIGKILL. None of these checks requires a phone or Bluetooth
+adapter. BLE parser cases reject truncated, ambiguous and unrelated manufacturer
+data; the session regression checks current Contacts/Everyone admission. A paused-clock test covers repeated
+BLE wake resets, active-user protection and refresh during completion grace. CLI
+checks cover fractional values and explicit override inheritance. Real BLE scanning is disabled for `--no-radio` sessions.
 
 ```sh
-cargo run --locked -- receive --no-radio --no-bluetooth \
-  --run-dir build/local/run --keys build/local/identity \
-  --output build/local/received --listen '[::1]:18771' --auto-accept
+cargo test --locked --lib
+cargo test --locked --test session_lifecycle
 ```
 
-In another terminal, start a sender with its own control directory:
-
-```sh
-cargo run --locked -- send local /path/to/file \
-  --run-dir build/local-send/run --no-radio --no-bluetooth \
-  --keys build/local-send/identity --listen '[::1]:18772' \
-  --direct '[::1]:18771'
-```
+`daemon --no-radio --no-bluetooth` exercises idle control commands. Tests create
+direct loopback HTTPS receivers through the library API.
 
 ## AWDL diagnostics
 
 `awdl` shares the main CLI's Tokio runtime and logging. Choose exactly one input:
 `--read PCAP` for offline radiotap replay, or `--interface IFACE` for an already
 prepared monitor. Diagnostics do not convert managed interfaces or apply profiles;
-managed setup and recovery belong to `send`/`receive`.
+managed setup and recovery belong to the shared session coordinator.
 
 ```sh
 just replay /path/to/full-radiotap.pcap
@@ -82,12 +86,14 @@ executables are not required. NetworkManager ownership and saved-AP restoration
 still use `nmcli`.
 
 `pcap` and `tun-rs` handle capture and TAP I/O; `etherparse` and `hickory-proto`
-handle packets and DNS; `bluer` owns BlueZ advertising. AirDrop uses `hyper`,
+handle packets and DNS; `bluer` owns BlueZ LE scanning and advertising. AirDrop uses `hyper`,
 `tokio-openssl`, `openssl` and `plist`; archives and previews use `cpio-archive`,
-`flate2`, `tempfile` and `image`. The [source map](protocol.md#source-map) links
+`flate2`, `tempfile` and `image`. `cms` and `x509-cert` inspect signed identity
+records and certificate-role markers without unsafe code. The [source map](protocol.md#source-map) links
 each subsystem to its implementation.
 
-Hardware setup checks have covered active-monitor creation and tuning, TAP
+Hardware setup checks have covered active-monitor creation, 80/40/20 MHz tuning
+on channels 149 and 44, return to channel 6 at 20 MHz, and TAP
 MTU/link-local readiness, permanent neighbor add/replace/delete, normal cleanup,
 startup-error rollback, passive observation, SIGKILL recovery and stale-socket
 restart. These checks restored managed Wi-Fi and preserved Ethernet configuration.
@@ -110,3 +116,9 @@ injection backpressure, data-refreshed peer liveness and DAD-free TAP setup, and
 [omdrop-plugin PR #41](https://github.com/brentkearney/omdrop-plugin/pull/41)
 for fully validated archive completion when HTTP termination is missing.
 The Apple public root certificate in `assets/` verifies optional identity records.
+
+Contacts Only reception follows omdrop-plugin's policy at commit
+`b2f9a537b150c26402c5daad8125fb7e61c214ec`, with dedicated certificate-role
+checks from Apple's published Security policies. Public Apple Application
+Integration CA certificates are vendored from that reference; see
+[their provenance and license](../assets/apple-ca/README.md).

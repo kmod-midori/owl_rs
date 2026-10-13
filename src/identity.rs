@@ -3,12 +3,11 @@ use anyhow::{Context, Result, bail};
 use openssl::{
     asn1::{Asn1Integer, Asn1Time},
     bn::BigNum,
-    cms::{CMSOptions, CmsContentInfo},
     hash::MessageDigest,
     pkey::PKey,
     rsa::Rsa,
     ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode, SslVersion},
-    x509::{X509, X509NameBuilder, store::X509StoreBuilder},
+    x509::{X509, X509NameBuilder},
 };
 use std::{
     fs::OpenOptions,
@@ -107,67 +106,16 @@ impl Identity {
         };
         let mut hashes = [0; 8];
         if let Some(data) = &record {
-            if data.len() > 128 * 1024 {
-                bail!("validation record exceeds 128 KiB");
-            }
-            let mut store = X509StoreBuilder::new()?;
-            store.add_cert(X509::from_pem(include_bytes!(
-                "../assets/apple_root_ca.pem"
-            ))?)?;
-            let store = store.build();
-            let mut chain = openssl::stack::Stack::new()?;
-            for cert in certificates.iter().skip(1) {
-                chain.push(cert.clone())?;
-            }
-            let mut verification = openssl::x509::X509StoreContext::new()?;
-            if !verification.init(&store, leaf, &chain, |ctx| ctx.verify_cert())? {
-                bail!("validation records require a certificate chain issued by Apple");
-            }
-            let mut cms = CmsContentInfo::from_der(data)?;
-            let mut decoded = Vec::new();
-            cms.verify(
-                None,
-                Some(&store),
-                None,
-                Some(&mut decoded),
-                CMSOptions::empty(),
-            )
-            .context("verify Apple validation record signature")?;
-            let plist = plist::Value::from_reader(std::io::Cursor::new(decoded))?;
-            let dict = plist
-                .as_dictionary()
-                .context("record must be a plist dictionary")?;
-            let account = dict
-                .get("altDsID")
-                .and_then(plist::Value::as_string)
-                .context("record has no account")?;
-            let cn = leaf
-                .subject_name()
-                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-                .next()
-                .context("certificate has no CN")?
-                .data()
-                .to_string()?;
-            if cn != format!("com.apple.idms.appleid.prd.{account}") {
+            let verifier = crate::contacts::Verifier::apple()?;
+            let verified = verifier
+                .record(data)
+                .context("verify local Apple validation record")?;
+            let account = verifier.certificate_account(leaf, &certificates[1..])?;
+            if account != verified.account {
                 bail!("certificate does not match the validation record account");
             }
-            let mut prefixes = Vec::new();
-            for field in ["ValidatedEmailHashes", "ValidatedPhoneHashes"] {
-                if let Some(values) = dict.get(field).and_then(plist::Value::as_array) {
-                    for value in values {
-                        if let Some(h) = value.as_string()
-                            && h.len() == 64
-                            && h.bytes().all(|b| b.is_ascii_hexdigit())
-                        {
-                            let a = u8::from_str_radix(&h[..2], 16)?;
-                            let b = u8::from_str_radix(&h[2..4], 16)?;
-                            prefixes.push([a, b]);
-                        }
-                    }
-                }
-            }
-            for (slot, prefix) in hashes.chunks_mut(2).zip(prefixes) {
-                slot.copy_from_slice(&prefix);
+            for (slot, digest) in hashes.chunks_mut(2).zip(verified.hashes) {
+                slot.copy_from_slice(&digest[..2]);
             }
         }
         Ok(Self {
