@@ -223,6 +223,11 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
         capabilities: BandCapabilities::default(),
     };
     while !r.rest().is_empty() {
+        // Zero-filled action suffixes can end with an incomplete tag-0 header.
+        // Only allow that at a TLV boundary, never inside a declared value.
+        if r.rest().len() < 3 && r.rest().iter().all(|&b| b == 0) {
+            break;
+        }
         let kind = r.u8()?;
         let len = r.le16()? as usize;
         let value = r.take(len)?;
@@ -244,7 +249,7 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
             }
             7 => {
                 // Reserved prefix, HT flags, A-MPDU parameters, RX MCS mask, reserved suffix.
-                if !(8..=11).contains(&value.len()) {
+                if value.len() < 8 {
                     return Err(Error::Invalid("HT capabilities length"));
                 }
                 v.take(2)?;
@@ -252,7 +257,9 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
                 let ampdu_params = v.u8()?;
                 let mut rx_mask = [0; 4];
                 let mask = v.take(value.len() - 7)?;
-                rx_mask[..mask.len()].copy_from_slice(mask);
+                // Keep MCS 0–31; extended masks must not discard the action.
+                let supported = mask.len().min(rx_mask.len());
+                rx_mask[..supported].copy_from_slice(&mask[..supported]);
                 a.capabilities.ht = Some(HtCapabilities {
                     cap_info,
                     ampdu_params,
@@ -266,10 +273,9 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
                     let id = v.u8()?;
                     let len = v.u8()? as usize;
                     let mut ie = Reader::new(v.take(len)?);
-                    if id == 191 {
-                        if len != 12 {
-                            return Err(Error::Invalid("VHT capabilities length"));
-                        }
+                    // Unsupported optional IE layouts do not invalidate timing.
+                    // v.take(len) above still rejects a truncated container.
+                    if id == 191 && len == 12 {
                         a.capabilities.vht = Some(VhtCapabilities {
                             cap_info: ie.le32()?,
                             rx_mcs_map: ie.le16()?,
@@ -320,11 +326,18 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
             }
             16 => {
                 v.u8()?;
-                let n = v.u8()? as usize;
-                if n > 64 {
-                    return Err(Error::Invalid("ARPA name length"));
+                let n = v.u8()?;
+                match n {
+                    0..=64 => {
+                        a.name = Some(String::from_utf8_lossy(v.take(n as usize)?).into_owned())
+                    }
+                    // AWDL uses two-byte compressed DNS labels too. Without a
+                    // preceding literal label there is no hostname to retain.
+                    0xc0..=0xff => {
+                        v.u8()?;
+                    }
+                    _ => {} // Unsupported label encodings are optional metadata.
                 }
-                a.name = Some(String::from_utf8_lossy(v.take(n)?).into_owned());
             }
             21 => {
                 a.version = Some(v.u8()?);

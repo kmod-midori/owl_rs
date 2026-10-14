@@ -64,6 +64,36 @@ fn malformed_lengths_never_panic_and_cannot_mutate_peers() {
         bad[n] = 255;
         let _ = protocol::parse(&bad);
     }
+    for padding in [1, 2, 3] {
+        let mut padded = frame.clone();
+        padded.extend(vec![0; padding]);
+        assert!(protocol::parse(&padded).unwrap().is_some());
+    }
+    let mut cfg = config(Mac([2, 0, 0, 0, 0, 1]));
+    cfg.channel = 149;
+    cfg.strategy = Strategy::Pin;
+    let mut engine = Engine::new(cfg, 0);
+    engine.receive(&frame, 0).unwrap();
+    assert!(!engine.send_ready(peer, 10_000));
+    let mut updated = mif(peer, 518, 368, &Sequence::fixed(149));
+    updated.extend([0; 8]);
+    engine.receive(&updated, 10_000).unwrap();
+    assert_eq!(engine.peers[&peer].sequence, Some(Sequence::fixed(149)));
+    assert!(engine.send_ready(peer, 10_000));
+    // An incomplete declared value remains invalid even if it ends in zeros.
+    for suffix in [
+        vec![1],
+        vec![0, 1],
+        vec![0, 0, 1],
+        vec![6, 4, 0, 0, 0],
+        vec![21, 2, 0, 0],
+    ] {
+        let mut bad = mif(peer, 518, 369, &Sequence::fixed(6));
+        bad.extend(suffix);
+        assert!(engine.receive(&bad, 20_000).is_err());
+        assert_eq!(engine.peers[&peer].sequence, Some(Sequence::fixed(149)));
+        assert_eq!(engine.peers[&peer].last_seen_us, 10_000);
+    }
 }
 #[test]
 fn rate_parsing_alignment_and_ethernet_roundtrip() {
@@ -732,4 +762,61 @@ fn hardware_capabilities_use_current_band_and_awdl_wire_layout() {
     engine.config.capabilities = RadioCapabilities::default();
     let absent = tags(&engine.action_frame_on_channel(3, 0, 149));
     assert!(!absent.contains_key(&7) && !absent.contains_key(&17));
+
+    let template = engine.action_frame_on_channel(3, 0, 149);
+    let with_tag = |kind: u8, value: &[u8]| {
+        let mut frame = template.clone();
+        frame.push(kind);
+        frame.extend((value.len() as u16).to_le_bytes());
+        frame.extend(value);
+        frame
+    };
+    let mut extended_ht = vec![0, 0, 0xff, 1, 3, 0xff, 0xff, 0xff, 0x7f];
+    extended_ht.extend([0xff; 6]); // Higher MCS bits cannot be represented locally.
+    extended_ht.extend([0, 0]);
+    let Body::Action(action) = protocol::parse(&with_tag(7, &extended_ht))
+        .unwrap()
+        .unwrap()
+        .body
+    else {
+        panic!()
+    };
+    assert_eq!(
+        action.capabilities.ht.unwrap().rx_mask,
+        [255, 255, 255, 0x7f]
+    );
+    assert!(action.sync.is_some() && action.sequence.is_some());
+    // Complete but unsupported optional VHT IE layouts do not discard timing.
+    for len in [0, 11, 13] {
+        let mut value = vec![191, len];
+        value.extend(vec![0; len as usize]);
+        let Body::Action(action) = protocol::parse(&with_tag(17, &value))
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!()
+        };
+        assert!(action.capabilities.vht.is_none() && action.sync.is_some());
+    }
+    for value in [vec![0, 0xc0, 0x0c], vec![0, 0x41]] {
+        let Body::Action(action) = protocol::parse(&with_tag(16, &value))
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!()
+        };
+        assert_eq!(action.name.as_deref(), Some("test"));
+        assert!(action.sequence.is_some());
+    }
+    // Still reject truncated known fields within otherwise complete TLVs.
+    for (kind, value) in [
+        (7, vec![0; 7]),
+        (17, vec![191, 12, 0]),
+        (16, vec![0, 0xc0]),
+        (16, vec![0, 5, b'a']),
+    ] {
+        assert!(protocol::parse(&with_tag(kind, &value)).is_err());
+    }
 }

@@ -207,10 +207,11 @@ omitted rather than replaced with a fixed device profile. Offline replay does
 not query hardware.
 
 HT type 7 contains two reserved bytes, the little-endian HT capability word,
-one A-MPDU parameter byte, a variable RX MCS mask (one to four bytes, MCS 0–31),
-and two reserved trailing bytes. Bits for MCS 32 and above cannot be represented
-in this compact AWDL field. VHT type 17 wraps standard IE 191: length 12,
-little-endian capability word and the eight-byte RX/TX MCS/NSS set. These layouts
+one A-MPDU parameter byte, a variable RX MCS mask, and two reserved trailing
+bytes. The receiver retains the first four mask bytes (MCS 0–31) and ignores
+higher bits in extended masks. Local advertisements emit one to four mask
+bytes. VHT type 17 wraps standard IE 191: length 12, little-endian capability
+word and the eight-byte RX/TX MCS/NSS set. These layouts
 follow the [Wireshark AWDL dissector](https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-awdl.c).
 Capability flags describe hardware support. Active-monitor transfer tuning tries
 80, 40, then 20 MHz on 5 GHz, constrained by the PHY's HT/VHT capabilities and
@@ -231,10 +232,16 @@ on 44/149. Channel 6 uses class 81. Width changes preserve unavailable slots.
 tuning is in flight. These netlink channel definitions follow
 [Linux cfg80211](https://github.com/torvalds/linux/blob/master/net/wireless/chan.c).
 
-Unknown TLVs are skipped using their checked lengths. The whole action frame is
-parsed before peer state changes, so a malformed trailing TLV cannot partially
-update timing or election state. Incoming service-response TLVs are currently
-not used to resolve peers; IP mDNS and scoped HTTPS probing perform resolution.
+Unknown TLVs are skipped using their checked lengths. Zero-filled suffix
+padding is accepted at action TLV boundaries, including one or two bytes left
+after zero-length tag-0 records. A nonzero incomplete header or a truncated
+declared value remains invalid. Unsupported optional VHT IE layouts and ARPA
+label encodings are skipped without discarding timing and availability; a
+compressed ARPA label without a preceding literal does not supply a hostname.
+The whole action frame is parsed before peer state changes, so a malformed
+trailing TLV cannot partially update timing or election state. Incoming
+service-response TLVs are currently not used to resolve peers; IP mDNS and
+scoped HTTPS probing perform resolution.
 
 One time unit (TU) is 1024 microseconds. This backend uses 16-TU availability
 windows, four windows per 64-TU slot, and 16 slots per schedule. Channel 0 means
