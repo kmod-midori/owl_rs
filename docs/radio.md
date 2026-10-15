@@ -25,6 +25,12 @@ Shared mode preserves AP association, stays on the AP's current channel and
 advertises all 16 slots on that channel with the AP's width. It ignores the
 exclusive-mode primary-channel preference and does not retune the radio.
 
+Exclusive mode waits for NetworkManager to release the station and for same-PHY
+P2P devices and active non-monitor interfaces to disappear or go down before
+converting the station. Transient interface/channel `EBUSY` responses are retried
+every 100 ms up to `--netlink-timeout`, retaining ownership throughout the retries.
+Final failure restores the saved state.
+
 Exclusive mode disconnects Wi-Fi and journals NetworkManager ownership, station
 MAC/up state and any connected AP's UUID for restoration. Setup waits for
 NetworkManager to release the station. With no AP, disconnect/reconnect is skipped.

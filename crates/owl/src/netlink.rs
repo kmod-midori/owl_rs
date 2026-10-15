@@ -26,6 +26,40 @@ use wl_nl80211::{
     packet_generic::GenlMessage,
 };
 
+fn is_busy(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<wl_nl80211::Nl80211Error>(),
+        Some(wl_nl80211::Nl80211Error::NetlinkError(message))
+            if message.code.is_some_and(|code| code.get() == -nix::libc::EBUSY))
+}
+
+async fn retry_busy<T, F, Fut>(timeout: Duration, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut retries = 0;
+    loop {
+        let result = tokio::time::timeout_at(deadline, operation())
+            .await
+            .context("netlink operation deadline expired")?;
+        match result {
+            Err(error) if is_busy(&error) => {
+                let next = tokio::time::Instant::now() + Duration::from_millis(100);
+                if next >= deadline {
+                    return Err(error).context("adapter remained busy until the retry deadline");
+                }
+                if retries == 0 {
+                    tracing::debug!("adapter busy; retrying without releasing radio ownership");
+                }
+                retries += 1;
+                tokio::time::sleep_until(next).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Netlink(Arc<Connections>);
 struct Connections {
@@ -350,6 +384,16 @@ impl Netlink {
         Ok(self.link(name).await?.header.flags.contains(LinkFlags::Up))
     }
     async fn wifi_request(&self, cmd: Cmd, attributes: Vec<Attr>) -> Result<()> {
+        if matches!(cmd, Cmd::SetInterface | Cmd::NewInterface | Cmd::SetWiphy) {
+            retry_busy(self.0.timeout, || {
+                self.wifi_request_once(cmd, attributes.clone())
+            })
+            .await
+        } else {
+            self.wifi_request_once(cmd, attributes).await
+        }
+    }
+    async fn wifi_request_once(&self, cmd: Cmd, attributes: Vec<Attr>) -> Result<()> {
         let mut handle = self.0.wifi.clone();
         let mut msg = NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
             cmd,
@@ -413,21 +457,53 @@ impl Netlink {
         .await
         .with_context(|| format!("wait for regulatory region {region}"))
     }
+    async fn interface_messages(&self) -> Result<Vec<GenlMessage<Nl80211Message>>> {
+        self.bounded(async {
+            self.0
+                .wifi
+                .interface()
+                .get(vec![])
+                .execute()
+                .await
+                .try_collect()
+                .await
+        })
+        .await
+    }
+    /// P2P devices have no ifindex, so the ordinary netdev list omits them.
+    pub async fn handoff_blockers(&self, station: &str, phy: u32) -> Result<Vec<String>> {
+        let mut blockers = Vec::new();
+        for msg in self.interface_messages().await? {
+            let attrs = &msg.payload.attributes;
+            if !attrs
+                .iter()
+                .any(|a| matches!(a, Attr::Wiphy(p) if *p == phy))
+            {
+                continue;
+            }
+            let kind = attrs.iter().find_map(|a| match a {
+                Attr::IfType(k) => Some(*k),
+                _ => None,
+            });
+            let name = attrs.iter().find_map(|a| match a {
+                Attr::IfName(n) => Some(n.as_str()),
+                _ => None,
+            });
+            if kind == Some(IfType::P2pDevice) {
+                blockers.push(format!("P2P device {}", name.unwrap_or("without netdev")));
+            } else if let Some(name) = name
+                && name != station
+                && kind != Some(IfType::Monitor)
+                && self.is_up(name).await?
+            {
+                blockers.push(format!("{name} ({kind:?}) is up"));
+            }
+        }
+        Ok(blockers)
+    }
     pub async fn interfaces(&self) -> Result<Vec<Interface>> {
-        let msgs: Vec<_> = self
-            .bounded(async {
-                self.0
-                    .wifi
-                    .interface()
-                    .get(vec![])
-                    .execute()
-                    .await
-                    .try_collect()
-                    .await
-            })
-            .await?;
         let mut interfaces = Vec::new();
-        for msg in msgs {
+        for msg in self.interface_messages().await? {
             let (mut index, mut name, mut phy, mut kind, mut frequency) =
                 (None, None, None, None, None);
             let (mut width_mhz, mut center_frequency_mhz) = (None, None);
@@ -565,6 +641,7 @@ impl Netlink {
         {
             match self.set_channel(name, iface.index, definition).await {
                 Ok(actual) => return Ok(actual),
+                Err(e) if is_busy(&e) => return Err(e).context("channel tuning remained busy"),
                 Err(e) => {
                     tracing::warn!(
                         channel,
@@ -705,6 +782,44 @@ impl Netlink {
 mod tests {
     use super::*;
     use wl_nl80211::packet_core::{Nla, NlaBuffer, NlasIterator};
+    #[tokio::test(start_paused = true)]
+    async fn busy_retries_are_bounded_and_do_not_retry_other_errors() {
+        fn error(errno: i32) -> anyhow::Error {
+            let mut message = wl_nl80211::packet_core::ErrorMessage::default();
+            message.code = std::num::NonZeroI32::new(-errno);
+            anyhow::Error::new(wl_nl80211::Nl80211Error::NetlinkError(message))
+                .context("nl80211 SetWiphy")
+        }
+        let mut attempts = 0;
+        retry_busy(Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(error(nix::libc::EBUSY))
+            } else {
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        attempts = 0;
+        let failure = retry_busy(Duration::from_millis(250), || {
+            attempts += 1;
+            std::future::ready::<Result<()>>(Err(error(nix::libc::EBUSY)))
+        })
+        .await
+        .unwrap_err();
+        assert!(is_busy(&failure));
+        assert_eq!(attempts, 3);
+        attempts = 0;
+        retry_busy(Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready::<Result<()>>(Err(error(nix::libc::EINVAL)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+    }
     #[test]
     fn split_phy_replies_merge_by_band_without_guessing_missing_fields() {
         use wl_nl80211::{

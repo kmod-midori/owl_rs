@@ -584,13 +584,14 @@ impl Radio {
             self.state.touched = true;
             self.persist()?;
             if self.state.managed == Some(true) {
+                let phy = self.net.interface(&station).await?.phy;
                 nmcli(
                     self.state.timeouts.network_manager,
                     &["device", "set", &station, "managed", "no"],
                 )
                 .await?;
-                // The property update can precede NetworkManager's device
-                // transition, which may still bring the station down.
+                // Wait for both the NM transition and release of same-PHY
+                // supplicant/P2P interfaces before changing the station.
                 tokio::time::timeout(self.state.timeouts.network_manager, async {
                     loop {
                         let state = nmcli(
@@ -599,7 +600,11 @@ impl Radio {
                         )
                         .await?;
                         if state.split_whitespace().next() == Some("10") {
-                            return Ok::<_, anyhow::Error>(());
+                            let blockers = self.net.handoff_blockers(&station, phy).await?;
+                            if blockers.is_empty() {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            tracing::debug!(?blockers, "waiting for PHY ownership handoff");
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
@@ -613,7 +618,7 @@ impl Radio {
                 self.net.set_type(&station, IfType::Monitor).await?;
                 self.net.set_mac(&station, self.mac).await?;
                 self.net.set_up(&station, true).await?;
-                // Establish the discovery context before the active monitor
+                // Establish the primary context before the active monitor
                 // joins it; its initial context must not conflict with tuning.
                 let mut tuned = Err(anyhow::anyhow!("no allowed AWDL channel"));
                 for &c in channels {
