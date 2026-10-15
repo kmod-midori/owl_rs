@@ -53,8 +53,9 @@ policy passes. There is no separate `receive` command or receive visibility flag
 With the default `tray` Cargo feature, desktop notifications offer **Accept** and
 **Decline**, then show transfer progress and **Cancel**. These use the same
 approval state as the CLI: acting in either place resolves the offer once.
-Dismissing a notification leaves the transfer unchanged. `--auto-accept` still
-skips approval, and CLI commands work when desktop notifications are unavailable.
+Dismissing a notification does not accept, decline or cancel a transfer.
+`--auto-accept` skips approval, and CLI commands work when desktop notifications
+are unavailable.
 
 Progress notifications update in place. Sending counts compressed archive bytes
 passed to HTTP and waits for the receiver's response before reporting completion.
@@ -137,7 +138,7 @@ connection-bound authorization.
 
 `airdropd --auto-accept` skips manual approval only after these checks pass.
 Discovery hiding is best-effort: a verifiable non-contact is not given receiver
-metadata, but a device without a verifiable record can still see the receiver.
+metadata, but a device without a verifiable record can see the receiver.
 It cannot transfer without passing the separate certificate-bound offer check.
 See [the protocol policy](protocol.md#contacts-only-receiving) for details.
 
@@ -147,39 +148,23 @@ enabling contact authentication by the sender.
 
 ## Sessions and the daemon
 
-`send` uses a running daemon or starts a temporary control service. The idle
-daemon exposes its control socket and scans BLE when receiving is enabled;
-Wi-Fi and HTTPS remain inactive. BLE wake-up and CLI sends activate or reuse
-one bidirectional session.
+BLE wakes and CLI sends activate or reuse one bidirectional session. When idle,
+the user daemon serves control commands and scans BLE if receiving is enabled;
+Wi-Fi and HTTPS are inactive. Active sends, browsing and incoming requests hold
+the session alive; idle discovery connections do not.
 
-`owld` owns capture, scheduling, TAP addressing and WLAN restoration. The
-user-owned `airdropd` owns HTTPS, UDP mDNS, identities, contact policy and BLE.
-It acquires a connection-owned link lease through authenticated Unix IPC.
-Sending and receiving share these resources.
-Each send, peer browse and active incoming request holds the session alive.
-Idle discovery connections do not delay cleanup.
-Canceling a CLI send releases only that operation; `cancel SESSION_ID` stops
-all work in the session. Visibility controls incoming offers, independently of
-outgoing sends.
+Eligible BLE wakes reset `--ble-idle-timeout` (default 120 seconds), including
+during completion grace. Everyone accepts valid AirDrop wakes; Contacts requires
+a current known-sender hash-prefix match. Unmatched and Off-mode wakes do not
+activate or extend a session. After successful work and all reply/TCP drains,
+`--completion-grace` holds the link for five seconds by default so new work can
+join. Teardown sends discovery goodbyes, drains the radio, restores WLAN and
+returns the daemon to idle; see [Architecture](architecture.md#networking-and-cleanup).
 
-A BLE-activated session waits up to `--ble-idle-timeout` idle seconds (120 by
-default) for a transfer. Every eligible live AirDrop BLE wake resets this deadline.
-In `everyone`, any valid AirDrop wake qualifies; in `contacts`, only a current
-known-sender hash-prefix match qualifies. Unmatched and Off-mode wakes neither
-activate Wi-Fi nor extend an existing session. Once work
-completes successfully, the session waits until every user has finished its
-reply/TCP drain, then retains the radio for `--completion-grace` seconds (5 by
-default). New transfers can join during that grace period; an eligible BLE wake
-starts a fresh idle wait, including during completion grace.
-The transport stops and sends discovery goodbyes before the link drains queued
-frames, removes its interfaces and restores WLAN settings. A temporary control
-service waits for cleanup and exits; an independent daemon returns to idle.
-
-Omitted send flags inherit the active session's settings, or daemon defaults
-when idle. Explicit settings must match an existing session; cancel that session
-before changing its identity or transport configuration. Radio settings are
-configured separately when starting `owld`. `send --duration SECONDS` limits that operation, while `airdropd --duration SECONDS` limits the
-control service's lifetime.
+Send settings inherit the active session or daemon defaults. Conflicting overrides
+require ending the active session first; radio settings belong to `owld`.
+`send --duration SECONDS` limits that operation; `airdropd --duration SECONDS`
+limits the daemon's lifetime.
 
 ```sh
 just status
@@ -189,38 +174,33 @@ target/release/catdrop cancel TRANSFER_ID
 just stop
 ```
 
-`status` reports the session ID, radio state and transfer progress. `peers`
-browses AirDrop services and resolves names over HTTPS during any active session. It does not activate an idle radio. `cancel` ends the
-specified session or individual transfer; `stop` ends both the session and the daemon. Ctrl+C on a
-CLI send cancels that operation; other transfers can keep the shared session active.
-Incoming IDs are in `transfers[].offer.id`; outgoing IDs, states and byte counts
-are in `status.outgoing`. The existing `status.sending` list still contains active
-outgoing IDs. Cancelling a transfer leaves other sends and receives running.
+| Command | Behavior |
+| --- | --- |
+| `status` | Session ID, radio state and progress; incoming IDs in `transfers[].offer.id`, outgoing details in `status.outgoing`, active outgoing IDs in `status.sending`. |
+| `peers` | Browse and resolve AirDrop services during an active session; does not wake an idle radio. |
+| `cancel SESSION_ID` | Stop all session work. |
+| `cancel TRANSFER_ID` | Cancel one transfer; other sends/receives continue. Ctrl+C on a CLI send has the same scope. |
+| `stop` | End the session and daemon. |
 
 ## Timeouts
 
-Timeouts are command-line options; no timeout configuration file is used.
-Set daemon defaults at startup, or override them when `send` starts a session.
-Configure radio timeouts on `owld`; they also apply to its `probe`, `recover`
-and `awdl` subcommands. AirDrop and link-client timeouts belong to `airdropd`
-with per-session overrides from `catdrop send`. An existing active
-session retains its settings: explicit conflicting overrides are rejected.
-Control-only commands use the running daemon's settings; they cannot change
-these flags. `status.timeouts` shows effective user-session values in seconds;
-active `status.awdl.timeouts` reports radio service deadlines.
+Configure radio deadlines on `owld` (also used by `probe`, `recover` and `awdl`),
+and user/link-client deadlines on `airdropd`. `catdrop send` can override user
+settings when starting a session; conflicts with an active session are rejected.
+Control commands cannot change deadlines. Effective values, in seconds, appear
+in `status.timeouts` and active `status.awdl.timeouts`. No timeout file is used.
 
 ```sh
 just daemon --ble-idle-timeout 180 --completion-grace 5 \
     --approval-timeout 90 --upload-idle-timeout 30 --upload-timeout 1800
 ```
 
-The new flags accept fractional seconds, such as `--ble-idle-timeout 0.5`.
+The timeout flags below accept fractional seconds, such as `--ble-idle-timeout 0.5`.
 Values must be positive and at most 86400 seconds; `--completion-grace 0` disables
 only that grace period. The radio quiet period must not exceed its drain timeout.
 `--timeout` separately sets send discovery (default 60 s) or `peers` waiting
 (default 10 s); `--duration` bounds a daemon or outgoing operation to
-1–86400 whole seconds. These two
-existing options take integer seconds. AWDL slot timing and advertised DNS TTLs
+1–86400 whole seconds. These two options take integer seconds. AWDL slot timing and advertised DNS TTLs
 are protocol parameters, rather than application timeout options.
 
 | Flag | Default (s) | Applies to |

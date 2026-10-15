@@ -41,18 +41,10 @@ Start the user daemon in another terminal:
 just daemon --name 'Example Computer'
 ```
 
-The user daemon shows a tray icon with receiving-mode controls and a Quit action.
-Changes made with `catdrop discoverable` also appear in the tray. Receiving starts
-off; enabling it in the tray uses the same policy as the CLI. Quitting shuts down
-the user daemon and releases its radio session. Without a graphical display, the
-daemon continues without a tray icon. Your desktop needs AppIndicator support to
-display the icon.
-
-The default `tray` feature also enables desktop notifications: accept or decline
-incoming offers, follow sending/receiving progress, and cancel one transfer.
-The CLI controls remain available alongside notifications. Progress bars depend
-on desktop support; byte counts are shown when the incoming stream has no known
-total. Notifications are optional and do not block transfers if unavailable.
+The default `tray` feature provides receiving-mode controls, Quit, and transfer
+notifications with accept, decline, cancel and progress actions. Receiving starts
+**off**. CLI commands use the same state and work without desktop integration;
+see [Usage](docs/usage.md#transfers). The tray requires AppIndicator support.
 
 Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 **Everyone for 10 Minutes**, then send as your regular user:
@@ -80,14 +72,9 @@ inactivity. `accept TRANSFER_ID` and `reject TRANSFER_ID` select specific offers
 `airdropd --auto-accept` skips manual approval. Received files go to
 `~/Downloads/AirDrop/` by default.
 
-Discoverability starts **off** and applies until the daemon stops. `send` requires
-both `airdropd` and `owld`. Incoming and outgoing
-transfers share one active session. See [Usage](docs/usage.md) for runtime controls
-and Contacts Only receiving.
-
-The development build produces `owld`, `airdropd` and the user-facing `catdrop`
-CLI. `just send`, `just accept` and the other control helpers invoke `catdrop`.
-mDNS uses scoped IPv6 UDP sockets in the user daemon.
+Incoming and outgoing transfers share one session. `just send`, `just accept`
+and other control helpers invoke `catdrop`; both daemons must be running.
+See [Usage](docs/usage.md) for Contacts Only reception and runtime controls.
 
 ## Documentation
 

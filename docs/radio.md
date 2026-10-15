@@ -25,15 +25,11 @@ Shared mode preserves AP association and requires its primary channel to be
 6, 44 or 149. Discovery and transmission stay on that channel, reusing the
 current station address.
 
-Exclusive mode saves NetworkManager ownership, the station's MAC/up state and
-any connected AP's connection UUID. It disconnects Wi-Fi for the session and
-restores saved state afterward. A cryptographically random, locally administered
-unicast MAC is generated at each `owld` start and reused for exclusive sessions
-until `owld` exits. A restart generates a new MAC. The original station MAC
-is retained in the recovery journal and restored during cleanup. With no
-connected AP, disassociation and reassociation are skipped. Setup waits for
-NetworkManager to finish releasing the station before changing it. The backend
-supplies the radio's channel context:
+Exclusive mode disconnects Wi-Fi and journals NetworkManager ownership, station
+MAC/up state and any connected AP's UUID for restoration. Setup waits for
+NetworkManager to release the station. With no AP, disconnect/reconnect is skipped.
+Each `owld` start generates a random locally administered unicast MAC reused by
+its exclusive sessions. The backend supplies channel context:
 
 - **IBSS:** `owlibss0` joins AWDL BSSID `00:25:00:ff:94:73` on the selected
   channel, supplying context and hardware ACKs. Passive `owlmon0` captures and
@@ -64,36 +60,28 @@ Radio flags configure `owld`; `catdrop send` and `airdropd` do not change them.
 preference defaults to 6 for active monitor and 44 for IBSS, subject to regulatory
 availability. Disabled, radar and no-IR channels are excluded.
 
-The local master uses its transmit preference. A follower chooses the usable
-channel with the greatest overlap with the elected parent's schedule; failed
-tunes fall back to other candidates. Idle sessions stay on the discovery
-channel. TLS, `/Discover` and `/Ask` approval stay on discovery while no transfer
-is active. Approved file transfers select and hold a transfer channel through
-upload and TCP shutdown, then return to discovery after queued/recent TCP
-traffic clears. There are no discovery detours during a transfer.
-Advertised slots follow the successfully tuned channel. `status` exposes `channel_plan` and
-`physical_channel` and `physical_channel_definition` (primary, width and center
-frequency). Active-monitor transfers use the widest permitted 5 GHz context,
-trying 80, 40 and 20 MHz in order; channel 6 and idle discovery use 20 MHz.
-Rejected widths fall back on the same primary before trying another channel.
-Every width change waits for kernel ACK before advertising it, and checks
-readback when the kernel exposes it. Active/passive monitor setups may omit
-readback; see the protocol notes.
-Shared mode preserves the AP's width. `probe` lists permitted tuning candidates.
-Timing, overlap ranking and tuning acknowledgments are
-described in [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
+A local master uses its transmit preference; a follower favors overlap with the
+elected parent's schedule. Failed tunes try other candidates. Idle discovery,
+TLS and offer approval use the discovery channel. Approved file transfers hold
+their selected channel through upload and TCP shutdown, then return to discovery
+after queued/recent TCP traffic clears, without discovery detours.
+
+Active-monitor transfers try permitted 80, 40, then 20 MHz widths on each 5 GHz
+primary before trying another channel. Channel 6 and idle discovery use 20 MHz;
+shared mode uses the AP's width. `probe` lists candidates. Advertisements follow
+kernel-acknowledged tuning, with readback checks when available.
+`status` exposes `channel_plan`, `physical_channel` and
+`physical_channel_definition` (primary, width, center frequency).
+See [Radio context and IPv6](protocol.md#radio-context-and-ipv6) for overlap,
+slot gating and tuning details.
 
 ## Transmit rates
 
-`owld` and `owld awdl` default to `--rate auto`, selecting the fastest
-mutually supported VHT or HT20 rate for each peer and the current channel.
-Automatic selection starts at the capability ceiling and adapts per peer using
-correlated hardware TX-completion failures and retry counts. Explicit rates
-remain fixed within capability and channel limits. Drivers without completion
-reports retain capability-based selection.
-VHT transmission is capped at **MCS8**, including explicit MCS9 requests,
-because MCS9 caused stalled uploads in radio tests. Hardware capability
-advertisements and reception retain full MCS9 support.
+`--rate auto` starts at the fastest mutually supported VHT or HT20 rate and
+adapts using correlated hardware TX failures/retries. Without completion reports
+it uses capability-based selection. Explicit rates do not adapt.
+VHT TX is capped at **MCS8** after MCS9 stalled test uploads; hardware-supported
+MCS9 reception and advertisements are allowed.
 
 | Override | Selection |
 | --- | --- |
@@ -102,23 +90,23 @@ advertisements and reception retain full MCS9 support.
 | `--rate mcs15-40-sgi` | HT MCS 0–31, optional `-20`/`-40` and `-lgi`/`-sgi`; defaults to HT20 long GI |
 | `--rate vht4-nss2-bw40-sgi` | VHT MCS 0–9 request, capped at 8; NSS 1–8, width 20/40/80 MHz, optional `-sgi` |
 
-Explicit HT40 requests are constrained by local TX and peer RX masks, SMPS, guard interval, and channel width; unknown capabilities fall back to 12 Mbps. Existing HT20 syntax and automatic selection are unchanged.
+HT40 and VHT requests are upper limits constrained by local TX, peer RX, SMPS,
+guard interval and channel width. Invalid PHY combinations are rejected; VHT
+requires 5 GHz. These rates fall back to 12 Mbps for missing capabilities or
+multicast destinations.
+`status` and selection logs report effective peer parameters; see
+[Transmit rates](protocol.md#transmit-rates) for encoding details.
 
-VHT requests are upper limits, constrained by both peers and the tuned channel.
-Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
-and unavailable capabilities use 12 Mbps. Effective peer transmission parameters
-appear in `status` and selection logs. See [Transmit rates](protocol.md#transmit-rates)
-for capability and encoding details. HT/VHT unicast packets already in the
-link queue are aggregated into A-MSDUs within peer, interface and slot limits;
-`status` exposes the aggregation counters. See
-[Transmit aggregation](protocol.md#transmit-aggregation) for retry and fallback behavior.
+Queued HT/VHT unicast packets can form A-MSDUs within peer, interface and slot
+limits. See [Transmit aggregation](protocol.md#transmit-aggregation) for counters,
+retries and fallback behavior.
 
 ## Unicast acknowledgments
 
 Channel pinning and hardware ACK policy are independent. `--tx-ack auto`
 (default) follows `tx_noack` in the driver profile, which defaults to false.
 The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
-channel changes. The Intel profile retains its original NOACK firmware workaround.
+channel changes. The Intel profile uses NOACK as a firmware workaround.
 `--tx-ack normal` or `--tx-ack noack` overrides it.
 NOACK suppresses hardware acknowledgment waiting and may suppress delivery
 reports; it also disables feedback-based rate adaptation.
@@ -126,14 +114,13 @@ reports; it also disables feedback-based rate adaptation.
 `status` exposes `tx_status_acked`, `tx_status_failed`, `tx_status_retries` and
 `tx_status_ignored`. Debug logs record requested/reported rates and completion
 latency. These are driver reports, distinct from successful libpcap submission.
-Hardware retry limits remain driver-owned; radiotap DATA_RETRIES does not bound
-per-packet retries on mt76x02. Queue airtime remains an estimate, so slot-edge
+The driver controls hardware retry limits; radiotap DATA_RETRIES does not bound
+per-packet retries on mt76x02. Queue airtime is an estimate, so slot-edge
 behavior needs on-air verification with ACK waiting enabled.
 
 ## Transmit coding
 
-`owld` and `owld awdl` default to `--fec bcc`; LDPC is implemented but disabled
-by default. Coding is separate from `--rate` and belongs to the radio service.
+`--fec` controls adapter coding independently of `--rate`:
 
 | Override | Selection |
 | --- | --- |
@@ -141,21 +128,25 @@ by default. Coding is separate from `--rate` and belongs to the radio service.
 | `--fec auto` | LDPC for HT/VHT unicast when the driver and the peer's corresponding RX capability support it; otherwise BCC. |
 | `--fec ldpc` | Request LDPC for HT/VHT unicast; require driver TX support and the peer's corresponding RX capability. |
 
-The selected driver profile declares TX support with `supports_tx_ldpc`, which
-defaults to false when omitted. The bundled `mt76x2u` profile sets it to true
-based on the upstream MT76x2 transmit descriptor implementation.
-Custom `--profiles PATH` files control the capability for both `owld` and
-`owld awdl` live diagnostics.
-Local RX capability bits do not establish TX support. Explicit LDPC with a legacy `--rate` is
-rejected. Discovery/multicast and legacy capability fallbacks retain BCC.
-Peer `tx_parameters` and selection logs report the requested injection rate and
-coding; they do not prove the hardware transmitted those parameters.
-
-LDPC encoding is performed by the adapter. It affects our data frames,
-including TCP ACKs during incoming transfers, and does not change the phone's
-coding or the card's automatic Wi-Fi ACK responses. The VHT injection workaround
-is source-derived and still needs on-air validation; see
+The profile's `supports_tx_ldpc` defaults to false; bundled `mt76x2u` enables it
+based on the driver TX descriptor. Local RX bits do not establish TX support.
+Explicit LDPC with a legacy rate is rejected; discovery/multicast and legacy
+fallbacks use BCC. `tx_parameters` and logs report requested coding, not proof of
+on-air encoding. The VHT injection workaround needs hardware validation; see
 [Transmit coding](protocol.md#transmit-coding).
+
+## Receive Block Ack
+
+Copy `profiles.toml`, set `rx_ampdu = true` for an exclusive active-monitor
+profile, and pass `--profiles PATH`. Built-in profiles disable it. Hardware must
+generate Block Ack replies; the option installs no driver patches. See
+[Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.
+
+Upstream PRs [#58](https://github.com/t4t5/omdrop-owl/pull/58) and
+[#59](https://github.com/t4t5/omdrop-owl/pull/59) report MT7612U support;
+[#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster patched-MT7921
+transfers with Block Ack and wide channels combined. Local tests validate
+synthetic negotiation/reordering, not those hardware or throughput claims.
 
 ## Election experiments
 
@@ -184,18 +175,6 @@ netlink error is reported and saved WLAN state is restored.
 
 The application does not configure firewall or VPN routing. The user daemon
 uses interface-scoped UDP for mDNS and TCP for HTTPS; host routing and filtering
-still apply. `owld` generates Ethernet neighbor-learning probes on its owned
+apply. `owld` generates Ethernet neighbor-learning probes on its owned
 link. See [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
 for tested hardware and remaining limits.
-
-PR [#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster MT7921 transfers with a patched driver, wide advertisements and Block Ack combined. Our advertisements already derive stream counts from hardware, and active-monitor tuning already tries regulatory-permitted 80 MHz channels. The added HT40 syntax does not install those driver patches or establish MT7921 injection support on stock kernels. Its reported throughput has not been reproduced here.
-
-Receive A-MPDU acceptance is opt-in: copy `profiles.toml`, set `rx_ampdu = true`
-for the selected exclusive active-monitor profile, and pass `--profiles PATH`.
-The built-in profiles leave it disabled. This option asserts that the hardware
-can send Block Ack replies in active-monitor mode; it does not patch the driver.
-PRs [#58](https://github.com/t4t5/omdrop-owl/pull/58) and
-[#59](https://github.com/t4t5/omdrop-owl/pull/59) report MT7612U support; #62
-reports patched MT7921 support. Local validation currently covers synthetic
-negotiation/reordering tests, not those hardware claims. See
-[Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.

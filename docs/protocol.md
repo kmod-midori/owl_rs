@@ -40,52 +40,30 @@ enabled, an LE advertisement listener. Runtime
 authorization; it starts
 as `off` and is not persisted across daemon restarts.
 
-The Cargo workspace runs two distinct layers in separate processes:
+`owld` owns the radio and TAP; `airdropd` owns transport, discovery and identity.
+Authenticated Unix IPC leases the link and acknowledges transfer-channel readiness
+before `/Upload`. See [Architecture](architecture.md) for IPC, privilege separation
+and restoration, and [Usage](usage.md#sessions-and-the-daemon) for controls.
 
-- **`owld` (root):** transactional Wi-Fi setup, radiotap capture/injection,
-  scheduling, TAP addressing, queue drain and WLAN restoration.
-- **`airdropd` (user):** HTTPS, mDNS service discovery and receiver BLE advertising,
-  using the leased link's address and interface without owning radio configuration.
+Outgoing operations, peer browsing and active incoming HTTPS requests hold
+session leases through reply and TCP drain. Idle discovery sockets release their
+leases after answering. CLI disconnect cancels only its send; session cancellation,
+stop and signals interrupt all work.
 
-`catdrop` controls the user daemon. Authenticated Unix IPC acquires the radio,
-reports service visibility and revisioned transfer activity, acknowledges the
-committed transfer channel, streams link snapshots,
-and releases the lease. TCP file data travels through the kernel TAP/IPv6 stack.
-The outgoing sender waits for its activity revision's channel-ready acknowledgment
-before starting `/Upload`, bounded by `--channel-ready-timeout` (15 seconds).
-`owld` chooses the channel; the acknowledgment confirms local tuning, not peer
-availability in the current slot. Disconnect or heartbeat expiry makes `owld`
-drain and restore the link. See
-[Architecture](architecture.md) for the process boundary.
+Eligible BLE wakes reset the idle deadline (default 120 seconds), including during
+completion grace. After successful work and the last lease release, the session
+holds the link and advertisements for `--completion-grace` (default five seconds).
+New work can join then; acquisition during shutdown waits for restoration.
+See [Bluetooth wake-up](#bluetooth-wake-up) for wake admission.
 
-An outgoing operation, peer browse or active incoming HTTPS request holds a
-shared lifetime lease. A CLI disconnect cancels only its outgoing operation. Incoming
-transfer connections hold their leases through approval, upload, the final reply and
-bounded TCP linger. Idle discovery keep-alive sockets release their leases after answering and do
-not delay cleanup. The session cannot normally tear down while any user remains;
-`cancel`, `stop` and signals explicitly interrupt all work.
+Successful file/link connections flush their reply and close a final TCP descriptor
+in a blocking worker with a ten-second linger bound. Refusals and failures skip
+this success-only linger. Completion grace starts after TCP drain, not a TAP write.
 
-An eligible live BLE wake starts or resets the configured idle wait (default
-120 seconds). Everyone accepts any structurally valid AirDrop wake; Contacts
-requires a current known-sender hash-prefix match. Repeated eligible advertisements
-also reset the timer. Fresh wakes during completion grace start a new idle wait.
-After successful work, all users finish, then the shared session retains the link
-and advertising for the configured grace period (default five seconds). A new
-operation can join during that grace period. Session acquisition waits for an
-already-closing session to finish restoration before creating another link.
-
-Successful file and link connections flush their HTTP/TLS reply and retain a
-final TCP descriptor in a blocking worker with a ten-second linger bound, allowing
-data/FIN acknowledgments while AWDL remains active. Failures and refusals do not
-use that success-only linger. Session leases are released after this drain, so
-the five-second grace follows TCP completion rather than a local TAP write.
-
-At teardown the coordinator stops the transport first, sending mDNS goodbyes and
-unregistering BLE advertising. It then stops the AWDL link. Link shutdown drains
-queued replies, FINs and goodbyes until injection/TAP traffic has been quiet for
-100 ms, bounded to two seconds if a peer becomes unavailable, then removes owned
-interfaces and restores WLAN settings. An independent daemon returns to idle;
-a temporary send service waits for cleanup before exiting.
+Teardown stops transport, sends mDNS goodbyes and unregisters BLE advertising.
+The radio drains queued replies, FINs and goodbyes until traffic is quiet for
+100 ms, bounded to two seconds, then removes owned interfaces and restores WLAN.
+The user daemon returns to idle.
 
 ## Radio context and IPv6
 
@@ -96,25 +74,22 @@ address derives from the AWDL MAC using modified EUI-64: flip the universal/loca
 bit of the first byte and insert `ff:fe` between the MAC halves. The owned TAP is
 created down, assigned this address with `nodad`, and then brought up. DAD is
 disabled only on this temporary interface; no global setting is changed. Session
-startup still verifies that the expected address is usable before binding HTTPS.
+startup verifies that the expected address is usable before binding HTTPS.
 IBSS readiness and address readiness are polled at 50 ms intervals.
 
-All link-local socket addresses need an interface scope. For example,
-`[fe80::200:ff:fe00:1%3]:8770` uses an example link-local address and
-interface index 3. Indices can change when a TAP is recreated. HTTPS sockets bind to that interface and the local
-link-local address. mDNS uses ordinary IPv6 UDP sockets bound to the TAP,
-with outgoing source/interface selection and received interface/hop-limit
-metadata. The kernel handles Ethernet encapsulation. Neighbor-learning ICMP
-probes are generated by the radio layer. Host IP routing and filtering apply
-to UDP and TCP; the application does not add firewall or VPN exceptions.
+IPv6 sockets bind to the leased interface and link-local address. Addresses need
+an interface scope, such as `%3` in `[fe80::200:ff:fe00:1%3]:8770`; indices can
+change when the TAP is recreated. The kernel encapsulates TCP and UDP, while the
+radio layer generates neighbor-learning ICMP probes. Host routing and filtering
+apply; the application adds no firewall or VPN exceptions.
 
-The TAP MTU remains **1450** with packet offloads disabled. Session-owned
+The TAP MTU is **1450** with packet offloads disabled. Session-owned
 monitors request MTU 8192 through rtnetlink so packet sockets can accept larger
 A-MSDUs. If that request is rejected, batching respects the reported monitor
 MTU; raw diagnostics use the prepared interface's current MTU. The owned
 monitor is deleted during teardown, so no persistent interface MTU changes.
-The previous TAP limit is retained; the monitor MTU bounds the full injected
-frame, including radiotap and 802.11 headers.
+The monitor MTU bounds the full injected frame, including radiotap and 802.11
+headers.
 
 Radio operations use `wl-nl80211` and `rtnetlink` directly, with bounded
 requests and kernel acknowledgments. Capability and regulatory checks decode
@@ -123,22 +98,15 @@ triggering a scan. Monitor flags use the kernel's nested nl80211 attribute,
 including the active-monitor flag for hardware ACKs. Interface state/MAC,
 link-local IPv6 address scope and `NODAD`, address readiness, and permanent
 neighbors use routing netlink. Operation-scoped connection tasks close during
-cleanup. NetworkManager ownership and saved connection restoration still use
+cleanup. NetworkManager ownership and saved connection restoration use
 `nmcli`; `ip` and `iw` executables are not required.
 
-The physical radio context is selected by the TOML profile:
+[Radio profiles](radio.md#modes-and-backends) select IBSS or active-monitor
+context in exclusive mode, which works without an AP. Active-monitor setup
+converts the station to a passive monitor with the same MAC, setting type and
+flags in one netlink request because drivers may reject a separate flags update.
+Discovery defaults to channel 6.
 
-| Backend | Channel context and ACKs | Capture/injection |
-| --- | --- | --- |
-| IBSS | `owlibss0`, fixed AWDL BSSID | Passive `owlmon0` |
-| Active monitor | Active `owlmon0`; existing station supplies tuning context | Active `owlmon0` |
-
-In active-monitor mode the existing station becomes a passive monitor with the
-same MAC. Type and passive flags are set in one netlink request; a separate
-flags update can be rejected by the driver. This is adapter setup, not an
-additional AirDrop wire protocol.
-Exclusive mode works without a connected AP. Discovery/negotiation and
-transmission use separate channel settings; discovery defaults to 6.
 An idle session stays on its discovery channel and advertises all 16 slots
 there, so mDNS and HTTPS discovery can reach the receiver. TLS handshakes,
 `/Discover`, and `/Ask` approval waits keep the discovery channel when no file
@@ -169,7 +137,7 @@ leaving/rejoining the fixed-BSSID network and polling readiness. Active monitor
 uses an acknowledged kernel channel-setting operation. Shared mode requires a
 connected AP on channel 6, 44 or 149 and advertises the intersection with that
 channel; it does not use separate-channel discovery or adaptive retuning. Driver/regulatory limits
-still apply. See [radio profiles](../profiles.toml) and [usage](../README.md).
+apply. See [radio profiles](../profiles.toml) and [usage](../README.md).
 
 ## AWDL action frames
 
@@ -222,8 +190,8 @@ Capability flags describe hardware support. Active-monitor transfer tuning tries
 80, 40, then 20 MHz on 5 GHz, constrained by the PHY's HT/VHT capabilities and
 regulatory flags on every constituent 20 MHz channel. Kernel rejection falls
 back to narrower definitions on the same primary before the channel plan tries
-another primary. Channel 6 and idle discovery remain at 20 MHz; shared mode
-preserves the AP's width and center frequency, and IBSS retains HT20.
+another primary. Channel 6 and idle discovery use 20 MHz; shared mode
+preserves the AP's width and center frequency, and IBSS uses HT20.
 
 SetWiphy supplies primary frequency, width and center frequency together. After
 its ACK, GetInterface checks the requested definition when the kernel reports
@@ -240,7 +208,7 @@ tuning is in flight. These netlink channel definitions follow
 Unknown TLVs are skipped using their checked lengths. Zero-filled suffix
 padding is accepted at action TLV boundaries, including one or two bytes left
 after zero-length tag-0 records. A nonzero incomplete header or a truncated
-declared value remains invalid. Unsupported optional VHT IE layouts and ARPA
+declared value is invalid. Unsupported optional VHT IE layouts and ARPA
 label encodings are skipped without discarding timing and availability; a
 compressed ARPA label without a preceding literal does not supply a hostname.
 The whole action frame is parsed before peer state changes, so a malformed
@@ -262,7 +230,7 @@ userspace queueing does not shift the AWDL clock. Invalid capture timestamps
 fall back to processing time; a detected wall-clock offset change over 10 ms
 disables capture-time mapping for the session. Outgoing action frames retain
 the construction timestamp and update the PHY timestamp immediately before
-injection. USB/driver receive latency and post-injection transmit delays remain
+injection. USB/driver receive latency and post-injection transmit delays are
 unmeasured; these are not hardware on-air timestamps.
 
 Counters wrap at 16 bits. Clock calculations use signed phase and wrapping
@@ -273,8 +241,8 @@ height below 10 and must not point back to this device as their sync parent.
 
 Local election metric and counter default to 60 and 0. Experimental
 `--election-metric` and `--election-counter` overrides set both the candidate's
-self fields and its initial advertised master fields. They remain available
-when a peer expires or the node returns to being its own master. The configured
+self fields and its initial advertised master fields. These values persist
+across peer expiry and transitions to self-master. The configured
 election counter is fixed and separate from the wrapping availability-window
 counter; Apple-style election-counter aging is not implemented. A larger local
 rank does not prove that a peer has adopted this master or expanded its channel
@@ -283,7 +251,7 @@ availability. Check the peer's incoming election and channel-sequence TLVs.
 The service uses `pin` plus an adaptive fixed transmit channel in exclusive mode, and
 `intersect` in shared mode. Raw mode also exposes `verbatim`, `rotate` and
 `widen`. A fixed physical channel does not remove unicast scheduling: unicast
-still waits for a valid peer's matching channel slot, with boundary guards.
+waits for a valid peer's matching channel slot, with boundary guards.
 Fixed mode relaxes multicast scheduling. Runtime scheduling requests ticks every
 500 microseconds (Tokio/OS timer resolution applies);
 periodic synchronization frames are spaced 110 TU apart and MIFs are scheduled
@@ -296,8 +264,8 @@ SYN/SYN-ACK packets addressed to the local AWDL MAC and IPv6 address are staged,
 without creating or validating a peer. Retransmissions with the same peer,
 ports and TCP sequence share one entry. Staged packets expire after
 `--queued-packet-timeout` (default two seconds) and are released only when that
-peer passes normal AWDL validation. Other early data remains ignored; Contacts
-Only authorization still occurs independently at HTTPS. The `rx_syn_buffered`,
+peer passes normal AWDL validation. Other early data is ignored; Contacts
+Only authorization occurs independently at HTTPS. The `rx_syn_buffered`,
 `rx_syn_released` and `rx_syn_expired` statistics expose these transitions.
 
 After the 802.11 header, a single data payload is:
@@ -331,10 +299,10 @@ backpressure. The runtime preserves the queued Ethernet frame, encoded AWDL
 bytes and sequence numbers, yields to its event loop, and retries on a later
 scheduler tick after rechecking the peer's channel slot. It does not block or
 place frames in a separate driver queue that could transmit off-channel. The
-original two-second packet expiry and 128-packet queue bound still apply.
+queue holds at most 128 packets, with a default two-second expiry.
 Transmit counters increase only on success; `tx_backpressure` counts deferred
-data injection attempts. Other injection errors remain failures with normal
-session cleanup. These changes adapt
+data injection attempts. Other injection errors fail the session and trigger
+cleanup. This behavior adapts
 [omdrop-owl PR #11](https://github.com/t4t5/omdrop-owl/pull/11).
 
 ### Transmit rates
@@ -347,8 +315,9 @@ width. Static/dynamic SMPS peers are limited to one stream because injection
 does not arrange RTS/CTS wake-up. Unsupported short GI becomes long GI.
 VHT requests bound MCS, streams and width. A transmit-policy ceiling of MCS8
 applies to automatic and explicit requests after MCS9 stalled injected
-uploads. Hardware capability maps remain unchanged for advertisement and
-reception. Missing capabilities fall back to 12 Mbps. Actions and automatic/VHT multicast discovery also use 12 Mbps.
+uploads. Advertisement and reception use the hardware capability maps. Missing
+capabilities fall back to 12 Mbps. Actions and automatic/VHT multicast discovery
+also use 12 Mbps.
 CLI syntax and overrides are documented in [Radio configuration](radio.md#transmit-rates).
 
 The codec rejects unresolved `auto` and invalid PHY rates. VHT radiotap field
@@ -365,7 +334,7 @@ The driver profile's `tx_noack` workaround defaults to false and is overridden
 with `--tx-ack normal|noack`. Injection also requests NOSEQNO so a matching
 shared station cannot rewrite sequence numbers used for completion correlation.
 The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
-channel changes; the Intel profile retains the original NOACK workaround.
+channel changes; the Intel profile uses NOACK as a firmware workaround.
 Incoming hardware reception ACKs are configured by the radio backend separately.
 
 Radiotap TX_FLAGS plus DATA_RETRIES identify local driver completion reports.
@@ -373,18 +342,18 @@ They never enter TAP or refresh incoming peers. A bounded ledger correlates
 successful unicast submissions using destination, 802.11 sequence and body
 fingerprint; reports without a known PHY rate (including mt76 synthetic ACKs
 after lost status), stale, duplicate, foreign and uncorrelated reports do not affect
-rate selection. The existing queued-packet timeout bounds ledger age. Debug
+rate selection. The queued-packet timeout bounds ledger age. Debug
 logs include hardware outcome, retry count, requested/reported rate and latency.
 USB completion padding is excluded using checked IPv6/A-MSDU lengths, preserving
 zeros within application data. Radio cleanup also waits for pending completion
-reports, bounded by the existing radio-drain and queued-packet timeouts.
+reports, bounded by the radio-drain and queued-packet timeouts.
 
 `auto` starts at the shared capability ceiling. Four failures within a 32-frame
 window, or at least two retries per frame after 16 reports, lower the target
 PHY rate by at least 15% when a slower candidate exists. After 128 consecutive
 successes without retries, it probes the next faster candidate. Late reports
 from an older rate or channel cannot change the new selection. Explicit rates
-remain fixed. Capability/channel changes reset the candidate ladder. No feedback
+are fixed. Capability/channel changes reset the candidate ladder. No feedback
 is synthesized from capture gaps or successful packet injection. Missing driver
 reports leave capability-based selection in place.
 FCS presence and radiotap padding are handled explicitly.
@@ -403,7 +372,7 @@ most eight peer/TID agreements; a full table declines new agreements without
 evicting existing ones. A response uses the management rate and configured
 unicast ACK policy, shares data airtime/slot gating, and preserves its sequence
 across injection backpressure. The session starts only after successful
-submission. Repeated identical requests do not rewind it. The existing
+submission. Repeated identical requests do not rewind it. The
 queued-packet timeout expires stale responses. Listen-only diagnostics never
 respond or establish agreements.
 
@@ -415,7 +384,7 @@ of channel tuning. Single-TID basic/compressed BARs advance the receive window;
 multi-TID BARs are unsupported. Sender-initiated DELBA flushes and removes the
 receive agreement and cancels queued responses; recipient-initiated DELBA does
 not affect it. Peer expiry drops held data and pending responses. Shutdown waits
-for buffered data within the existing radio drain budget.
+for buffered data within the radio drain budget.
 
 Status includes `rx_reorder` counters for started sessions, buffered, duplicate
 and old MPDUs, skipped sequences, gap timeouts and BARs. Acceptance/rejection
@@ -423,18 +392,13 @@ counts appear in `stats`. These describe local processing, not proof that hardwa
 sent a Block Ack or that the peer received our response. Offline replay does not
 establish agreements because it cannot send acceptance responses.
 
-`rx_addba_requests` and `tx_addba_rejections` report received requests and responses
-successfully submitted to the driver; submission does not prove on-air delivery.
-A-MSDU aggregation remains available. Accepting ADDBA would additionally require
-working RX Block Ack support in the driver/hardware.
-
 ### Transmit coding
 
-BCC remains the default; `--fec auto|ldpc` explicitly opts in. Coding is resolved
+BCC is the default; `--fec auto|ldpc` explicitly opts in. Coding is resolved
 per peer after the concrete rate is selected. HT checks RX LDPC capability bit
 0; VHT checks RX LDPC bit 4. Local TX support is supplied by the selected driver profile
 (`supports_tx_ldpc`, false when omitted), independently of local advertised RX
-capabilities. Declaring support does not enable LDPC; the default remains BCC.
+capabilities.
 
 HT LDPC sets radiotap MCS HAVE_FEC and FEC_LDPC. VHT sets the user-0 coding bit.
 The upstream [Linux 7.2.9 injection parser](https://github.com/gregkh/linux/blob/v7.2.9/net/mac80211/tx.c)
@@ -442,7 +406,7 @@ ignores that VHT coding byte, so VHT LDPC additionally includes a preceding
 MCS field `[0x12, 0x10, 0]`: HAVE_MCS|HAVE_FEC, LDPC, MCS0. HAVE_MCS is required
 for Linux to process FEC. The later VHT field replaces the temporary HT rate
 while retaining `IEEE80211_TX_CTL_LDPC`. This field is injection metadata and
-is removed before transmission; the resulting requested PHY remains VHT.
+is removed before transmission; the requested PHY is VHT.
 The [MT76x2 driver](https://github.com/openwrt/mt76/blob/master/mt76x02_mac.c)
 then sets its hardware LDPC descriptor bit. This path needs on-air validation
 on the installed kernel before enabling it by default.
@@ -456,7 +420,7 @@ including the VHT compatibility field and alignment padding.
 ### Transmit aggregation
 
 [TX batching](../crates/owl/src/tx.rs) belongs to the AWDL link layer, between the Ethernet
-TAP queue and the 802.11 codec. HTTP, TLS and archive code remain unaware of it.
+TAP queue and the 802.11 codec. HTTP, TLS and archive code operate on the individual packets.
 Already queued packets with the same source/destination are combined into one
 QoS TID-0 A-MSDU; sparse traffic is sent immediately without a coalescing timer.
 Only validated HT/VHT unicast peers with known capabilities are eligible.
@@ -464,12 +428,12 @@ Only validated HT/VHT unicast peers with known capabilities are eligible.
 The body is bounded by both peers' HT maximum A-MSDU size (3839/7935), VHT
 maximum MPDU size when applicable, the current monitor MTU, and the remaining
 common-channel window. The local receive-size capability is also used as a
-conservative hardware bound; backend size rejection still triggers fallback.
+conservative hardware bound; backend size rejection triggers fallback.
 The scheduler subtracts its boundary guard and budgets each submitted burst
 using the selected PHY rate and a preamble/ACK allowance. Reservations carry
 across scheduler ticks and keep the radio on its transfer channel while
 submitted frames have estimated airtime remaining. Cleanup waits for that reservation and the configured quiet interval.
-Driver queue latency remains outside this estimate. Each subframe contains
+This estimate excludes driver queue latency. Each subframe contains
 DA/SA, a big-endian length and its own LLC/AWDL payload and sequence number;
 padding aligns subsequent subframes to four bytes. No trailing padding is added.
 
@@ -479,11 +443,11 @@ The encoded frame and sequences are retained until successful submission;
 Rate or coding changes replace its radiotap header. If new capabilities no longer permit
 that aggregate, its unsent members are repacked. An aggregate rejected with
 `EMSGSIZE` disables aggregation for that link session and retries the members
-individually. Other permanent injection errors remain fatal.
+individually. Other permanent injection errors are fatal.
 
 `tx_data` counts submitted Wi-Fi data frames, `tx_packets` counts their Ethernet
 packets, and `tx_amsdu`/`tx_aggregated_packets` describe batching.
-`tx_aggregation_rejected` counts driver size rejections. Transmit A-MPDU remains
+`tx_aggregation_rejected` counts driver size rejections. Transmit A-MPDU is
 unsupported: the monitor path does not create kernel TX BA sessions or aggregate
 MPDUs through radiotap. Experimental receive Block Ack acceptance is separate,
 as described above.
@@ -537,7 +501,7 @@ to listen for fresh Apple manufacturer (`0x004c`) data. The scanner parses
 length-delimited Apple TLVs and accepts a single complete AirDrop (`05`, length
 18) element. Cached device snapshots, unrelated properties and malformed or
 ambiguous TLVs do not wake Wi-Fi. Duplicate-data events are requested so repeated
-live advertisements can still be observed. Identical live payloads remain eligible
+live advertisements can be observed. Identical live payloads are eligible
 to refresh the idle deadline; there is no per-tag deduplication or global wake
 cooldown. A bounded queue coalesces bursts while the daemon reuses one session.
 Addresses and hash hints are never logged.
@@ -546,7 +510,7 @@ In Contacts mode, the four two-byte hash slots are compared against prefixes of
 current known-sender SHA-256 hashes before waking or refreshing the timer. Missing, unreadable or invalid
 lists produce no contact wake matches. These short, unauthenticated values are
 only hints and may collide or be spoofed; full record and TLS verification at
-Ask remains mandatory. The daemon checks the current policy and list again at
+Ask is mandatory. The daemon checks the current policy and list again at
 admission, including after waiting for an older session to finish cleanup. A
 queued Everyone hint cannot bypass a later Contacts-only setting. Everyone mode
 accepts a structurally valid wake hint;
@@ -599,7 +563,7 @@ than packet-relative mDNS compression. The outgoing implementation uses `c0 07`
 for the AirDrop service, `c0 0c` for `.local`, and `c0 00` as the PTR terminator.
 Each type-2 TLV contains little-endian owner-name length, encoded owner, DNS type
 byte, little-endian RDATA length, two reserved bytes and RDATA. SRV priority,
-weight and port remain big-endian DNS fields. These records complement mDNS;
+weight and port are big-endian DNS fields. These records complement mDNS;
 publishing only IPv6 mDNS was insufficient for receiver visibility in testing.
 
 The radio runtime also sends a scoped unicast ICMPv6 echo to each valid AWDL neighbor
@@ -622,7 +586,7 @@ are not checked against public Web PKI; this supplies transport encryption, not
 Apple-account authentication or protection against an active impostor.
 
 An optional local `validation_record.cms` must verify to Apple Root CA, use the
-dedicated record-signing certificate role, remain within its declared validity,
+dedicated record-signing certificate role, be within its declared validity,
 and match the local Apple-issued sharing certificate's account CN
 `com.apple.idms.appleid.prd.<altDsID>`. It is published only as receiver identity.
 Outgoing sends omit `SenderRecordData` and advertise zero Apple ID hash prefixes;
@@ -729,30 +693,22 @@ then tested with an 8,727,870-byte MOV, which the phone reported as Sent. Earlie
 Content-Type and keep-alive changes were tested together; this comparison
 preserves the body and Content-Type behavior while changing connection closure.
 
-Some captured iPhone transfers deliver a complete archive without finishing
-its HTTP chunk terminator. The receiver now feeds incoming bytes through a
-bounded queue to a blocking archive decoder, independent of HTTP completion.
-DVZip decoding uses a 64 KiB input buffer and incremental zlib state. Bounded
-CPIO headers are parsed as they arrive and each regular file is streamed directly
-into a private `.owl-rs-*` directory inside the destination. No complete wire
-archive, compressed block or decoded CPIO archive is buffered in RAM; reception
-also avoids the former intermediate decoded-archive disk file. File contents
-are consumed by their declared lengths, rather than searched for trailer text.
-Gzip reception verifies its CRC/footer before completing.
+A complete archive can end before HTTP's closing zero chunk arrives. Reception
+feeds a blocking archive decoder through a bounded queue, using a 64 KiB DVZip
+input buffer and incremental zlib state. CPIO files stream into destination-local
+`.owl-rs-*` staging; no complete compressed or decoded archive is buffered in RAM
+or written as an intermediate disk file. File lengths determine boundaries;
+gzip reception also verifies its CRC/footer.
 
-A structurally parsed, zero-size `TRAILER!!!` entry after at least one member
-marks archive completion. The enclosing DVZip block must also be complete.
-Extraction checks safe member types and duplicate names before writing, then
-verifies AppleDouble companions and all approved files and sizes. Validated files
-remain in destination-local staging until the receive task renames the entire
-directory to `airdrop-TRANSFER_ID` with an atomic no-replace rename and sends
-HTTP 200. Decode, validation, I/O
-and rename failures remove staging. Timeout or cancellation stops the worker;
-its temporary directory is removed when it exits, even if the HTTP task has
-already ended. An existing completed transfer is preserved. No quiet-period timer
-or repeated whole-archive decoding is needed;
-`--upload-idle-timeout` still rejects stalled incomplete uploads. Hyper retains
-partial chunk headers and body data while the decoder runs.
+Completion requires a structurally parsed, zero-size `TRAILER!!!` after at least
+one member and a complete enclosing DVZip block. Extraction validates member
+types, paths, duplicate names, AppleDouble companions and approved files/sizes
+before an atomic no-replace rename to `airdrop-TRANSFER_ID` and HTTP 200.
+Decode, validation, I/O or rename errors remove staging. Timeout/cancellation
+stops the worker and removes its temporary directory, even after the HTTP task
+ends; completed transfers are preserved. Hyper retains partial chunk framing
+while decoding, and `--upload-idle-timeout` rejects stalled incomplete uploads.
+See [DVZip and CPIO](#dvzip-and-cpio) for archive limits.
 
 The earlier disk-backed incremental validator was tested with a live 14.76 MiB
 image receive without an HTTP terminator:
@@ -785,7 +741,7 @@ digits from phone numbers. Phone numbers need an explicit country code.
 
 Contacts Only TLS requests an optional client certificate. Certificate absence
 does not abort discovery; certificate-chain acceptance at the handshake is
-deferred to the application policy. OpenSSL still verifies possession of the
+deferred to the application policy. OpenSSL verifies possession of the
 client private key. The certificate used at Ask is taken from that connection,
 never from request metadata. Every mode requests an optional client certificate
 so an existing Everyone TLS connection can later be checked in Contacts mode.
@@ -795,7 +751,7 @@ revision after verification and pending approval. A policy change rejects a
 pending offer. Already approved uploads keep their connection-bound consent.
 Off mode returns empty HTTP 403 responses to Discover and Ask, sends an mDNS
 goodbye, suppresses further mDNS and AWDL service advertisements, and disables
-receive-side BLE advertising/scanning. Outgoing sender wake advertising remains
+receive-side BLE advertising/scanning. Outgoing sender wake advertising is
 available in Off mode.
 
 Before approval, file extraction, link saving or upload authorization, Ask requires:
@@ -803,7 +759,7 @@ Before approval, file extraction, link saving or upload authorization, Ask requi
 1. A CMS SignedData record (DER or BER) with a valid signature and certificate chain
    anchored only to the bundled Apple Root CA. Record size and decoded payload
    are limited to 128 KiB. OpenSSL canonicalizes BER envelopes before DER
-   signer inspection; signature verification still uses the original CMS.
+   signer inspection; signature verification uses the original CMS.
    If validity fields are present, `ValidAsOf` plus a
    finite positive `SuggestValidDuration` must not have expired; incomplete
    validity fields are rejected.
@@ -826,7 +782,7 @@ The certificate roles follow
 [Apple's published Security policies](https://github.com/apple-oss-distributions/Security/blob/main/OSX/sec/Security/SecPolicy.c)
 for validation-record signing and Apple ID sharing. The verification purpose is
 `ANY` because the record signer is not an S/MIME identity; chain, signature,
-validity and role checks remain mandatory. This is not a full implementation of
+validity and role checks are mandatory. This is not a full implementation of
 Apple's trust service: online OCSP/CRL revocation fetching is not implemented.
 
 Ask refusal returns HTTP 403 with an explicit zero Content-Length and closes
@@ -839,7 +795,7 @@ affects the next Ask, not an already approved upload.
 
 Discover uses weaker, best-effort hiding. A valid signed record belonging to a
 non-contact receives an empty HTTP 401, without receiver metadata. Missing,
-malformed or expired records are still answered for compatibility with devices
+malformed or expired records are answered for compatibility with devices
 that omit discovery identity. A replayed contact record can obtain discovery
 metadata, but cannot pass Ask without the matching Apple-issued private key.
 Discovery results are never cached as transfer authorization. Identifiers,
@@ -926,41 +882,30 @@ internal BLE callback starts receiving. For example:
 
 `accept` with a UUID selects that offer. An omitted/null ID waits for the oldest
 pending offer and returns after approving it; closing this connection cancels
-only the waiting acceptance. `reject` requires a transfer UUID. `cancel` uses
-the active `session.id`. Idle status has `session: null`, runtime `visibility`
+only the waiting acceptance. `reject` requires a transfer UUID. `cancel` accepts
+a session or transfer ID. Idle status has `session: null`, runtime `visibility`
 and `ble.listening`; active status adds the session ID and `phase` (`starting`,
 `active` or `closing`). `timeouts` reports the effective deadline values in
 seconds. `sending` contains independent outgoing operation IDs.
-Transfer history remains after teardown. `peers` requires an active session,
+Transfer history is available after teardown. `peers` requires an active session,
 holds it alive while resolving names over HTTPS, and does not activate an idle
-radio. Raw AWDL neighbors remain available in `status.awdl.peers`, independently
+radio. Raw AWDL neighbors are listed in `status.awdl.peers`, independently
 of AirDrop service discovery. Errors use `{"error":"message"}`.
 
-Before starting an outgoing operation, the CLI probes the control socket.
-A missing socket or connection refusal asks the user to start `airdropd`;
-the CLI never runs the service or loads identity keys. Other connection errors
-are reported. Startup takes an exclusive daemon lock
-before replacing an orphaned user socket. Radio recovery belongs to owld and
-uses its separate root-owned run directory, not the user control directory.
+The CLI requires the user daemon and never loads identity keys. Daemon startup
+locks its runtime directory before replacing an orphaned socket; radio recovery
+uses owld's separate root-owned directory.
 
-Send `options` contain explicit user-session CLI overrides. Unknown fields,
-including radio settings, are rejected. The user run directory and owld socket
-must match the control service. An idle activation
-inherits daemon defaults, excluding its lifetime `duration`. A send joining an
-active session inherits that session's settings; explicit conflicting settings
-are rejected until the session is canceled or finishes. `duration` bounds only
-the outgoing operation and can differ between users of the same session.
-`timeouts` holds explicit nested command-line deadline overrides; omitted values
-inherit the active session or daemon defaults. Unknown, non-finite, zero deadline
-and incompatible interval values are rejected before setup. Completion grace
-alone accepts zero. See the [timeout flags](usage.md#timeouts) for all settings.
+Send `options` contain explicit user-session overrides; unknown fields and radio
+settings are rejected. The user run directory and owld socket must match the
+service. Omitted values inherit the active session or daemon defaults, excluding
+the daemon's lifetime `duration`. Conflicting active-session settings are rejected;
+`duration` limits each outgoing operation independently. Nested `timeouts` follow
+[the timeout validation rules](usage.md#timeouts).
 
-Additional sends reuse the session instead of competing for radio ownership.
-Closing a send client's connection or pressing Ctrl+C cancels only that send.
-Successful IPC replies indicate transfer completion; the session can remain
-active for other work or completion grace. A temporary CLI service waits for
-session cleanup before exiting. `cancel SESSION_ID` stops the entire session;
-`stop` also ends the daemon.
+Additional sends share the session. Client disconnect or Ctrl+C cancels only that
+send. Success means transfer completion, not session shutdown: other work or grace
+may hold the link. `cancel SESSION_ID` stops all session work; `stop` ends the daemon.
 
 For `send`, the JSON declares `to`, optional scoped `direct`, `items`, `urls`,
 `bytes`, optional thumbnail `icon`, and discovery `timeout`. Exactly `bytes` raw
@@ -979,7 +924,7 @@ upload completed in 46.1 seconds with normal HTTP termination and HTTP 200;
 the phone reported Sent, and the received image matched its source SHA-256.
 Turning visibility off released the radio lease and restored managed Wi-Fi.
 Initial attempts failed during monitor channel setup with `EBUSY`; a retry
-succeeded. That intermittent setup failure remains unresolved. The earlier
+succeeded. That intermittent setup failure is unresolved. The earlier
 receive measurements below predate the process split.
 
 MT7612U/mt76x2u active-monitor tests completed native Rust image transfers in
@@ -1023,18 +968,19 @@ are listed separately; each successful image opened correctly on the phone.
 | VHT MCS8, two streams, 80 MHz, short GI | Enabled | 24.9 s |
 | VHT MCS9, two streams, 80 MHz, either GI | Enabled | Long stalls; cancelled |
 
-These comparisons preceded the MCS8 transmit ceiling. The phone remained
+These comparisons preceded the MCS8 transmit ceiling. The phone was
 unlocked during the fixed-rate MCS9 failures. They narrow the problem to
 MCS9 in this setup, but do not distinguish radio margin from a driver or
 firmware issue. Advertised capability alone does not establish a reliable
-injection rate; the selector currently has no delivery-based rate adaptation.
-Captures, device identifiers and test filenames remain in ignored local directories.
+injection rate. Automatic rate selection uses correlated TX-completion feedback
+when the driver supplies it; explicit rates do not adapt.
+Captures, device identifiers and test filenames are stored in ignored local directories.
 
 The bounded TCP drain and five-second grace period allowed final success-reply
 and FIN acknowledgments before teardown. Sessions then removed owned
 AWDL/monitor interfaces, restored managed WLAN and unregistered BLE advertising.
 Normal HTTP termination and recovery from missing termination are separately
-verified; incomplete archives remain rejected.
+verified; incomplete archives are rejected.
 
 Native Rust IBSS/shared-mode AirDrop, Contacts Only sending, Apple identity acquisition, broad OS-version compatibility and all media conversions are not
 validated or implemented by this evidence. A different phone failing to see a
