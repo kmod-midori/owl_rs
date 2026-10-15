@@ -141,6 +141,8 @@ pub struct Frame {
     pub source: Mac,
     pub destination: Mac,
     pub sequence: u16,
+    /// QoS sequence space; non-QoS data has a separate sequence space.
+    pub tid: Option<u8>,
     pub retry: bool,
     pub rssi: Option<i8>,
     pub frequency: Option<u16>,
@@ -235,6 +237,7 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
         source,
         destination,
         sequence: seq >> 4,
+        tid: (fc & 0x00fc == 0x88).then_some((qos & 0x0f) as u8),
         retry: fc & 0x0800 != 0,
         rssi: radio.antenna_signal.map(|v| v.value),
         frequency: radio.channel.map(|v| v.freq),

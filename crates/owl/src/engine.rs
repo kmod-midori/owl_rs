@@ -15,6 +15,7 @@ struct PendingSyn {
     key: (u16, u16, u32),
     ethernet: Vec<u8>,
     sequence: u16,
+    tid: Option<u8>,
     queued_us: i64,
 }
 fn syn_key(ethernet: &[u8], source: Mac, local: Mac) -> Option<(u16, u16, u32)> {
@@ -61,7 +62,7 @@ pub struct Peer {
     #[serde(skip)]
     v2: bool,
     #[serde(skip)]
-    recent: VecDeque<(u16, i64)>,
+    recent: VecDeque<(Option<u8>, u16, i64)>,
 }
 impl Peer {
     fn new(mac: Mac, now: i64) -> Self {
@@ -315,6 +316,7 @@ impl Engine {
                                 key,
                                 ethernet: ethernet.clone(),
                                 sequence: frame.sequence,
+                                tid: frame.tid,
                                 queued_us: now,
                             });
                             self.stats.rx_syn_buffered += 1;
@@ -328,16 +330,22 @@ impl Engine {
                 // Fully parsed data, including retries, proves a known peer is alive.
                 // Busy phones may skip action frames while uploading.
                 peer.last_seen_us = now;
-                peer.recent
-                    .retain(|&(_, time)| now - time < self.config.retry_timeout.as_micros() as i64);
-                if frame.retry && peer.recent.iter().any(|&(seq, _)| seq == frame.sequence) {
+                peer.recent.retain(|&(_, _, time)| {
+                    now - time < self.config.retry_timeout.as_micros() as i64
+                });
+                if frame.retry
+                    && peer
+                        .recent
+                        .iter()
+                        .any(|&(tid, seq, _)| tid == frame.tid && seq == frame.sequence)
+                {
                     self.stats.rx_duplicates += 1;
                     return Ok((vec![], vec![]));
                 }
                 if peer.recent.len() >= 128 {
                     peer.recent.pop_front();
                 }
-                peer.recent.push_back((frame.sequence, now));
+                peer.recent.push_back((frame.tid, frame.sequence, now));
                 self.stats.rx_data += 1;
                 // Monitor capture is promiscuous; never inject another node's unicast into TAP.
                 let mut out = Vec::new();
@@ -373,7 +381,7 @@ impl Engine {
             if peer.recent.len() == 128 {
                 peer.recent.pop_front();
             }
-            peer.recent.push_back((packet.sequence, now));
+            peer.recent.push_back((packet.tid, packet.sequence, now));
             frames.push(packet.ethernet);
         }
         self.stats.rx_data += frames.len() as u64;

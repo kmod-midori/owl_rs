@@ -317,8 +317,9 @@ and this LLC/AWDL payload; subframes align to four bytes. The decoder limits an
 aggregate to 64 subframes and checks every length before copying.
 
 The backend only forwards multicast or locally addressed data from valid peers.
-802.11 retry duplicates are tracked for 500 ms by default with 128 sequence entries per
-peer. Peer state is bounded to 512 entries and by default expires after five seconds without
+802.11 retry duplicates are keyed by QoS TID and sequence number, with a
+separate non-QoS sequence space. The cache retains up to 128 entries per peer
+for 500 ms by default, shared across TIDs. Peer state is bounded to 512 entries and by default expires after five seconds without
 valid action or data traffic. Fully parsed data from an already valid peer,
 including a suppressed retry, refreshes its lifetime. Data cannot discover a new
 peer or make an invalid peer valid, and malformed frames cannot refresh one.

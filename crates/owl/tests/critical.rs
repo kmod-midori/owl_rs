@@ -413,6 +413,18 @@ fn amsdu_bounds_and_retry_deduplication() {
         panic!()
     };
     assert_eq!(frames, [ethernet]);
+    // QoS TID 0 must not collide with the non-QoS sequence already received.
+    amsdu[rt + 1] |= 8;
+    for tid in [0, 7, 15] {
+        amsdu[rt + 24] = 0x80 | tid;
+        assert_eq!(protocol::parse(&amsdu).unwrap().unwrap().tid, Some(tid));
+        assert_eq!(e.receive(&amsdu, 30).unwrap().0.len(), 1);
+        assert!(e.receive(&amsdu, 40).unwrap().0.is_empty());
+    }
+    assert_eq!(e.stats.rx_duplicates, 4);
+    // The same TID/sequence becomes eligible after the retry cache expires.
+    let expired = e.config.retry_timeout.as_micros() as i64 + 41;
+    assert_eq!(e.receive(&amsdu, expired).unwrap().0.len(), 1);
     amsdu.pop();
     assert!(protocol::parse(&amsdu).is_err());
 }
