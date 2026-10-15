@@ -478,12 +478,12 @@ pub fn radiotap_tx(parameters: TxParameters, noack: bool, fcs: bool) -> Result<V
         fields.push(0);
     }
     fields.extend_from_slice(&(0x10u16 | if noack { 8 } else { 0 }).to_le_bytes());
-    if let Rate::Mcs { index, sgi } = rate {
+    if let Rate::Mcs { index, width, sgi } = rate {
         present |= 1 << 19;
         let ldpc = coding == Coding::Ldpc;
         fields.extend_from_slice(&[
             7 | if ldpc { 0x10 } else { 0 },
-            (if sgi { 4 } else { 0 }) | if ldpc { 0x10 } else { 0 },
+            (if sgi { 4 } else { 0 }) | if ldpc { 0x10 } else { 0 } | u8::from(width == 40),
             index,
         ]);
     }

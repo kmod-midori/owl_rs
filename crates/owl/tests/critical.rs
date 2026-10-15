@@ -117,6 +117,8 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         "mcs0",
         "mcs7-sgi",
         "mcs31",
+        "mcs15-40-sgi",
+        "mcs7-20-lgi",
         "auto",
         "vht4-nss2-bw40-sgi",
         "vht9-nss2-bw80",
@@ -130,6 +132,9 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         "mcs-1",
         "12x",
         "mcs7-sgix",
+        "mcs7-80",
+        "mcs7-sgi-40",
+        "12-lgi",
         "vht",
         "vht10-nss2-bw80",
         "vht4-nss0-bw40",
@@ -148,6 +153,11 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         protocol::radiotap_tx("mcs7-sgi".parse::<Rate>().unwrap().into(), true, false).unwrap(),
         [0, 0, 13, 0, 0, 128, 8, 0, 24, 0, 7, 4, 7]
     );
+    assert_eq!(
+        protocol::radiotap_tx("mcs15-40-sgi".parse::<Rate>().unwrap().into(), true, false).unwrap(),
+        [0, 0, 13, 0, 0, 128, 8, 0, 24, 0, 7, 5, 15]
+    );
+    assert_eq!("mcs7-20-lgi".parse::<Rate>().unwrap().to_string(), "mcs7");
     for rate in [
         Rate::Legacy(12),
         "mcs15-sgi".parse().unwrap(),
@@ -872,6 +882,19 @@ fn vht_radiotap_alignment_and_peer_limits() {
     );
     assert_eq!(
         request.for_peer(channel, &local, &Default::default(), 80),
+        Rate::Legacy(12)
+    );
+    let wide_ht: Rate = "mcs15-40-sgi".parse().unwrap();
+    assert_eq!(
+        wide_ht.for_peer(channel, &local, &remote, 80),
+        "mcs15-40".parse().unwrap()
+    );
+    assert_eq!(
+        wide_ht.for_peer(channel, &local, &remote, 20),
+        "mcs15-sgi".parse().unwrap()
+    );
+    assert_eq!(
+        wide_ht.for_peer(channel, &local, &Default::default(), 80),
         Rate::Legacy(12)
     );
     remote.vht.as_mut().unwrap().rx_mcs_map = 0xfffa;

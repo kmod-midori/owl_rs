@@ -93,6 +93,7 @@ pub enum Rate {
     Auto,
     Legacy(u8),
     Mcs {
+        width: u8,
         index: u8,
         sgi: bool,
     },
@@ -109,7 +110,13 @@ impl fmt::Display for Rate {
         match *self {
             Self::Auto => f.write_str("auto"),
             Self::Legacy(n) => write!(f, "{n}"),
-            Self::Mcs { index, sgi } => write!(f, "mcs{index}{}", suffix(sgi)),
+            Self::Mcs { index, width, sgi } => {
+                write!(f, "mcs{index}")?;
+                if width != 20 {
+                    write!(f, "-{width}")?;
+                }
+                f.write_str(suffix(sgi))
+            }
             Self::Vht {
                 index,
                 nss,
@@ -137,7 +144,11 @@ impl FromStr for Rate {
         if s == "auto" {
             return Ok(Self::Auto);
         }
-        let (s, sgi) = s.strip_suffix("-sgi").map_or((s, false), |s| (s, true));
+        let original = s;
+        let (s, sgi) = s.strip_suffix("-sgi").map_or_else(
+            || (s.strip_suffix("-lgi").unwrap_or(s), false),
+            |s| (s, true),
+        );
         let parsed = (|| {
             if let Some(s) = s.strip_prefix("vht") {
                 let mut fields = s.split('-');
@@ -149,18 +160,21 @@ impl FromStr for Rate {
                 };
                 fields.next().is_none().then_some(rate)
             } else if let Some(s) = s.strip_prefix("mcs") {
-                Some(Self::Mcs {
-                    index: number(s)?,
-                    sgi,
-                })
-            } else if !sgi {
+                let mut fields = s.split('-');
+                let index = number(fields.next()?)?;
+                let width = fields.next().map_or(Some(20), number)?;
+                fields
+                    .next()
+                    .is_none()
+                    .then_some(Self::Mcs { index, width, sgi })
+            } else if s == original {
                 Some(Self::Legacy(number(s)?))
             } else {
                 None
             }
         })();
         parsed.filter(|rate| rate.phy_mbps().is_some()).ok_or_else(||
-            "use auto, legacy Mbps (6,9,12,18,24,36,48,54), mcsN[-sgi] (0–31), or vhtN-nssS-bwW[-sgi] (MCS 0–9, NSS 1–8, width 20/40/80)".into())
+            "use auto, legacy Mbps (6,9,12,18,24,36,48,54), mcsN[-20|-40][-lgi|-sgi] (0–31), or vhtN-nssS-bwW[-sgi] (MCS 0–9, NSS 1–8, width 20/40/80)".into())
     }
 }
 fn number(s: &str) -> Option<u8> {
@@ -199,7 +213,7 @@ impl Rate {
     pub(crate) const DISCOVERY: Self = Self::Legacy(12);
     pub(crate) fn fallback(self) -> Self {
         match self {
-            Self::Auto | Self::Vht { .. } => Self::DISCOVERY,
+            Self::Auto | Self::Vht { .. } | Self::Mcs { width: 40, .. } => Self::DISCOVERY,
             _ => self,
         }
     }
@@ -209,7 +223,10 @@ impl Rate {
             Self::Auto => None,
             Self::Legacy(n) if [6, 9, 12, 18, 24, 36, 48, 54].contains(&n) => Some(f32::from(n)),
             Self::Legacy(_) => None,
-            Self::Mcs { index, sgi } => ht_rate(index, bandwidth(20)?, gi(sgi)).ok(),
+            Self::Mcs { index, width, sgi } if matches!(width, 20 | 40) => {
+                ht_rate(index, bandwidth(width)?, gi(sgi)).ok()
+            }
+            Self::Mcs { .. } => None,
             Self::Vht {
                 index,
                 nss,
@@ -252,10 +269,39 @@ impl Rate {
                         let byte = index as usize / 8;
                         let allowed = !(peer.single_stream() && index >= 8)
                             && tx.tx_mask?[byte] & rx.rx_mask[byte] & (1 << (index % 8)) != 0;
-                        allowed.then_some(Self::Mcs { index, sgi })
+                        allowed.then_some(Self::Mcs {
+                            index,
+                            width: 20,
+                            sgi,
+                        })
                     })
                 });
             return Self::fastest(ht.chain(std::iter::once(vht)));
+        }
+        if let Self::Mcs {
+            index,
+            width: 40,
+            sgi,
+        } = self
+        {
+            let (Some(tx), Some(rx)) = (&local.ht, &peer.ht) else {
+                return Self::DISCOVERY;
+            };
+            let width = if channel.width_mhz >= 40
+                && peer_width >= 40
+                && tx.cap_info & rx.cap_info & 2 != 0
+            {
+                40
+            } else {
+                20
+            };
+            let sgi = sgi && local.short_gi(width) && peer.short_gi(width);
+            return Self::fastest((0..=index.min(31)).filter_map(|index| {
+                let byte = usize::from(index / 8);
+                let supported = !(peer.single_stream() && index >= 8)
+                    && tx.tx_mask?[byte] & rx.rx_mask[byte] & (1 << (index % 8)) != 0;
+                supported.then_some(Self::Mcs { index, width, sgi })
+            }));
         }
         let Self::Vht {
             index,
@@ -420,7 +466,11 @@ impl AutoRate {
                     }
                     for sgi in [false, true] {
                         if !sgi || (local.short_gi(20) && peer.short_gi(20)) {
-                            rates.push(Rate::Mcs { index, sgi });
+                            rates.push(Rate::Mcs {
+                                index,
+                                width: 20,
+                                sgi,
+                            });
                         }
                     }
                 }
@@ -492,10 +542,12 @@ pub(crate) fn reported_rate(radio: &radiotap::Radiotap) -> Option<Rate> {
         });
     }
     if let Some(mcs) = &radio.mcs {
-        if mcs.bw?.bandwidth != 20 {
+        let width = mcs.bw?.bandwidth;
+        if !matches!(width, 20 | 40) {
             return None;
         }
         return Some(Rate::Mcs {
+            width,
             index: mcs.index?,
             sgi: mcs.gi? == GuardInterval::Short,
         });

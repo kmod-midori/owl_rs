@@ -99,8 +99,10 @@ advertisements and reception retain full MCS9 support.
 | --- | --- |
 | `--rate auto` | Automatic selection (default) |
 | `--rate 12` | Legacy Mbps: 6, 9, 12, 18, 24, 36, 48 or 54 |
-| `--rate mcs7-sgi` | HT20 MCS 0–31, optional `-sgi` |
+| `--rate mcs15-40-sgi` | HT MCS 0–31, optional `-20`/`-40` and `-lgi`/`-sgi`; defaults to HT20 long GI |
 | `--rate vht4-nss2-bw40-sgi` | VHT MCS 0–9 request, capped at 8; NSS 1–8, width 20/40/80 MHz, optional `-sgi` |
+
+Explicit HT40 requests are constrained by local TX and peer RX masks, SMPS, guard interval, and channel width; unknown capabilities fall back to 12 Mbps. Existing HT20 syntax and automatic selection are unchanged.
 
 VHT requests are upper limits, constrained by both peers and the tuned channel.
 Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
@@ -185,3 +187,5 @@ uses interface-scoped UDP for mDNS and TCP for HTTPS; host routing and filtering
 still apply. `owld` generates Ethernet neighbor-learning probes on its owned
 link. See [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
 for tested hardware and remaining limits.
+
+PR [#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster MT7921 transfers with a patched driver, wide advertisements and Block Ack combined. Our advertisements already derive stream counts from hardware, and active-monitor tuning already tries regulatory-permitted 80 MHz channels. The added HT40 syntax does not install those driver patches or establish MT7921 injection support on stock kernels. Its reported throughput has not been reproduced here.
