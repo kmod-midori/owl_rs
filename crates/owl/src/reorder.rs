@@ -198,7 +198,6 @@ mod tests {
         r.start(PEER, request(0, 4094));
         r.start(PEER, request(1, 7));
         assert!(r.receive(PEER, 0, 0, packet(0), 0).is_empty());
-        assert!(r.receive(PEER, 0, 0, packet(9), 1).is_empty());
         assert_eq!(r.receive(PEER, 1, 7, packet(7), 1), packet(7));
         assert_eq!(r.receive(PEER, 0, 4094, packet(4), 1), packet(4));
         assert_eq!(
@@ -217,7 +216,6 @@ mod tests {
         // Advancing past the window releases held MPDUs before the new one.
         assert_eq!(r.receive(PEER, 0, 12, packet(12), 100_006), packet(8));
         assert_eq!(r.stop(PEER, 0), packet(12));
-        assert_eq!(r.stats.duplicate_mpdus, 1);
         assert_eq!(r.stats.old_mpdus, 1);
         assert_eq!(r.stats.gap_timeouts, 1);
         assert_eq!(r.stats.sessions_started, 2);

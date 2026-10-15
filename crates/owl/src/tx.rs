@@ -883,36 +883,20 @@ mod tests {
         queue.respond_addba(&mut engine, PEER, request, 10_000);
         assert_eq!(queue.management.len(), 1);
         let mut submitted = Vec::new();
-        queue
-            .flush(
-                &mut engine,
-                6,
-                8192,
-                || 10_000,
-                |bytes| {
-                    submitted = bytes.to_vec();
-                    Err::<(), _>(InjectionError::<TestError>::Backpressure)
-                },
-            )
-            .unwrap();
+        flush(&mut queue, &mut engine, 8192, 10_000, |bytes| {
+            submitted = bytes.to_vec();
+            Err(InjectionError::Backpressure)
+        });
         assert_eq!(engine.stats.tx_addba_rejections, 0);
         engine.config.channel = 149;
         queue
             .flush::<TestError>(&mut engine, 6, 8192, || 11_000, |_| panic!("wrong channel"))
             .unwrap();
         engine.config.channel = 6;
-        queue
-            .flush(
-                &mut engine,
-                6,
-                8192,
-                || 12_000,
-                |bytes| {
-                    assert_eq!(bytes, submitted);
-                    Ok::<(), InjectionError<TestError>>(())
-                },
-            )
-            .unwrap();
+        flush(&mut queue, &mut engine, 8192, 12_000, |bytes| {
+            assert_eq!(bytes, submitted);
+            Ok(())
+        });
         let (radio, body) = radiotap::Radiotap::parse(&submitted).unwrap();
         assert!(radio.tx_flags.unwrap().no_ack);
         assert_eq!(&body[4..10], &PEER.0);
@@ -922,15 +906,9 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(engine.stats.tx_addba_rejections, 1);
         queue.respond_addba(&mut engine, PEER, request, 20_000);
-        queue
-            .flush(
-                &mut engine,
-                6,
-                8192,
-                || 3_000_000,
-                |_| -> Result<(), InjectionError<TestError>> { panic!("expired reply") },
-            )
-            .unwrap();
+        flush(&mut queue, &mut engine, 8192, 3_000_000, |_| {
+            panic!("expired reply")
+        });
         assert!(queue.is_empty());
         assert_eq!(engine.stats.tx_addba_rejections, 1);
     }
@@ -946,47 +924,59 @@ mod tests {
             starting_sequence: 10 << 4,
         };
         queue.respond_addba(&mut engine, PEER, request, 10_000);
-        queue
-            .flush(
-                &mut engine,
-                6,
-                8192,
-                || 10_000,
-                |_| Err::<(), _>(InjectionError::<TestError>::Backpressure),
-            )
-            .unwrap();
+        flush(&mut queue, &mut engine, 8192, 10_000, |_| {
+            Err(InjectionError::Backpressure)
+        });
         assert!(!engine.reorder.contains(PEER, 0));
-        queue
-            .flush(
-                &mut engine,
-                6,
-                8192,
-                || 11_000,
-                |bytes| {
-                    let (_, body) = radiotap::Radiotap::parse(bytes).unwrap();
-                    assert_eq!(&body[24..], &[3, 1, 9, 0, 0, 2, 1, 0, 0]);
-                    Ok::<(), InjectionError<TestError>>(())
-                },
-            )
-            .unwrap();
+        flush(&mut queue, &mut engine, 8192, 11_000, |bytes| {
+            let (_, body) = radiotap::Radiotap::parse(bytes).unwrap();
+            assert_eq!(&body[24..], &[3, 1, 9, 0, 0, 3, 1, 0, 0]);
+            Ok(())
+        });
         assert!(engine.reorder.contains(PEER, 0));
         assert_eq!(engine.stats.tx_addba_acceptances, 1);
-        let data = |seq| {
-            let mut ethernet = packet(OWN, seq as u8);
-            ethernet[6..12].copy_from_slice(&PEER.0);
-            let mut bytes =
-                protocol::encode_data(&ethernet, seq, 0, Rate::DISCOVERY.into(), false, false)
+        fn data(sequence: u16, markers: &[u8]) -> Vec<u8> {
+            let packets: Vec<_> = markers
+                .iter()
+                .map(|&marker| {
+                    let mut ethernet = packet(OWN, marker);
+                    ethernet[6..12].copy_from_slice(&PEER.0);
+                    ethernet
+                })
+                .collect();
+            let parameters = Rate::DISCOVERY.into();
+            if packets.len() > 1 {
+                let members: Vec<_> = packets.iter().map(Vec::as_slice).collect();
+                return protocol::encode_amsdu(&members, sequence, 0, parameters, false, false)
                     .unwrap();
-            let offset = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+            }
+            let mut bytes =
+                protocol::encode_data(&packets[0], sequence, 0, parameters, false, false).unwrap();
+            let offset = radiotap::Radiotap::from_bytes(&bytes)
+                .unwrap()
+                .header
+                .length;
             bytes[offset] = 0x88;
             bytes.splice(offset + 24..offset + 24, [0, 0]); // QoS TID 0.
             bytes
-        };
-        assert!(engine.receive(&data(11), 12_000).unwrap().0.is_empty());
-        assert!(engine.receive(&data(11), 12_001).unwrap().0.is_empty()); // No Retry bit required.
-        assert_eq!(engine.receive(&data(10), 12_002).unwrap().0.len(), 2);
-        assert!(engine.receive(&data(10), 12_003).unwrap().0.is_empty());
-        assert!(engine.receive(&data(14), 12_004).unwrap().0.is_empty());
+        }
+        let first = data(10, &[10]);
+        let aggregate = data(11, &[11, 111]);
+        let after_gap = data(14, &[14]);
+        let before_delba = data(16, &[16]);
+        let after_restart = data(20, &[20]);
+        assert!(engine.receive(&aggregate, 12_000).unwrap().0.is_empty());
+        assert!(engine.receive(&aggregate, 12_001).unwrap().0.is_empty()); // No Retry bit required.
+        let released = engine.receive(&first, 12_002).unwrap().0;
+        assert_eq!(
+            released,
+            packets(&first)
+                .into_iter()
+                .chain(packets(&aggregate))
+                .collect::<Vec<_>>()
+        );
+        assert!(engine.receive(&first, 12_003).unwrap().0.is_empty());
+        assert!(engine.receive(&after_gap, 12_004).unwrap().0.is_empty());
         let mut bar = vec![0, 0, 8, 0, 0, 0, 0, 0, 0x84, 0, 0, 0];
         bar.extend_from_slice(&OWN.0);
         bar.extend_from_slice(&PEER.0);
@@ -1011,7 +1001,7 @@ mod tests {
         foreign[12] ^= 2;
         assert!(engine.receive(&foreign, 12_005).unwrap().0.is_empty());
         assert_eq!(engine.receive(&bar, 12_006).unwrap().0.len(), 1);
-        assert!(engine.receive(&data(16), 12_007).unwrap().0.is_empty());
+        assert!(engine.receive(&before_delba, 12_007).unwrap().0.is_empty());
         let mut delba = vec![0, 0, 8, 0, 0, 0, 0, 0, 0xd0, 0, 0, 0];
         delba.extend_from_slice(&OWN.0);
         delba.extend_from_slice(&PEER.0);
@@ -1034,17 +1024,21 @@ mod tests {
         // Renegotiation releases the old window before newly received data,
         // even if capture wins the select before the scheduler polls.
         engine.reorder.start(PEER, request);
-        assert!(engine.receive(&data(11), 13_000).unwrap().0.is_empty());
+        assert!(engine.receive(&aggregate, 13_000).unwrap().0.is_empty());
         let replacement = protocol::AddBaRequest {
             dialog_token: 10,
             starting_sequence: 20 << 4,
             ..request
         };
         engine.reorder.start(PEER, replacement);
-        let frames = engine.receive(&data(20), 13_001).unwrap().0;
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].last(), Some(&11));
-        assert_eq!(frames[1].last(), Some(&20));
+        let frames = engine.receive(&after_restart, 13_001).unwrap().0;
+        assert_eq!(
+            frames,
+            packets(&aggregate)
+                .into_iter()
+                .chain(packets(&after_restart))
+                .collect::<Vec<_>>()
+        );
     }
     #[test]
     fn ack_timing_keeps_identity_and_counts_members_once_across_retries() {

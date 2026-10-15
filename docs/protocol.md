@@ -367,7 +367,7 @@ validated AWDL peers with status 37. The experimental profile option
 responses in this mode; userspace does not send these time-critical replies.
 
 Acceptance negotiates immediate Block Ack, a window of at most 64 MPDUs,
-no A-MSDU-in-A-MPDU, and an inactivity timeout of zero (disabled). There are at
+A-MSDU-in-A-MPDU support, and an inactivity timeout of zero (disabled). There are at
 most eight peer/TID agreements; a full table declines new agreements without
 evicting existing ones. A response uses the management rate and configured
 unicast ACK policy, shares data airtime/slot gating, and preserves its sequence

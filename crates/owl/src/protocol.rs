@@ -653,7 +653,7 @@ pub struct Advertisement<'a> {
     pub now_us: i64,
 }
 
-/// Respond with immediate BA, no A-MSDU-in-A-MPDU, and no inactivity timeout.
+/// Respond with immediate BA, A-MSDU-in-A-MPDU support, and no inactivity timeout.
 pub fn encode_addba_response(
     source: Mac,
     destination: Mac,
@@ -669,7 +669,8 @@ pub fn encode_addba_response(
     le16(
         &mut out,
         if accept {
-            (request.parameters & 0x003c) | 2 | (request.window() << 6)
+            // Bit 0 advertises our receive support, independently of the request.
+            (request.parameters & 0x003c) | 3 | (request.window() << 6)
         } else {
             request.parameters & 0x003e
         },
