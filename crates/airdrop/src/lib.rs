@@ -12,5 +12,8 @@ pub use owl_ipc::timeouts;
 mod contacts;
 mod link;
 mod mdns;
+mod progress;
 mod session;
 mod transport;
+#[cfg(feature = "tray")]
+mod tray;

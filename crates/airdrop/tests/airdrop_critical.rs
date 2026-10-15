@@ -496,7 +496,19 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         ),
     ]);
     let metadata = airdrop::transfer::plist_bytes(&offer).unwrap();
+    let previous_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let mut previous_offer = offer.clone();
+    previous_offer
+        .as_dictionary_mut()
+        .unwrap()
+        .insert("TransferID".into(), previous_id.clone().into());
+    ask(
+        &mut stream,
+        &airdrop::transfer::plist_bytes(&previous_offer).unwrap(),
+    )
+    .await;
     ask(&mut stream, &metadata).await;
+    assert!(receiver.cancel(&previous_id).await.is_err());
     let data = std::fs::read(prepared.file.path()).unwrap();
     stream.write_all(format!("POST /Upload HTTP/1.1\r\nHost: AirDrop\r\nTransferID: {id}\r\nContent-Type: application/x-dvzip\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes()).await.unwrap();
     let chunk_size = format!("{:x}\r\n", data.len());
@@ -508,7 +520,16 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
     stream.write_all(&data[..data.len() / 2]).await.unwrap();
     stream.flush().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_ne!(receiver.transfers().await[0].state, "completed");
+    assert_ne!(
+        receiver
+            .transfers()
+            .await
+            .into_iter()
+            .find(|transfer| transfer.offer.id == id)
+            .unwrap()
+            .state,
+        "completed"
+    );
     assert!(!dir.path().join(format!("received/airdrop-{id}")).exists());
     stream.write_all(&data[data.len() / 2..]).await.unwrap();
     stream.write_all(b"\r\n").await.unwrap();
@@ -521,7 +542,12 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
     assert!(response.to_ascii_lowercase().contains("connection: close"));
     assert_eq!(
         std::fs::read(
-            receiver.transfers().await[0]
+            receiver
+                .transfers()
+                .await
+                .into_iter()
+                .find(|transfer| transfer.offer.id == id)
+                .unwrap()
                 .output
                 .as_ref()
                 .unwrap()
@@ -531,7 +557,8 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         payload
     );
     drop(stream);
-    for disconnect in [true, false] {
+    assert!(receiver.cancel(&id).await.is_err()); // Published files cannot be cancelled.
+    for failure in ["disconnect", "timeout", "cancel"] {
         let mut stream = connect(&identity, address).await;
         let failed_id = uuid::Uuid::new_v4().to_string().to_uppercase();
         let mut failed_offer = offer.clone();
@@ -552,7 +579,34 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         })
         .await
         .unwrap();
-        if !disconnect {
+        let progress = receiver
+            .transfers()
+            .await
+            .into_iter()
+            .find(|t| t.offer.id == failed_id)
+            .unwrap();
+        assert!(progress.bytes > 0 && progress.bytes < data.len() as u64);
+        assert_eq!(progress.total_bytes, Some(data.len() as u64));
+        if failure == "cancel" {
+            receiver.cancel(&failed_id).await.unwrap();
+            assert!(receiver.decide(&failed_id, true).await.is_err());
+            let mut response = Vec::new();
+            let _closed =
+                tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+                    .await
+                    .unwrap();
+            assert!(!response.starts_with(b"HTTP/1.1 200"));
+            assert_eq!(
+                receiver
+                    .transfers()
+                    .await
+                    .into_iter()
+                    .find(|t| t.offer.id == failed_id)
+                    .unwrap()
+                    .state,
+                "cancelled"
+            );
+        } else if failure == "timeout" {
             let response = tokio::time::timeout(Duration::from_secs(4), reply(&mut stream))
                 .await
                 .unwrap();

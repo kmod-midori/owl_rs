@@ -35,6 +35,9 @@ async fn runtime_visibility_idle_control_and_killed_daemon_restart() {
     let keys = temp.path().join("keys");
     let start = || {
         Process::new(env!("CARGO_BIN_EXE_airdropd"))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("GDK_BACKEND", "x11")
             .kill_on_drop(true)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

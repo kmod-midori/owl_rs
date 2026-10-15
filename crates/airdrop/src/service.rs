@@ -28,6 +28,9 @@ use tokio::{
     sync::{Mutex, watch},
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "tray")]
+#[path = "notifications.rs"]
+mod notifications;
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Options {
@@ -269,6 +272,14 @@ impl State {
         command: Command,
         archive: Option<tempfile::NamedTempFile>,
     ) -> Result<serde_json::Value> {
+        self.command_with_progress(command, archive, None).await
+    }
+    async fn command_with_progress(
+        &self,
+        command: Command,
+        archive: Option<tempfile::NamedTempFile>,
+        progress: Option<crate::progress::Progress>,
+    ) -> Result<serde_json::Value> {
         match command {
             Command::Status => Ok(
                 serde_json::json!({"name":self.receiver.name,"visibility":self.receiver.visibility(),"awdl":self.snapshot.borrow().clone(),"sending":[],"transfers":self.receiver.transfers().await}),
@@ -319,7 +330,7 @@ impl State {
                     _ = cancel.cancelled() => Err(anyhow::anyhow!("send cancelled")),
                     result = async {
                         let address = self.target(&to, direct, timeout).await?;
-                        sender.send_with_activity(address, items, urls, archive.as_ref().map(|f| f.path().into()), icon, Some(&self.activity)).await
+                        sender.send_with_context(address, items, urls, archive.as_ref().map(|f| f.path().into()), icon, crate::transfer::SendContext { activity: Some(&self.activity), progress }).await
                     } => result,
                 };
                 let id = result?;
@@ -559,6 +570,7 @@ struct Daemon {
     sessions: tokio_util::task::TaskTracker,
     visibility: Arc<visibility::Control>,
     ble: watch::Receiver<bool>,
+    outgoing: Arc<Mutex<std::collections::BTreeMap<String, crate::progress::Progress>>>,
 }
 fn merge_options(base: &mut serde_json::Value, overrides: &serde_json::Value) -> Result<()> {
     if overrides.is_null() {
@@ -833,6 +845,43 @@ impl Daemon {
         archive: Option<tempfile::NamedTempFile>,
         client_cancel: CancellationToken,
     ) -> Result<serde_json::Value> {
+        let Command::Send {
+            to, items, urls, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        let names = if items.is_empty() {
+            urls.clone()
+        } else {
+            items.iter().map(|item| item.name.clone()).collect()
+        };
+        let progress =
+            crate::progress::Progress::new(to.clone(), names, client_cancel.child_token());
+        let _guard = progress.guard();
+        let id = progress.state.borrow().id.clone();
+        {
+            let mut outgoing = self.outgoing.lock().await;
+            if outgoing.len() >= 256 {
+                let key = outgoing
+                    .iter()
+                    .find(|(_, value)| crate::progress::terminal(&value.state.borrow().state))
+                    .map(|(id, _)| id.clone())
+                    .context("too many outgoing transfers")?;
+                outgoing.remove(&key);
+            }
+            outgoing.insert(id, progress.clone());
+        }
+        let result = self.send_tracked(command, archive, &progress).await;
+        progress.finish(result.as_ref().err().map(|error| format!("{error:#}")));
+        result
+    }
+    async fn send_tracked(
+        &self,
+        command: Command,
+        archive: Option<tempfile::NamedTempFile>,
+        progress: &crate::progress::Progress,
+    ) -> Result<serde_json::Value> {
         let Command::Send { options, .. } = &command else {
             unreachable!()
         };
@@ -841,11 +890,11 @@ impl Daemon {
             .duration
             .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
         let (active, lease) = tokio::select! {
-            _ = client_cancel.cancelled() => bail!("send cancelled"),
+            _ = progress.cancel.cancelled() => bail!("send cancelled"),
             _ = expires(deadline) => bail!("send duration expired"),
             result = self.activate(options, None, true) => result?,
         };
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = progress.state.borrow().id.clone();
         active.sending.send_modify(|ids| {
             ids.insert(id.clone());
         });
@@ -856,8 +905,8 @@ impl Daemon {
         };
         let mut wake = None;
         let result = tokio::select! {
-            _ = client_cancel.cancelled() => Err(anyhow::anyhow!("send cancelled")),
-            _ = active.cancel.cancelled() => Err(anyhow::anyhow!("AirDrop session cancelled")),
+            _ = progress.cancel.cancelled() => Err(anyhow::anyhow!("send cancelled")),
+            _ = active.cancel.cancelled() => { progress.cancel.cancel(); Err(anyhow::anyhow!("AirDrop session cancelled")) },
             _ = expires(deadline) => Err(anyhow::anyhow!("send duration expired")),
             result = async {
                 let mut state = active.ready().await?;
@@ -867,7 +916,7 @@ impl Daemon {
                         Err(error) => tracing::warn!("BLE wake unavailable: {error:#}"),
                     }
                 }
-                state.command(command, archive).await
+                state.command_with_progress(command, archive, Some(progress.clone())).await
             } => result,
         };
         if let Some(wake) = &mut wake {
@@ -921,6 +970,13 @@ impl Daemon {
             },
             Command::Status => {
                 let mode = self.visibility.tx.borrow().mode;
+                let outgoing: Vec<_> = self
+                    .outgoing
+                    .lock()
+                    .await
+                    .values()
+                    .map(|progress| progress.state.borrow().clone())
+                    .collect();
                 let listening = *self.ble.borrow();
                 let active = self.active.lock().await.clone();
                 if let Some(active) = active {
@@ -935,6 +991,7 @@ impl Daemon {
                         crate::timeouts::AirDropTimeouts::from(active.opts.timeouts),
                     )?;
                     value["sending"] = serde_json::to_value(active.sending.borrow().clone())?;
+                    value["outgoing"] = serde_json::to_value(outgoing)?;
                     let phase = match &*active.phase.borrow() {
                         Phase::Starting => "starting",
                         Phase::Ready => "active",
@@ -944,7 +1001,7 @@ impl Daemon {
                     Ok(value)
                 } else {
                     Ok(
-                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"session":null,"awdl":{},"sending":[],"transfers":self.history.lock().await.clone(),"timeouts":crate::timeouts::AirDropTimeouts::from(self.opts.timeouts)}),
+                        serde_json::json!({"name":self.opts.name,"visibility":mode,"ble":{"listening":listening},"session":null,"awdl":{},"sending":[],"outgoing":outgoing,"transfers":self.history.lock().await.clone(),"timeouts":crate::timeouts::AirDropTimeouts::from(self.opts.timeouts)}),
                     )
                 }
             }
@@ -956,14 +1013,25 @@ impl Daemon {
                 Ok(serde_json::to_value(transfers)?)
             }
             Command::Cancel { id } => {
+                if let Some(progress) = self.outgoing.lock().await.get(&id) {
+                    ensure!(
+                        !crate::progress::terminal(&progress.state.borrow().state),
+                        "transfer has already ended"
+                    );
+                    progress.cancel.cancel();
+                    return Ok(serde_json::json!({"cancelled":id}));
+                }
                 let active = self
                     .active
                     .lock()
                     .await
                     .clone()
                     .context("no active session")?;
-                ensure!(active.id == id, "unknown session ID");
-                active.cancel.cancel();
+                if active.id == id {
+                    active.cancel.cancel();
+                } else {
+                    active.ready().await?.receiver.cancel(&id).await?;
+                }
                 Ok(serde_json::json!({"cancelled":id}))
             }
             Command::Stop => Ok(serde_json::json!({"stopping":true})),
@@ -1079,6 +1147,7 @@ pub async fn run(opts: Options) -> Result<()> {
         sessions: tokio_util::task::TaskTracker::new(),
         visibility: visibility::Control::new(crate::contact_book::default_path(&home)),
         ble,
+        outgoing: Arc::default(),
     };
     let bluetooth = if !opts.no_bluetooth && !opts.no_radio {
         Some(tokio::spawn({
@@ -1095,6 +1164,15 @@ pub async fn run(opts: Options) -> Result<()> {
         async move { daemon.serve_control(listener, uid).await }
     });
     let signal = tokio::spawn(signals(cancel.clone(), opts.duration));
+    #[cfg(feature = "tray")]
+    let notifications = tokio::spawn(notifications::run(daemon.clone()));
+    #[cfg(feature = "tray")]
+    let _tray = crate::tray::start(
+        &opts.name,
+        &opts.run_dir,
+        daemon.visibility.clone(),
+        cancel.clone(),
+    );
     tracing::info!(control=%socket_path.display(), "AirDrop control ready; radio and HTTPS inactive");
     let result = tokio::select! {
         _ = cancel.cancelled() => Ok(()),
@@ -1112,6 +1190,18 @@ pub async fn run(opts: Options) -> Result<()> {
         .and_then(|result| result);
     signal.abort();
     let _ = signal.await;
+    #[cfg(feature = "tray")]
+    {
+        // A missing or unresponsive notification server must not delay shutdown.
+        let mut notifications = notifications;
+        if tokio::time::timeout(Duration::from_secs(2), &mut notifications)
+            .await
+            .is_err()
+        {
+            notifications.abort();
+            let _ = notifications.await;
+        }
+    }
     let _ = std::fs::remove_file(&socket_path);
     result.and(cleanup)
 }
@@ -1150,6 +1240,7 @@ mod tests {
             sessions: tokio_util::task::TaskTracker::new(),
             visibility: visibility::Control::new(temp.path().join("contacts")),
             ble,
+            outgoing: Arc::default(),
         };
         assert!(
             daemon
@@ -1339,6 +1430,11 @@ mod tests {
         .unwrap();
         assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
         assert_eq!(active.sending.borrow().len(), 1);
+        let sending_status = daemon
+            .command(Command::Status, None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(sending_status["outgoing"][0]["state"], "pending");
         assert_eq!(active.activity.traffic().borrow().transfers, 0); // Pending approval stays on discovery.
         let incoming = Sender {
             name: "fixture".into(),
@@ -1378,6 +1474,13 @@ mod tests {
         assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
         send_cancel.cancel();
         assert!(send.await.unwrap().is_err());
+        assert_eq!(
+            daemon
+                .command(Command::Status, None, CancellationToken::new())
+                .await
+                .unwrap()["outgoing"][0]["state"],
+            "cancelled"
+        );
         assert!(active.sending.borrow().is_empty());
         assert!(!active.activity.closed());
         tokio::time::timeout(Duration::from_secs(10), active.stopped())

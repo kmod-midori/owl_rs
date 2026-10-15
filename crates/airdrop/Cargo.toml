@@ -9,6 +9,10 @@ license.workspace = true
 name = "airdropd"
 path = "src/airdropd.rs"
 
+[features]
+default = ["tray"]
+tray = ["dep:gtk", "dep:tray-icon", "dep:zbus"]
+
 [dependencies]
 anyhow.workspace = true
 bluer.workspace = true
@@ -19,6 +23,7 @@ cpio-archive.workspace = true
 flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
+gtk = { workspace = true, optional = true }
 hickory-proto.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
@@ -37,10 +42,12 @@ tokio-openssl.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tray-icon = { workspace = true, optional = true }
 uuid.workspace = true
 walkdir.workspace = true
 x509-cert.workspace = true
 owl-ipc.workspace = true
+zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

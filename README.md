@@ -7,7 +7,15 @@ sending to Contacts Only recipients is not implemented.
 ## Build
 
 Requires Rust 1.88+, Cargo, `just`, and libpcap, OpenSSL and D-Bus development
-libraries. The radio service requires `/dev/net/tun`, root and a supported Wi-Fi
+libraries. The default `tray` feature also requires GTK 3 development libraries
+and libayatana-appindicator (or libappindicator) at runtime. Build without the
+tray and its GUI dependencies with:
+
+```sh
+cargo build --workspace --release --locked --no-default-features
+```
+
+The radio service requires `/dev/net/tun`, root and a supported Wi-Fi
 adapter. AirDrop transport and the CLI run as your regular user. NetworkManager
 integration uses `nmcli`; Bluetooth wake-up uses BlueZ with LE advertising.
 
@@ -32,6 +40,19 @@ Start the user daemon in another terminal:
 ```sh
 just daemon --name 'Example Computer'
 ```
+
+The user daemon shows a tray icon with receiving-mode controls and a Quit action.
+Changes made with `catdrop discoverable` also appear in the tray. Receiving starts
+off; enabling it in the tray uses the same policy as the CLI. Quitting shuts down
+the user daemon and releases its radio session. Without a graphical display, the
+daemon continues without a tray icon. Your desktop needs AppIndicator support to
+display the icon.
+
+The default `tray` feature also enables desktop notifications: accept or decline
+incoming offers, follow sending/receiving progress, and cancel one transfer.
+The CLI controls remain available alongside notifications. Progress bars depend
+on desktop support; byte counts are shown when the incoming stream has no known
+total. Notifications are optional and do not block transfers if unavailable.
 
 Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 **Everyone for 10 Minutes**, then send as your regular user:

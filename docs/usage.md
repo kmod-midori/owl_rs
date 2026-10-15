@@ -50,6 +50,18 @@ just reject TRANSFER_ID
 Run `airdropd --auto-accept` to approve offers automatically after the receiving
 policy passes. There is no separate `receive` command or receive visibility flag.
 
+With the default `tray` Cargo feature, desktop notifications offer **Accept** and
+**Decline**, then show transfer progress and **Cancel**. These use the same
+approval state as the CLI: acting in either place resolves the offer once.
+Dismissing a notification leaves the transfer unchanged. `--auto-accept` still
+skips approval, and CLI commands work when desktop notifications are unavailable.
+
+Progress notifications update in place. Sending counts compressed archive bytes
+passed to HTTP and waits for the receiver's response before reporting completion.
+Receiving shows wire bytes and, when HTTP supplies a length, a percentage. Offered
+file sizes describe decoded data and are not used as a compressed-stream total.
+Desktops that support the `value` hint can show a progress bar; others show text.
+
 ## Runtime discoverability
 
 ```sh
@@ -173,13 +185,17 @@ control service's lifetime.
 just status
 just peers
 target/release/catdrop cancel SESSION_ID
+target/release/catdrop cancel TRANSFER_ID
 just stop
 ```
 
 `status` reports the session ID, radio state and transfer progress. `peers`
 browses AirDrop services and resolves names over HTTPS during any active session. It does not activate an idle radio. `cancel` ends the
-specified session; `stop` ends both the session and the daemon. Ctrl+C on a
+specified session or individual transfer; `stop` ends both the session and the daemon. Ctrl+C on a
 CLI send cancels that operation; other transfers can keep the shared session active.
+Incoming IDs are in `transfers[].offer.id`; outgoing IDs, states and byte counts
+are in `status.outgoing`. The existing `status.sending` list still contains active
+outgoing IDs. Cancelling a transfer leaves other sends and receives running.
 
 ## Timeouts
 

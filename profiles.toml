@@ -70,7 +70,7 @@ tested = true
 mode = "exclusive"
 mon_mac = "station"
 reconnect = false
-mt76_pm = true
+mt76_pm = false
 supports_tx_ldpc = true
 exclusive_backend = "active-monitor"
 

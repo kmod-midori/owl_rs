@@ -62,6 +62,20 @@ publication readiness, heartbeats, bounded framing and disconnect cleanup.
 The daemon lifecycle test belongs to the AirDrop crate and uses Cargo's binary
 path, so it runs without a previous build of the CLI.
 
+The optional desktop regression runs a fake notification server on a private
+D-Bus session and real loopback HTTPS transfers. It checks notification actions,
+CLI approval races, per-transfer cancellation, progress, dismissal and notification
+cleanup. Archive integrity and staging cleanup stay in the Rust transfer tests.
+It requires Python PyGObject/Gio and `dbus-run-session`, with no display or radio:
+
+```sh
+cargo build --workspace --locked
+dbus-run-session -- python3 crates/airdrop/tests/desktop_notifications.py
+```
+
+Also check `cargo check --workspace --all-targets --no-default-features --locked`
+when changing desktop integration, to preserve the headless build.
+
 ## AWDL diagnostics
 
 `owld awdl` shares the radio daemon's Tokio runtime and logging. Choose exactly one input:

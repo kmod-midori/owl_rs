@@ -20,6 +20,7 @@ etherparse = "0.19"
 flate2 = "1"
 fs2 = "0.4"
 futures-util = "0.3"
+gtk = "0.18"
 hickory-proto = { version = "0.25", default-features = false, features = ["mdns"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }
@@ -42,14 +43,16 @@ tokio-util = { version = "0.7", features = ["rt", "io", "codec"] }
 toml = "0.9"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 tun-rs = { version = "2", features = ["async_tokio"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 wl-nl80211 = "0.8"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 owl-ipc = { path = "crates/owl-ipc" }
-airdrop = { path = "crates/airdrop" }
+airdrop = { path = "crates/airdrop", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -135,7 +135,7 @@ enum Action {
         #[arg(long, default_value_os_t = service::default_run_dir())]
         run_dir: PathBuf,
     },
-    /// Cancel the active session ID shown by status.
+    /// Cancel a session or individual incoming/outgoing transfer ID shown by status.
     Cancel {
         id: String,
         #[arg(long, default_value_os_t = service::default_run_dir())]

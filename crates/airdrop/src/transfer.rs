@@ -152,6 +152,8 @@ pub struct Transfer {
     pub offer: Offer,
     pub state: String,
     pub bytes: u64,
+    /// Wire length, when provided by HTTP; offered sizes describe decoded files.
+    pub total_bytes: Option<u64>,
     pub output: Option<PathBuf>,
     pub error: Option<String>,
 }
@@ -159,6 +161,17 @@ struct Entry {
     created: tokio::time::Instant,
     transfer: Transfer,
     decision: Option<oneshot::Sender<bool>>,
+    cancel: CancellationToken,
+}
+impl Entry {
+    fn refresh_cancelled(&mut self) {
+        if self.cancel.is_cancelled() {
+            self.decision.take();
+            if !crate::progress::terminal(&self.transfer.state) {
+                self.transfer.state = "cancelled".into();
+            }
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Receiver {
@@ -217,7 +230,11 @@ impl Receiver {
         loop {
             let next = entries
                 .values_mut()
-                .filter(|entry| entry.transfer.state == "pending" && entry.decision.is_some())
+                .filter(|entry| {
+                    entry.transfer.state == "pending"
+                        && entry.decision.is_some()
+                        && !entry.cancel.is_cancelled()
+                })
                 .min_by_key(|entry| entry.created);
             let Some(entry) = next else {
                 return Ok(None);
@@ -232,20 +249,37 @@ impl Receiver {
         self.entries
             .lock()
             .await
-            .values()
-            .map(|e| e.transfer.clone())
+            .values_mut()
+            .map(|entry| {
+                entry.refresh_cancelled();
+                entry.transfer.clone()
+            })
             .collect()
     }
     pub async fn decide(&self, id: &str, accept: bool) -> Result<()> {
         let id = uuid::Uuid::parse_str(id)?.to_string().to_uppercase();
         let mut entries = self.entries.lock().await;
         let entry = entries.get_mut(&id).context("unknown transfer")?;
+        ensure!(!entry.cancel.is_cancelled(), "request expired");
         entry
             .decision
             .take()
             .context("transfer is not pending approval")?
             .send(accept)
             .map_err(|_| anyhow::anyhow!("request expired"))?;
+        Ok(())
+    }
+    pub async fn cancel(&self, id: &str) -> Result<()> {
+        let id = uuid::Uuid::parse_str(id)?.to_string().to_uppercase();
+        let mut entries = self.entries.lock().await;
+        let entry = entries.get_mut(&id).context("unknown transfer")?;
+        ensure!(
+            !crate::progress::terminal(&entry.transfer.state) && !entry.cancel.is_cancelled(),
+            "transfer has already ended"
+        );
+        entry.cancel.cancel();
+        entry.decision.take();
+        entry.transfer.state = "cancelled".into();
         Ok(())
     }
     async fn update(
@@ -258,7 +292,7 @@ impl Receiver {
     ) {
         if let Some(e) = self.entries.lock().await.get_mut(id) {
             e.transfer.state = state.into();
-            e.transfer.bytes = bytes;
+            e.transfer.bytes = e.transfer.bytes.max(bytes);
             e.transfer.output = out;
             e.transfer.error = error;
         }
@@ -373,12 +407,15 @@ impl Receiver {
             "incoming AirDrop TLS ready"
         );
         let peer = Arc::new(PeerCertificate::from_tls(stream.ssl()));
+        let connection_cancel = CancellationToken::new();
+        let _connection_guard = connection_cancel.clone().drop_guard();
         let session = Arc::new(Mutex::new(None::<Offer>));
         let receiver = self.clone();
         let refused = CancellationToken::new();
         let finished = CancellationToken::new();
         let refusal = refused.clone();
         let terminal = finished.clone();
+        let request_cancel = connection_cancel.clone();
         let service = service_fn(move |req: Request<Incoming>| {
             let receiver = receiver.clone();
             let session = session.clone();
@@ -386,6 +423,7 @@ impl Receiver {
             let peer = peer.clone();
             let refused = refusal.clone();
             let lifetime = lifetime.clone();
+            let connection_cancel = request_cancel.clone();
             async move {
                 if let Some(activity) = &receiver.activity {
                     let mut held = lifetime.lock().await;
@@ -405,7 +443,9 @@ impl Receiver {
                 let discovery = req.uri().path() == "/Discover";
                 let upload = req.uri().path() == "/Upload";
                 let ask = req.uri().path() == "/Ask";
-                let response = receiver.handle(req, session.clone(), peer).await;
+                let response = receiver
+                    .handle(req, session.clone(), peer, connection_cancel)
+                    .await;
                 // A completed discovery reply needs no idle keep-alive lease.
                 // Approved offers retain theirs across /Ask -> /Upload and
                 // through the final connection drain and TCP linger.
@@ -435,6 +475,7 @@ impl Receiver {
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         tokio::pin!(connection);
         tokio::select! {
+            _ = connection_cancel.cancelled() => return Ok(false),
             result = &mut connection => result?,
             _ = refused.cancelled() => {
                 // Finish the refusal response, then close without waiting for
@@ -458,6 +499,7 @@ impl Receiver {
         req: Request<Incoming>,
         session: Arc<Mutex<Option<Offer>>>,
         peer: Arc<PeerCertificate>,
+        connection_cancel: CancellationToken,
     ) -> Response<Body> {
         let endpoint = match req.uri().path() {
             "/Discover" => "Discover",
@@ -466,7 +508,7 @@ impl Receiver {
             _ => "unknown",
         };
         let started = tokio::time::Instant::now();
-        let reply = match self.route(req, session, &peer).await {
+        let reply = match self.route(req, session, &peer, connection_cancel).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("AirDrop request rejected: {e:#}");
@@ -487,6 +529,7 @@ impl Receiver {
         req: Request<Incoming>,
         session: Arc<Mutex<Option<Offer>>>,
         peer: &PeerCertificate,
+        connection_cancel: CancellationToken,
     ) -> Result<Response<Body>> {
         ensure!(req.method() == hyper::Method::POST, "only POST is accepted");
         match req.uri().path() {
@@ -507,7 +550,11 @@ impl Receiver {
                 Ok(response(StatusCode::OK, self.discover()?))
             }
             "/Ask" => {
-                *session.lock().await = None;
+                // A replacement offer on this connection invalidates its old
+                // approval and controls before a new transfer can start.
+                if let Some(previous) = session.lock().await.take() {
+                    self.update(&previous.id, "cancelled", 0, None, None).await;
+                }
                 let value = metadata(req.into_body(), self.timeouts.metadata_idle).await?;
                 let policy = self.policy.borrow().clone();
                 if policy.mode == Visibility::Off {
@@ -530,18 +577,20 @@ impl Receiver {
                     .context("size overflow")?;
                 ensure!(bytes <= self.limit, "offered files exceed size limit");
                 let (tx, rx) = oneshot::channel();
+                let cancel = connection_cancel.clone();
                 {
                     let mut entries = self.entries.lock().await;
                     ensure!(!entries.contains_key(&offer.id), "duplicate transfer ID");
                     if entries.len() >= 256 {
+                        // A dropped HTTP future cannot update its entry. Reconcile
+                        // disconnected offers before reclaiming terminal history.
+                        for entry in entries.values_mut() {
+                            entry.refresh_cancelled();
+                        }
                         let key = entries
                             .iter()
                             .find(|(_, e)| {
-                                e.decision.is_none()
-                                    && matches!(
-                                        e.transfer.state.as_str(),
-                                        "completed" | "failed" | "rejected"
-                                    )
+                                e.decision.is_none() && crate::progress::terminal(&e.transfer.state)
                             })
                             .map(|(k, _)| k.clone())
                             .context("too many transfers")?;
@@ -555,10 +604,12 @@ impl Receiver {
                                 offer: offer.clone(),
                                 state: "pending".into(),
                                 bytes: 0,
+                                total_bytes: None,
                                 output: None,
                                 error: None,
                             },
                             decision: Some(tx),
+                            cancel: cancel.clone(),
                         },
                     );
                 }
@@ -571,25 +622,43 @@ impl Receiver {
                     tokio::select! {
                         result = tokio::time::timeout(self.timeouts.approval, rx) => result.ok().and_then(Result::ok).unwrap_or(false),
                         _ = visibility::changed(&mut changes) => false,
+                        _ = cancel.cancelled() => false,
                     }
                 };
                 if let Some(e) = self.entries.lock().await.get_mut(&offer.id) {
                     e.decision.take();
                 }
-                if !accepted || self.policy.borrow().revision != policy.revision {
-                    self.update(&offer.id, "rejected", 0, None, None).await;
+                if !accepted
+                    || cancel.is_cancelled()
+                    || self.policy.borrow().revision != policy.revision
+                {
+                    self.update(
+                        &offer.id,
+                        if cancel.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "rejected"
+                        },
+                        0,
+                        None,
+                        None,
+                    )
+                    .await;
                     return Ok(response(StatusCode::FORBIDDEN, vec![]));
                 }
                 if !offer.urls.is_empty() {
+                    let mut entries = self.entries.lock().await;
+                    let entry = entries.get_mut(&offer.id).context("unknown transfer")?;
+                    ensure!(!cancel.is_cancelled(), "transfer cancelled");
                     let result = self.save_urls(&offer);
                     match result {
                         Ok(out) => {
-                            self.update(&offer.id, "completed", 0, Some(out), None)
-                                .await;
+                            entry.transfer.state = "completed".into();
+                            entry.transfer.output = Some(out);
                         }
                         Err(e) => {
-                            self.update(&offer.id, "failed", 0, None, Some(e.to_string()))
-                                .await;
+                            entry.transfer.state = "failed".into();
+                            entry.transfer.error = Some(e.to_string());
                             return Err(e);
                         }
                     }
@@ -611,15 +680,25 @@ impl Receiver {
                     return Ok(response(StatusCode::FORBIDDEN, vec![]));
                 };
                 let offer = &offer;
-                let result =
+                let cancel = self
+                    .entries
+                    .lock()
+                    .await
+                    .get(&offer.id)
+                    .context("unknown transfer")?
+                    .cancel
+                    .clone();
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(anyhow::anyhow!("transfer cancelled")),
+                    result =
                     tokio::time::timeout(self.timeouts.upload_total, self.upload(req, offer))
-                        .await
+                        => result
                         .context("incoming upload timed out")
-                        .and_then(|r| r);
+                        .and_then(|r| r),
+                };
                 match result {
-                    Ok((bytes, out, incomplete_http)) => {
-                        self.update(&offer.id, "completed", bytes, Some(out), None)
-                            .await;
+                    Ok((bytes, incomplete_http)) => {
                         tracing::info!(id=%offer.id, bytes, http_complete=!incomplete_http,
                             "AirDrop upload committed");
                         // Finish the upload's TLS session with the empty HTTP reply.
@@ -633,8 +712,18 @@ impl Receiver {
                         Ok(reply)
                     }
                     Err(e) => {
-                        self.update(&offer.id, "failed", 0, None, Some(e.to_string()))
-                            .await;
+                        self.update(
+                            &offer.id,
+                            if cancel.is_cancelled() {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            },
+                            0,
+                            None,
+                            Some(e.to_string()),
+                        )
+                        .await;
                         Err(e)
                     }
                 }
@@ -656,7 +745,7 @@ impl Receiver {
         std::fs::rename(stage.path(), &out)?;
         Ok(out)
     }
-    async fn upload(&self, req: Request<Incoming>, offer: &Offer) -> Result<(u64, PathBuf, bool)> {
+    async fn upload(&self, req: Request<Incoming>, offer: &Offer) -> Result<(u64, bool)> {
         let id = req
             .headers()
             .get("TransferID")
@@ -709,6 +798,13 @@ impl Receiver {
             )
         });
         let mut chunks = Some(chunks);
+        if let Some(entry) = self.entries.lock().await.get_mut(&offer.id) {
+            entry.transfer.total_bytes = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok());
+        }
         let mut body = req.into_body();
         let mut bytes = 0u64;
         self.update(&offer.id, "receiving", 0, None, None).await;
@@ -730,9 +826,18 @@ impl Receiver {
                 }
             }
         };
+        // Serialize the publication boundary with cancellation: once the final
+        // directory exists, cancellation must report that this transfer ended.
+        let mut entries = self.entries.lock().await;
+        let entry = entries.get_mut(&offer.id).context("unknown transfer")?;
+        ensure!(!entry.cancel.is_cancelled(), "transfer cancelled");
         let out = validated.commit()?;
+        entry.transfer.state = "completed".into();
+        entry.transfer.bytes = bytes;
+        entry.transfer.output = Some(out);
+        drop(entries);
         tracing::info!(id=%offer.id, bytes, "validated complete archive while receiving");
-        Ok((bytes, out, chunks.is_some()))
+        Ok((bytes, chunks.is_some()))
     }
 }
 // Bounded adapter between asynchronous HTTP input and the blocking archive
@@ -767,6 +872,11 @@ pub struct Sender {
     pub identity: Identity,
     pub tag: Option<[u8; 3]>,
     pub timeouts: Timeouts,
+}
+#[derive(Default)]
+pub(crate) struct SendContext<'a> {
+    pub activity: Option<&'a Arc<crate::session::Activity>>,
+    pub progress: Option<crate::progress::Progress>,
 }
 struct Connection {
     sender: hyper::client::conn::http1::SendRequest<Body>,
@@ -867,19 +977,22 @@ impl Sender {
         file: Option<PathBuf>,
         icon: Option<Vec<u8>>,
     ) -> Result<String> {
-        self.send_with_activity(address, items, urls, file, icon, None)
+        self.send_with_context(address, items, urls, file, icon, SendContext::default())
             .await
     }
-    pub(crate) async fn send_with_activity(
+    pub(crate) async fn send_with_context(
         &self,
         address: SocketAddrV6,
         items: Vec<Item>,
         urls: Vec<String>,
         file: Option<PathBuf>,
         icon: Option<Vec<u8>>,
-        activity: Option<&Arc<crate::session::Activity>>,
+        context: SendContext<'_>,
     ) -> Result<String> {
         let receiver = self.discover(address).await?;
+        if let Some(progress) = &context.progress {
+            progress.update("pending", 0, None);
+        }
         tracing::info!(%receiver,%address,"requesting AirDrop transfer");
         let id = uuid::Uuid::new_v4().to_string().to_uppercase();
         let links = !urls.is_empty();
@@ -944,7 +1057,7 @@ impl Sender {
             .await
             .context("read Ask response")?;
         if !links {
-            let mut exchange = activity.map(|a| a.acquire()).transpose()?;
+            let mut exchange = context.activity.map(|a| a.acquire()).transpose()?;
             if let Some(lease) = &mut exchange {
                 let started = tokio::time::Instant::now();
                 lease.channel_ready().await?;
@@ -956,9 +1069,20 @@ impl Sender {
             let file = file.context("file transfer has no archive")?;
             let input = tokio::fs::File::open(file).await?;
             let wire_bytes = input.metadata().await?.len();
+            if let Some(progress) = &context.progress {
+                progress.update("sending", 0, Some(wire_bytes));
+            }
             tracing::info!(%id,wire_bytes,"uploading AirDrop archive");
-            let stream = tokio_util::io::ReaderStream::new(input)
-                .map(|data| data.map(Frame::data).map_err(|e| Box::new(e) as Error));
+            let mut sent = 0u64;
+            let stream = tokio_util::io::ReaderStream::new(input).map(move |data| {
+                if let Ok(data) = &data {
+                    sent += data.len() as u64;
+                    if let Some(progress) = &context.progress {
+                        progress.update("sending", sent, Some(wire_bytes));
+                    }
+                }
+                data.map(Frame::data).map_err(|e| Box::new(e) as Error)
+            });
             let body = StreamBody::new(stream).boxed_unsync();
             let bytes = items
                 .iter()
@@ -1079,10 +1203,12 @@ mod tests {
                         },
                         state: "pending".into(),
                         bytes: 0,
+                        total_bytes: None,
                         output: None,
                         error: None,
                     },
                     decision: Some(tx),
+                    cancel: CancellationToken::new(),
                 },
             );
         }
@@ -1092,6 +1218,30 @@ mod tests {
         assert_eq!(receiver.accept_next().await.unwrap(), Some(newer));
         assert!(decisions.remove(0).await.unwrap());
         assert_eq!(receiver.accept_next().await.unwrap(), None);
+        receiver
+            .entries
+            .lock()
+            .await
+            .get(&expired)
+            .unwrap()
+            .cancel
+            .cancel();
+        assert_eq!(
+            receiver
+                .transfers()
+                .await
+                .into_iter()
+                .find(|t| t.offer.id == expired)
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        let entries = receiver.entries.lock().await;
+        let entry = entries.get(&expired).unwrap();
+        assert_eq!(entry.transfer.state, "cancelled");
+        assert!(entry.decision.is_none()); // Disconnected offers can be evicted.
+        drop(entries);
+
         assert!(!dir.path().join("output").exists());
     }
 }
