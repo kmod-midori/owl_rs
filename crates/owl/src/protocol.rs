@@ -128,12 +128,30 @@ pub struct TxStatus {
 pub struct AddBaRequest {
     pub dialog_token: u8,
     pub parameters: u16,
+    pub timeout: u16,
+    /// Sequence control, including fragment bits (which must be zero).
+    pub starting_sequence: u16,
+}
+impl AddBaRequest {
+    pub fn tid(self) -> u8 {
+        ((self.parameters >> 2) & 15) as u8
+    }
+    pub fn window(self) -> u16 {
+        let requested = self.parameters >> 6;
+        if requested == 0 {
+            64
+        } else {
+            requested.min(64)
+        }
+    }
 }
 #[derive(Debug)]
 pub enum Body {
     TxStatus(TxStatus),
     Action(Action),
     AddBaRequest(AddBaRequest),
+    Bar { tid: u8, sequence: u16 },
+    DelBa { tid: u8, initiator: bool },
     Data(Vec<Vec<u8>>),
 }
 #[derive(Debug)]
@@ -170,8 +188,36 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
     let mut r = Reader::new(data);
     let fc = r.le16()?;
     if fc & 0x000c == 4 {
-        return Ok(None);
-    } // Control frames do not have three addresses.
+        if fc & 0x00ff != 0x84 || fc & 0x4300 != 0 {
+            return Ok(None);
+        }
+        r.take(2)?;
+        let destination = r.mac()?;
+        let source = r.mac()?;
+        let control = r.le16()?;
+        let sequence = r.le16()?;
+        // Single-TID basic/compressed BAR: 16-byte header and four-byte body.
+        if control & 0x0ffa != 0 || sequence & 15 != 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Frame {
+            source,
+            destination,
+            sequence: sequence >> 4,
+            tid: Some((control >> 12) as u8),
+            retry: fc & 0x800 != 0,
+            amsdu: false,
+            body_bytes: 4,
+            ampdu: false,
+            ampdu_last: false,
+            rssi: radio.antenna_signal.map(|s| s.value),
+            frequency: radio.channel.map(|c| c.freq),
+            body: Body::Bar {
+                tid: (control >> 12) as u8,
+                sequence: sequence >> 4,
+            },
+        }));
+    }
     if fc & 0x4303 != 0 || fc & 0x0400 != 0 {
         return Ok(None);
     } // Version, DS, protected, fragmented.
@@ -224,9 +270,19 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
                 let request = AddBaRequest {
                     dialog_token: r.u8()?,
                     parameters: r.le16()?,
+                    timeout: r.le16()?,
+                    starting_sequence: r.le16()?,
                 };
-                r.take(4)?; // Timeout and starting sequence control must be present.
                 Body::AddBaRequest(request)
+            }
+            0xd0 if r.rest().starts_with(&[3, 2]) => {
+                r.take(2)?;
+                let parameters = r.le16()?;
+                r.take(2)?; // Reason code.
+                Body::DelBa {
+                    tid: (parameters >> 12) as u8,
+                    initiator: parameters & 0x800 != 0,
+                }
             }
             0xd0 => match parse_action(r.rest())? {
                 Some(a) => Body::Action(a),
@@ -597,19 +653,27 @@ pub struct Advertisement<'a> {
     pub now_us: i64,
 }
 
-/// Decline RX Block Ack negotiation; no BA/reorder state is established.
-pub fn encode_addba_rejection(
+/// Respond with immediate BA, no A-MSDU-in-A-MPDU, and no inactivity timeout.
+pub fn encode_addba_response(
     source: Mac,
     destination: Mac,
     request: AddBaRequest,
     sequence: u16,
     noack: bool,
+    accept: bool,
 ) -> Vec<u8> {
     let mut out = radiotap_tx(Rate::DISCOVERY.into(), noack, false).expect("valid management rate");
     header(&mut out, source, destination, sequence, 0xd0);
     out.extend_from_slice(&[3, 1, request.dialog_token]);
-    le16(&mut out, 37); // WLAN_STATUS_REQUEST_DECLINED.
-    le16(&mut out, request.parameters & 0x003e); // Echo TID/policy; no A-MSDU or buffer agreement.
+    le16(&mut out, if accept { 0 } else { 37 }); // WLAN_STATUS_REQUEST_DECLINED.
+    le16(
+        &mut out,
+        if accept {
+            (request.parameters & 0x003c) | 2 | (request.window() << 6)
+        } else {
+            request.parameters & 0x003e
+        },
+    );
     le16(&mut out, 0);
     out
 }

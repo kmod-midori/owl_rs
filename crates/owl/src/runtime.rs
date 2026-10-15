@@ -87,7 +87,7 @@ async fn neighbor_worker(net: Netlink, host: String, mut rx: mpsc::Receiver<Even
         let (mac, add) = match event {
             Event::Added(mac) => (mac, true),
             Event::Removed(mac) => (mac, false),
-            Event::AddBaRequest { .. } => continue,
+            Event::AddBaRequest { .. } | Event::DelBa { .. } => continue,
         };
         let result = net.neighbor(&host, mac, add).await;
         if let Err(e) = result {
@@ -316,6 +316,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                 _ = clean.tick() => {
                     let now = elapsed_us(start);
                     for event in engine.tick(now) {
+                        if let Event::Removed(peer) = &event { queue.cancel_ba(*peer, None); }
                         if tap.is_some() {
                             neigh_tx.send(event).await.context("neighbor task stopped")?;
                         }
@@ -344,9 +345,10 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                                 match event {
                                     Event::AddBaRequest { peer, request } => {
                                         if !opts.listen_only && draining.is_none() {
-                                            queue.reject_addba(&mut engine, peer, request, elapsed_us(start));
+                                            queue.respond_addba(&mut engine, peer, request, elapsed_us(start));
                                         }
                                     }
+                                    Event::DelBa { peer, tid } => queue.cancel_ba(peer, Some(tid)),
                                     event => if tap.is_some() {
                                         neigh_tx.send(event).await.context("neighbor task stopped")?;
                                     },
@@ -378,6 +380,13 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                 },
                 _ = scheduler.tick() => {
                     let now = elapsed_us(start);
+                    let released = engine.reorder.poll(now);
+                    if let Some(tap) = &tap {
+                        for frame in released {
+                            if tcp_frame(&frame) { last_tcp = Some(now); }
+                            send_tap(tap, &frame).await.context("deliver reordered AWDL frame")?;
+                        }
+                    }
                     // HTTP/TLS shutdown only writes into the kernel/TAP. Keep AWDL
                     // alive until queued replies, FINs and discovery goodbyes have
                     // been injected, with a quiet interval for their ACKs. A lost
@@ -386,6 +395,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                         && (now - since >= opts.timeouts.radio_drain.as_micros() as i64
                             || (queue.is_idle(now, opts.timeouts.radio_quiet.as_micros() as i64)
                                 && !engine.has_pending_tx(now)
+                                && !engine.reorder.pending()
                                 && now - since >= opts.timeouts.radio_quiet.as_micros() as i64
                                 && now - last_traffic >= opts.timeouts.radio_quiet.as_micros() as i64)) {
                         break;
@@ -661,6 +671,8 @@ fn log_stats(engine: &Engine) {
         info!(
             received = s.rx_addba_requests,
             rejected = s.tx_addba_rejections,
+            accepted = s.tx_addba_acceptances,
+            reorder = ?engine.reorder.stats,
             "ADDBA negotiation"
         );
     }

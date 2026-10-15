@@ -93,6 +93,9 @@ pub struct Profile {
     /// Driver workaround: transmit without hardware ACK waiting or TX feedback.
     #[serde(default)]
     pub tx_noack: bool,
+    /// Experimental: hardware must generate Block Ack in active monitor mode.
+    #[serde(default)]
+    pub rx_ampdu: bool,
     pub exclusive_backend: Backend,
 }
 #[derive(Deserialize)]
@@ -122,7 +125,18 @@ impl Profile {
         {
             bail!("active-monitor requires mon_mac=station");
         }
+        profile.validate_rx_ampdu()?;
         Ok(profile)
+    }
+    fn validate_rx_ampdu(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.rx_ampdu
+                || (self.mode == Mode::Exclusive
+                    && self.exclusive_backend == Backend::ActiveMonitor
+                    && self.mon_mac == MonMac::Station),
+            "rx_ampdu requires exclusive active-monitor with mon_mac=station and hardware Block Ack support"
+        );
+        Ok(())
     }
 }
 pub(crate) async fn nmcli(timeout: Duration, args: &[&str]) -> Result<String> {
@@ -228,6 +242,7 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     let ap_channel = linked.and_then(channel);
     let caps = net.phy_capabilities(iface.phy).await?;
     let allowed: Vec<_> = caps.frequencies.into_iter().filter_map(channel).collect();
+    profile.validate_rx_ampdu()?;
     let order = if profile.exclusive_backend == Backend::ActiveMonitor {
         [6, 44, 149]
     } else {

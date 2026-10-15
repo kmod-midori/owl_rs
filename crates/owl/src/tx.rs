@@ -222,7 +222,7 @@ struct ManagementFrame {
     peer: Mac,
     request: protocol::AddBaRequest,
     queued_us: i64,
-    bytes: Vec<u8>,
+    sequence: u16,
 }
 pub(crate) struct Queue {
     frames: VecDeque<Frame>,
@@ -284,7 +284,7 @@ impl Queue {
             ack,
         }));
     }
-    pub fn reject_addba(
+    pub fn respond_addba(
         &mut self,
         engine: &mut Engine,
         peer: Mac,
@@ -300,6 +300,7 @@ impl Queue {
         {
             return;
         }
+        self.cancel_ba(peer, Some(request.tid()));
         if self.management.len() == QUEUE_LIMIT {
             engine.stats.dropped += 1;
             return;
@@ -308,8 +309,12 @@ impl Queue {
             peer,
             request,
             queued_us: now,
-            bytes: engine.addba_rejection(peer, request),
+            sequence: engine.next_sequence(),
         });
+    }
+    pub fn cancel_ba(&mut self, peer: Mac, tid: Option<u8>) {
+        self.management
+            .retain(|f| f.peer != peer || tid.is_some_and(|tid| f.request.tid() != tid));
     }
     fn split(&mut self, index: usize, frame: Frame) {
         for packet in frame.packets.into_iter().rev() {
@@ -337,11 +342,21 @@ impl Queue {
                 engine.stats.dropped += 1;
                 continue;
             }
+            let accept =
+                engine.config.rx_ampdu && engine.reorder.can_start(frame.peer, frame.request);
+            let bytes = protocol::encode_addba_response(
+                engine.config.mac,
+                frame.peer,
+                frame.request,
+                frame.sequence,
+                engine.config.tx_noack,
+                accept,
+            );
             let outstanding = self.reserved_until_us.saturating_sub(time).max(0);
             if channel != engine.current_channel(time)
                 || !fits_window(
                     Rate::DISCOVERY,
-                    frame.bytes.len(),
+                    bytes.len(),
                     engine
                         .tx_window_us(frame.peer, time)
                         .saturating_sub(outstanding),
@@ -350,16 +365,22 @@ impl Queue {
                 self.management.push_back(frame);
                 continue;
             }
-            match inject(&frame.bytes) {
+            match inject(&bytes) {
                 Ok(()) => {
-                    self.reserved_until_us = self.reserved_until_us.max(time).saturating_add(
-                        airtime_us(Rate::DISCOVERY, frame.bytes.len()).unwrap_or(0),
-                    );
-                    engine.stats.tx_addba_rejections += 1;
+                    self.reserved_until_us = self
+                        .reserved_until_us
+                        .max(time)
+                        .saturating_add(airtime_us(Rate::DISCOVERY, bytes.len()).unwrap_or(0));
+                    if accept {
+                        engine.reorder.start(frame.peer, frame.request);
+                        engine.stats.tx_addba_acceptances += 1;
+                    } else {
+                        engine.stats.tx_addba_rejections += 1;
+                    }
                     report.last_sent_us = Some(time);
                     debug!(peer=%frame.peer, dialog_token=frame.request.dialog_token,
-                        tid=(frame.request.parameters >> 2) & 15, status=37, channel,
-                        "ADDBA rejection submitted");
+                        tid=(frame.request.parameters >> 2) & 15, accepted=accept, channel,
+                        "ADDBA response submitted");
                 }
                 Err(InjectionError::Backpressure) => {
                     engine.stats.tx_backpressure += 1;
@@ -626,6 +647,7 @@ mod tests {
                 strategy: Strategy::Pin,
                 fixed_radio: true,
                 tx_noack: false,
+                rx_ampdu: false,
                 metric_first: true,
                 election_metric: 60,
                 election_counter: 0,
@@ -834,6 +856,8 @@ mod tests {
         let request = protocol::AddBaRequest {
             dialog_token: 7,
             parameters: 0x1017,
+            timeout: 0,
+            starting_sequence: 0,
         };
         let mut raw = protocol::radiotap_tx(Rate::DISCOVERY.into(), false, false).unwrap();
         raw.extend_from_slice(&[0xd0, 0, 0, 0]);
@@ -855,8 +879,8 @@ mod tests {
         foreign[offset + 4..offset + 10].copy_from_slice(&protocol::BROADCAST.0);
         assert!(engine.receive(&foreign, 10_000).unwrap().1.is_empty());
         let mut queue = Queue::default();
-        queue.reject_addba(&mut engine, PEER, request, 10_000);
-        queue.reject_addba(&mut engine, PEER, request, 10_000);
+        queue.respond_addba(&mut engine, PEER, request, 10_000);
+        queue.respond_addba(&mut engine, PEER, request, 10_000);
         assert_eq!(queue.management.len(), 1);
         let mut submitted = Vec::new();
         queue
@@ -897,7 +921,7 @@ mod tests {
         assert_eq!(&body[24..], &[3, 1, 7, 37, 0, 0x16, 0, 0, 0]);
         assert!(queue.is_empty());
         assert_eq!(engine.stats.tx_addba_rejections, 1);
-        queue.reject_addba(&mut engine, PEER, request, 20_000);
+        queue.respond_addba(&mut engine, PEER, request, 20_000);
         queue
             .flush(
                 &mut engine,
@@ -909,6 +933,118 @@ mod tests {
             .unwrap();
         assert!(queue.is_empty());
         assert_eq!(engine.stats.tx_addba_rejections, 1);
+    }
+    #[test]
+    fn addba_acceptance_reordering_bar_and_delba_lifecycle() {
+        let mut engine = engine();
+        engine.config.rx_ampdu = true;
+        let mut queue = Queue::default();
+        let request = protocol::AddBaRequest {
+            dialog_token: 9,
+            parameters: 2 | (4 << 6),
+            timeout: 100,
+            starting_sequence: 10 << 4,
+        };
+        queue.respond_addba(&mut engine, PEER, request, 10_000);
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || 10_000,
+                |_| Err::<(), _>(InjectionError::<TestError>::Backpressure),
+            )
+            .unwrap();
+        assert!(!engine.reorder.contains(PEER, 0));
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || 11_000,
+                |bytes| {
+                    let (_, body) = radiotap::Radiotap::parse(bytes).unwrap();
+                    assert_eq!(&body[24..], &[3, 1, 9, 0, 0, 2, 1, 0, 0]);
+                    Ok::<(), InjectionError<TestError>>(())
+                },
+            )
+            .unwrap();
+        assert!(engine.reorder.contains(PEER, 0));
+        assert_eq!(engine.stats.tx_addba_acceptances, 1);
+        let data = |seq| {
+            let mut ethernet = packet(OWN, seq as u8);
+            ethernet[6..12].copy_from_slice(&PEER.0);
+            let mut bytes =
+                protocol::encode_data(&ethernet, seq, 0, Rate::DISCOVERY.into(), false, false)
+                    .unwrap();
+            let offset = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+            bytes[offset] = 0x88;
+            bytes.splice(offset + 24..offset + 24, [0, 0]); // QoS TID 0.
+            bytes
+        };
+        assert!(engine.receive(&data(11), 12_000).unwrap().0.is_empty());
+        assert!(engine.receive(&data(11), 12_001).unwrap().0.is_empty()); // No Retry bit required.
+        assert_eq!(engine.receive(&data(10), 12_002).unwrap().0.len(), 2);
+        assert!(engine.receive(&data(10), 12_003).unwrap().0.is_empty());
+        assert!(engine.receive(&data(14), 12_004).unwrap().0.is_empty());
+        let mut bar = vec![0, 0, 8, 0, 0, 0, 0, 0, 0x84, 0, 0, 0];
+        bar.extend_from_slice(&OWN.0);
+        bar.extend_from_slice(&PEER.0);
+        bar.extend_from_slice(&[4, 0, 14 << 4, 0]);
+        assert_eq!(bar.len(), 28); // Eight bytes radiotap + twenty bytes BAR.
+        for n in 0..bar.len() {
+            assert!(!matches!(protocol::parse(&bar[..n]), Ok(Some(_))));
+        }
+        let mut multi = bar.clone();
+        multi[24] |= 2;
+        assert!(protocol::parse(&multi).unwrap().is_none());
+        let mut fcs = vec![0, 0, 9, 0, 2, 0, 0, 0, 0x10];
+        fcs.extend_from_slice(&bar[8..]);
+        fcs.extend_from_slice(&[0; 4]);
+        assert!(matches!(
+            protocol::parse(&fcs).unwrap().unwrap().body,
+            Body::Bar { sequence: 14, .. }
+        ));
+        fcs[8] |= 0x40;
+        assert!(protocol::parse(&fcs).unwrap().is_none());
+        let mut foreign = bar.clone();
+        foreign[12] ^= 2;
+        assert!(engine.receive(&foreign, 12_005).unwrap().0.is_empty());
+        assert_eq!(engine.receive(&bar, 12_006).unwrap().0.len(), 1);
+        assert!(engine.receive(&data(16), 12_007).unwrap().0.is_empty());
+        let mut delba = vec![0, 0, 8, 0, 0, 0, 0, 0, 0xd0, 0, 0, 0];
+        delba.extend_from_slice(&OWN.0);
+        delba.extend_from_slice(&PEER.0);
+        delba.extend_from_slice(&protocol::BSSID.0);
+        delba.extend_from_slice(&[0, 0, 3, 2, 0, 0, 1, 0]);
+        assert!(engine.receive(&delba, 12_008).unwrap().1.is_empty()); // Recipient DELBA is for TX.
+        assert!(engine.reorder.contains(PEER, 0));
+        queue.respond_addba(&mut engine, PEER, request, 12_009);
+        delba[35] = 8; // Sender/originator DELBA for our RX agreement.
+        let (frames, events) = engine.receive(&delba, 12_010).unwrap();
+        assert_eq!(frames.len(), 1);
+        let [crate::engine::Event::DelBa { peer, tid }] = events.as_slice() else {
+            panic!("DELBA event");
+        };
+        queue.cancel_ba(*peer, Some(*tid));
+        assert!(queue.is_empty());
+        assert!(!engine.reorder.contains(PEER, 0));
+        assert_eq!(engine.reorder.stats.duplicate_mpdus, 1);
+        assert_eq!(engine.reorder.stats.old_mpdus, 1);
+        // Renegotiation releases the old window before newly received data,
+        // even if capture wins the select before the scheduler polls.
+        engine.reorder.start(PEER, request);
+        assert!(engine.receive(&data(11), 13_000).unwrap().0.is_empty());
+        let replacement = protocol::AddBaRequest {
+            dialog_token: 10,
+            starting_sequence: 20 << 4,
+            ..request
+        };
+        engine.reorder.start(PEER, replacement);
+        let frames = engine.receive(&data(20), 13_001).unwrap().0;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].last(), Some(&11));
+        assert_eq!(frames[1].last(), Some(&20));
     }
     #[test]
     fn ack_timing_keeps_identity_and_counts_members_once_across_retries() {

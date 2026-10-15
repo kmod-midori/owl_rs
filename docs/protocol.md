@@ -391,13 +391,37 @@ FCS presence and radiotap padding are handled explicitly.
 
 ### Block Ack negotiation
 
-`owld` declines IEEE 802.11 ADDBA requests addressed to its MAC by validated AWDL
-peers. It echoes the dialog token, TID and policy with status 37 (Request declined),
-without establishing an RX Block Ack window. Responses use the management rate
-and the configured unicast ACK policy. They stay in a bounded MAC management
-queue, share airtime/slot gating with data, and retain their sequence across
-injection backpressure. The existing queued-packet timeout expires stale replies.
-Listen-only diagnostics never respond. No management frame enters TAP or AirDrop.
+By default, `owld` declines IEEE 802.11 ADDBA requests addressed to its MAC by
+validated AWDL peers with status 37. The experimental profile option
+`rx_ampdu = true` enables acceptance on exclusive active-monitor backends with
+`mon_mac = "station"`. It requires hardware/firmware that generates Block Ack
+responses in this mode; userspace does not send these time-critical replies.
+
+Acceptance negotiates immediate Block Ack, a window of at most 64 MPDUs,
+no A-MSDU-in-A-MPDU, and an inactivity timeout of zero (disabled). There are at
+most eight peer/TID agreements; a full table declines new agreements without
+evicting existing ones. A response uses the management rate and configured
+unicast ACK policy, shares data airtime/slot gating, and preserves its sequence
+across injection backpressure. The session starts only after successful
+submission. Repeated identical requests do not rewind it. The existing
+queued-packet timeout expires stale responses. Listen-only diagnostics never
+respond or establish agreements.
+
+Accepted sessions deliver each decoded MPDU as a unit in 12-bit sequence order,
+independently for each peer/TID. Old and duplicate MPDUs are discarded even
+without a Retry bit. Frames ahead of the window advance it; a 100 ms gap timeout
+releases held data without waiting indefinitely. The runtime polls independently
+of channel tuning. Single-TID basic/compressed BARs advance the receive window;
+multi-TID BARs are unsupported. Sender-initiated DELBA flushes and removes the
+receive agreement and cancels queued responses; recipient-initiated DELBA does
+not affect it. Peer expiry drops held data and pending responses. Shutdown waits
+for buffered data within the existing radio drain budget.
+
+Status includes `rx_reorder` counters for started sessions, buffered, duplicate
+and old MPDUs, skipped sequences, gap timeouts and BARs. Acceptance/rejection
+counts appear in `stats`. These describe local processing, not proof that hardware
+sent a Block Ack or that the peer received our response. Offline replay does not
+establish agreements because it cannot send acceptance responses.
 
 `rx_addba_requests` and `tx_addba_rejections` report received requests and responses
 successfully submitted to the driver; submission does not prove on-air delivery.
@@ -459,10 +483,10 @@ individually. Other permanent injection errors remain fatal.
 
 `tx_data` counts submitted Wi-Fi data frames, `tx_packets` counts their Ethernet
 packets, and `tx_amsdu`/`tx_aggregated_packets` describe batching.
-`tx_aggregation_rejected` counts driver size rejections. A-MPDU aggregation and
-Block ACK session management require kernel support. The current monitor path
-has no kernel peer records or BA sessions and cannot enable A-MPDU through
-radiotap alone.
+`tx_aggregation_rejected` counts driver size rejections. Transmit A-MPDU remains
+unsupported: the monitor path does not create kernel TX BA sessions or aggregate
+MPDUs through radiotap. Experimental receive Block Ack acceptance is separate,
+as described above.
 
 ### Receive aggregation measurements
 

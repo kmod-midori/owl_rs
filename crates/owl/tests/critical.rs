@@ -17,6 +17,7 @@ fn config(mac: Mac) -> Config {
         strategy: Strategy::Intersect,
         fixed_radio: true,
         tx_noack: false,
+        rx_ampdu: false,
         metric_first: true,
         election_metric: 60,
         election_counter: 0,

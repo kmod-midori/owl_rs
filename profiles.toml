@@ -26,6 +26,10 @@
 # tx_noack: request unicast transmission without waiting for hardware ACKs.
 #   Defaults to false. Keep true only for a driver workaround; --tx-ack normal
 #   overrides it. This is independent of shared/exclusive mode and channel pinning.
+# rx_ampdu: experimental receive Block Ack acceptance; defaults to false.
+#   Requires exclusive active-monitor, mon_mac=station, and a driver/firmware
+#   known to generate hardware Block Ack replies in that mode. Userspace only
+#   negotiates and reorders; it cannot generate the hardware replies itself.
 # exclusive_backend:
 #   ibss: join AWDL's BSSID on owlibss0 and inject through a passive monitor.
 #   active-monitor: an active monitor ACKs unicast; the existing station becomes
@@ -65,6 +69,7 @@ exclusive_backend = "ibss"
 # Channel changes can cancel the driver's TX-status cleanup worker, causing
 # normal-ACK injection to stall. Use --tx-ack normal after the driver is fixed.
 [profiles.mt76x2u]
+rx_ampdu = false
 tx_noack = true
 tested = true
 mode = "exclusive"

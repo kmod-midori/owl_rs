@@ -100,6 +100,7 @@ pub struct Config {
     pub strategy: Strategy,
     pub fixed_radio: bool,
     pub tx_noack: bool,
+    pub rx_ampdu: bool,
     pub metric_first: bool,
     pub election_metric: u32,
     pub election_counter: u32,
@@ -174,6 +175,7 @@ pub struct Stats {
     pub rx_action: u64,
     pub rx_addba_requests: u64,
     pub tx_addba_rejections: u64,
+    pub tx_addba_acceptances: u64,
     pub rx_data: u64,
     pub rx_aggregation: RxAggregation,
     pub rx_unknown: u64,
@@ -203,6 +205,10 @@ pub struct Stats {
 pub enum Event {
     Added(Mac),
     Removed(Mac),
+    DelBa {
+        peer: Mac,
+        tid: u8,
+    },
     AddBaRequest {
         peer: Mac,
         request: protocol::AddBaRequest,
@@ -211,6 +217,7 @@ pub enum Event {
 #[derive(Debug, Serialize)]
 pub struct Summary<'a> {
     pub stats: &'a Stats,
+    pub rx_reorder: &'a crate::reorder::Stats,
     pub peers: Vec<&'a Peer>,
     pub election: &'a Election,
     pub sequence: &'a Sequence,
@@ -232,6 +239,7 @@ pub struct Engine {
     pub sequence: Sequence,
     pub peers: BTreeMap<Mac, Peer>,
     pub stats: Stats,
+    pub(crate) reorder: crate::reorder::Reorder,
     pub frequencies: BTreeMap<u16, u64>,
     ieee_sequence: u16,
     data_sequence: u16,
@@ -255,6 +263,7 @@ impl Engine {
             config,
             peers: BTreeMap::new(),
             stats: Stats::default(),
+            reorder: Default::default(),
             frequencies: BTreeMap::new(),
             ieee_sequence: 0,
             data_sequence: 0,
@@ -268,6 +277,7 @@ impl Engine {
     pub fn summary(&self) -> Summary<'_> {
         Summary {
             stats: &self.stats,
+            rx_reorder: &self.reorder.stats,
             peers: self.peers.values().filter(|p| p.valid).collect(),
             election: &self.election,
             sequence: &self.sequence,
@@ -275,6 +285,18 @@ impl Engine {
         }
     }
     pub fn receive(&mut self, bytes: &[u8], now: i64) -> Result<(Vec<Vec<u8>>, Vec<Event>), Error> {
+        let (frames, events) = self.receive_frame(bytes, now)?;
+        // Renegotiation may release the previous window during TX submission.
+        // Deliver it before any subsequently received data, even before a timer tick.
+        let mut out = self.reorder.take_ready();
+        out.extend(frames);
+        Ok((out, events))
+    }
+    fn receive_frame(
+        &mut self,
+        bytes: &[u8],
+        now: i64,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Event>), Error> {
         self.stats.captured += 1;
         self.expire_syns(now);
         let frame = match protocol::parse(bytes) {
@@ -314,6 +336,29 @@ impl Engine {
                     vec![Event::AddBaRequest {
                         peer: frame.source,
                         request: *request,
+                    }],
+                ))
+            }
+            Body::Bar { tid, sequence } => {
+                if frame.destination != self.config.mac
+                    || !self.peers.get(&frame.source).is_some_and(|p| p.valid)
+                {
+                    return Ok((vec![], vec![]));
+                }
+                Ok((self.reorder.bar(frame.source, *tid, *sequence), vec![]))
+            }
+            Body::DelBa { tid, initiator } => {
+                if !initiator
+                    || frame.destination != self.config.mac
+                    || !self.peers.get(&frame.source).is_some_and(|p| p.valid)
+                {
+                    return Ok((vec![], vec![]));
+                }
+                Ok((
+                    self.reorder.stop(frame.source, *tid),
+                    vec![Event::DelBa {
+                        peer: frame.source,
+                        tid: *tid,
                     }],
                 ))
             }
@@ -370,7 +415,12 @@ impl Engine {
                 peer.recent.retain(|&(_, _, time)| {
                     now - time < self.config.retry_timeout.as_micros() as i64
                 });
-                let duplicate = frame.retry
+                let reordered = frame.destination == self.config.mac
+                    && frame
+                        .tid
+                        .is_some_and(|tid| self.reorder.contains(frame.source, tid));
+                let duplicate = !reordered
+                    && frame.retry
                     && peer
                         .recent
                         .iter()
@@ -400,6 +450,15 @@ impl Engine {
                     {
                         out.push(ethernet.clone());
                     }
+                }
+                if reordered {
+                    out = self.reorder.receive(
+                        frame.source,
+                        frame.tid.expect("BA TID"),
+                        frame.sequence,
+                        out,
+                        now,
+                    );
                 }
                 Ok((out, vec![]))
             }
@@ -506,6 +565,7 @@ impl Engine {
             .collect();
         let mut events = Vec::new();
         for (mac, valid) in expired {
+            self.reorder.remove_peer(mac);
             if let Some(p) = self.peers.remove(&mac)
                 && valid
             {
@@ -695,21 +755,7 @@ impl Engine {
             true
         }
     }
-    pub(crate) fn addba_rejection(
-        &mut self,
-        peer: Mac,
-        request: protocol::AddBaRequest,
-    ) -> Vec<u8> {
-        let sequence = self.next_sequence();
-        protocol::encode_addba_rejection(
-            self.config.mac,
-            peer,
-            request,
-            sequence,
-            self.config.tx_noack,
-        )
-    }
-    fn next_sequence(&mut self) -> u16 {
+    pub(crate) fn next_sequence(&mut self) -> u16 {
         let n = self.ieee_sequence;
         self.ieee_sequence = (n + 1) & 4095;
         n

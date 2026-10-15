@@ -123,14 +123,15 @@ pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<(
             .into()
     });
     ensure!(name.len() <= 64, "name must be at most 64 bytes");
-    let (tx_ldpc, tx_noack) = if offline {
-        (false, args.tx_ack.noack(false))
+    let (tx_ldpc, tx_noack, rx_ampdu) = if offline {
+        (false, args.tx_ack.noack(false), false)
     } else {
         let driver = owl::radio::driver_name(&input)?;
         let profile = owl::radio::Profile::load(&driver, args.profiles.as_deref())?;
         (
             profile.supports_tx_ldpc,
             args.tx_ack.noack(profile.tx_noack),
+            profile.rx_ampdu,
         )
     };
     // Offline replay does not inject frames or require a hardware backend.
@@ -157,6 +158,7 @@ pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<(
         strategy: args.strategy,
         fixed_radio: args.fixed_radio,
         tx_noack,
+        rx_ampdu,
         metric_first: args.metric_first,
         election_metric: args.election_metric,
         election_counter: args.election_counter,

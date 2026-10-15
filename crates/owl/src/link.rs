@@ -126,6 +126,7 @@ impl Link {
             },
             fixed_radio: radio.probe.profile.mode == Mode::Exclusive,
             tx_noack: opts.radio.tx_ack.noack(radio.probe.profile.tx_noack),
+            rx_ampdu: radio.probe.profile.rx_ampdu,
             metric_first: radio.probe.profile.mode == Mode::Exclusive,
             election_metric: opts.election_metric,
             election_counter: opts.election_counter,

@@ -189,3 +189,13 @@ link. See [observed interoperability](protocol.md#observed-interoperability-and-
 for tested hardware and remaining limits.
 
 PR [#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster MT7921 transfers with a patched driver, wide advertisements and Block Ack combined. Our advertisements already derive stream counts from hardware, and active-monitor tuning already tries regulatory-permitted 80 MHz channels. The added HT40 syntax does not install those driver patches or establish MT7921 injection support on stock kernels. Its reported throughput has not been reproduced here.
+
+Receive A-MPDU acceptance is opt-in: copy `profiles.toml`, set `rx_ampdu = true`
+for the selected exclusive active-monitor profile, and pass `--profiles PATH`.
+The built-in profiles leave it disabled. This option asserts that the hardware
+can send Block Ack replies in active-monitor mode; it does not patch the driver.
+PRs [#58](https://github.com/t4t5/omdrop-owl/pull/58) and
+[#59](https://github.com/t4t5/omdrop-owl/pull/59) report MT7612U support; #62
+reports patched MT7921 support. Local validation currently covers synthetic
+negotiation/reordering tests, not those hardware claims. See
+[Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.

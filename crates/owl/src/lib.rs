@@ -12,4 +12,5 @@ pub mod rate;
 pub mod runtime;
 pub use owl_ipc::timeouts;
 mod link;
+pub mod reorder;
 mod tx;
