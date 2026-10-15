@@ -54,6 +54,7 @@ pub struct Peer {
     pub sync_offset_us: Option<i64>,
     pub rssi: Option<i8>,
     pub capabilities: protocol::BandCapabilities,
+    pub rx_aggregation: RxAggregation,
     pub tx_parameters: Option<TxParameters>,
     #[serde(skip)]
     rate_control: crate::rate::AutoRate,
@@ -78,6 +79,7 @@ impl Peer {
             sync_offset_us: None,
             rssi: None,
             capabilities: protocol::BandCapabilities::default(),
+            rx_aggregation: RxAggregation::default(),
             tx_parameters: None,
             rate_control: Default::default(),
             mif: false,
@@ -132,6 +134,40 @@ pub struct AckTiming {
     pub injection_us_total: u64,
     pub injection_us_max: u64,
 }
+/// Observed valid-peer MPDUs addressed to us or multicast, including retries.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RxAggregation {
+    pub mpdus: u64,
+    pub retry_mpdus: u64,
+    pub duplicate_mpdus: u64,
+    pub amsdu_mpdus: u64,
+    pub amsdu_members: u64,
+    pub amsdu_body_bytes: u64,
+    pub amsdu_max_body_bytes: usize,
+    pub amsdu_member_counts: BTreeMap<usize, u64>,
+    /// Body-size buckets: <=1, <=2, <=4, <=8 KiB, >8 KiB.
+    pub amsdu_size_buckets: [u64; 5],
+    pub ampdu_reported_mpdus: u64,
+    pub ampdu_reported_last_mpdus: u64,
+}
+impl RxAggregation {
+    fn observe(&mut self, frame: &Frame, members: usize, duplicate: bool) {
+        self.mpdus += 1;
+        self.retry_mpdus += u64::from(frame.retry);
+        self.duplicate_mpdus += u64::from(duplicate);
+        if frame.amsdu {
+            self.amsdu_mpdus += 1;
+            self.amsdu_members += members as u64;
+            self.amsdu_body_bytes += frame.body_bytes as u64;
+            self.amsdu_max_body_bytes = self.amsdu_max_body_bytes.max(frame.body_bytes);
+            *self.amsdu_member_counts.entry(members).or_default() += 1;
+            let bucket = [1024, 2048, 4096, 8192].partition_point(|&max| max < frame.body_bytes);
+            self.amsdu_size_buckets[bucket] += 1;
+        }
+        self.ampdu_reported_mpdus += u64::from(frame.ampdu);
+        self.ampdu_reported_last_mpdus += u64::from(frame.ampdu_last);
+    }
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub captured: u64,
@@ -139,6 +175,7 @@ pub struct Stats {
     pub rx_addba_requests: u64,
     pub tx_addba_rejections: u64,
     pub rx_data: u64,
+    pub rx_aggregation: RxAggregation,
     pub rx_unknown: u64,
     pub rx_ignored: u64,
     pub rx_duplicates: u64,
@@ -333,12 +370,18 @@ impl Engine {
                 peer.recent.retain(|&(_, _, time)| {
                     now - time < self.config.retry_timeout.as_micros() as i64
                 });
-                if frame.retry
+                let duplicate = frame.retry
                     && peer
                         .recent
                         .iter()
-                        .any(|&(tid, seq, _)| tid == frame.tid && seq == frame.sequence)
-                {
+                        .any(|&(tid, seq, _)| tid == frame.tid && seq == frame.sequence);
+                if frame.destination == self.config.mac || frame.destination.multicast() {
+                    peer.rx_aggregation.observe(&frame, frames.len(), duplicate);
+                    self.stats
+                        .rx_aggregation
+                        .observe(&frame, frames.len(), duplicate);
+                }
+                if duplicate {
                     self.stats.rx_duplicates += 1;
                     return Ok((vec![], vec![]));
                 }

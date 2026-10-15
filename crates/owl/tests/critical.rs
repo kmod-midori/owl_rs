@@ -321,6 +321,22 @@ fn outgoing_amsdu_roundtrip_padding_sequences_and_bounds() {
             panic!("data")
         };
         assert_eq!(decoded, [first.clone(), second.clone()]);
+        let mut receiver = Engine::new(config(peer), 0);
+        receiver
+            .receive(&mif(own, 518, 1, &Sequence::fixed(6)), 0)
+            .unwrap();
+        assert_eq!(receiver.receive(&frame, 1).unwrap().0.len(), 2);
+        let rx = &receiver.stats.rx_aggregation;
+        assert_eq!(
+            (rx.amsdu_mpdus, rx.amsdu_members, rx.amsdu_body_bytes),
+            (1, 2, 145)
+        );
+        assert_eq!(rx.amsdu_member_counts.get(&2), Some(&1));
+        assert_eq!(rx.ampdu_reported_mpdus, 0); // No driver metadata is not proof of no A-MPDU.
+        let mut foreign = frame.clone();
+        foreign[rt + 9] ^= 1; // Outer receiver address belongs to another device.
+        receiver.receive(&foreign, 2).unwrap();
+        assert_eq!(receiver.stats.rx_aggregation.mpdus, 1);
     }
     let mut mixed = second.clone();
     mixed[5] ^= 1;
@@ -413,9 +429,19 @@ fn amsdu_bounds_and_retry_deduplication() {
         panic!()
     };
     assert_eq!(frames, [ethernet]);
+    // Synthetic driver metadata: A-MPDU status, reference 42, unknown last flag.
+    let radio = [0, 0, 16, 0, 0, 0, 0x10, 0, 42, 0, 0, 0, 0, 0, 0, 0];
+    amsdu.splice(..rt, radio);
+    let rt = radio.len();
+    let body_bytes = amsdu.len() - rt - 26;
     // QoS TID 0 must not collide with the non-QoS sequence already received.
     amsdu[rt + 1] |= 8;
     for tid in [0, 7, 15] {
+        amsdu[12] = match tid {
+            0 => 0,
+            7 => 4,
+            _ => 12,
+        };
         amsdu[rt + 24] = 0x80 | tid;
         assert_eq!(protocol::parse(&amsdu).unwrap().unwrap().tid, Some(tid));
         assert_eq!(e.receive(&amsdu, 30).unwrap().0.len(), 1);
@@ -425,8 +451,22 @@ fn amsdu_bounds_and_retry_deduplication() {
     // The same TID/sequence becomes eligible after the retry cache expires.
     let expired = e.config.retry_timeout.as_micros() as i64 + 41;
     assert_eq!(e.receive(&amsdu, expired).unwrap().0.len(), 1);
+    for rx in [&e.stats.rx_aggregation, &e.peers[&peer].rx_aggregation] {
+        assert_eq!((rx.mpdus, rx.retry_mpdus, rx.duplicate_mpdus), (9, 8, 4));
+        assert_eq!((rx.amsdu_mpdus, rx.amsdu_members), (7, 7));
+        assert_eq!(rx.amsdu_body_bytes, 7 * body_bytes as u64);
+        assert_eq!(rx.amsdu_max_body_bytes, body_bytes);
+        assert_eq!(rx.amsdu_member_counts.get(&1), Some(&7));
+        assert_eq!(rx.amsdu_size_buckets, [7, 0, 0, 0, 0]);
+        assert_eq!(
+            (rx.ampdu_reported_mpdus, rx.ampdu_reported_last_mpdus),
+            (7, 3)
+        );
+    }
+    // Invalid aggregates never enter the measurements.
     amsdu.pop();
-    assert!(protocol::parse(&amsdu).is_err());
+    assert!(e.receive(&amsdu, expired + 1).is_err());
+    assert_eq!(e.stats.rx_aggregation.mpdus, 9);
 }
 
 #[test]

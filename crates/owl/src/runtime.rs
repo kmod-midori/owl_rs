@@ -648,6 +648,15 @@ fn log_stats(engine: &Engine) {
         ignored = s.tx_status_ignored,
         "AWDL TX delivery"
     );
+    let rx = &s.rx_aggregation;
+    info!(
+        mpdus = rx.mpdus, retries = rx.retry_mpdus, duplicates = rx.duplicate_mpdus,
+        amsdu = rx.amsdu_mpdus, members = rx.amsdu_members,
+        body_bytes = rx.amsdu_body_bytes, max_body_bytes = rx.amsdu_max_body_bytes,
+        member_counts = ?rx.amsdu_member_counts, size_buckets = ?rx.amsdu_size_buckets,
+        ampdu_reported = rx.ampdu_reported_mpdus, ampdu_last = rx.ampdu_reported_last_mpdus,
+        "AWDL RX aggregation"
+    );
     if s.rx_addba_requests != 0 {
         info!(
             received = s.rx_addba_requests,

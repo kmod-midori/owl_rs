@@ -464,6 +464,29 @@ Block ACK session management require kernel support. The current monitor path
 has no kernel peer records or BA sessions and cannot enable A-MPDU through
 radiotap alone.
 
+### Receive aggregation measurements
+
+Status and replay summaries expose `stats.rx_aggregation` and each peer's
+`rx_aggregation`; periodic logs emit `AWDL RX aggregation`. These count fully
+parsed data MPDUs from validated peers addressed to our MAC or multicast, before
+retry suppression. Local TX completion reports, malformed frames, unknown peers,
+and foreign unicast are excluded. Buffered pre-validation SYNs are not counted
+again when released. Global counters survive peer expiry; per-peer counters do not.
+
+`mpdus`, `retry_mpdus`, and `duplicate_mpdus` distinguish observed frames, frames
+with the Retry bit, and retries suppressed by our cache. A-MSDU counters include
+retries: `amsdu_mpdus`, `amsdu_members`, `amsdu_body_bytes`, and
+`amsdu_max_body_bytes`. Body bytes include subframe headers and padding, excluding
+radiotap, the outer MAC header and FCS. `amsdu_member_counts` maps exact member
+counts to observed MPDUs; `amsdu_size_buckets` contains counts for bodies
+<=1 KiB, <=2 KiB, <=4 KiB, <=8 KiB, and >8 KiB, respectively.
+
+`ampdu_reported_mpdus` counts frames carrying radiotap A-MPDU status;
+`ampdu_reported_last_mpdus` counts those explicitly marked last. Missing metadata
+does not establish that A-MPDU was absent. These are capture observations, not
+counts of complete aggregates, successful BA sessions, or delivered application
+bytes. A frame can count as both an A-MSDU and an A-MPDU member.
+
 ## Bluetooth wake-up
 
 BlueZ advertising is owned by `bluer`. The Apple manufacturer ID is `0x004c`;

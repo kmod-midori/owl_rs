@@ -144,6 +144,12 @@ pub struct Frame {
     /// QoS sequence space; non-QoS data has a separate sequence space.
     pub tid: Option<u8>,
     pub retry: bool,
+    pub amsdu: bool,
+    /// MPDU body bytes, excluding radiotap, MAC header and FCS.
+    pub body_bytes: usize,
+    /// Driver-reported A-MPDU membership; absence does not prove no aggregation.
+    pub ampdu: bool,
+    pub ampdu_last: bool,
     pub rssi: Option<i8>,
     pub frequency: Option<u16>,
     pub body: Body,
@@ -202,6 +208,7 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
         .tx_flags
         .zip(radio.data_retries)
         .filter(|_| matches!(fc & 0x00fc, 0x08 | 0x88));
+    let body_bytes = r.rest().len();
     let body = if let Some((flags, retries)) = completion {
         Body::TxStatus(TxStatus {
             failed: flags.fail,
@@ -239,6 +246,12 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
         sequence: seq >> 4,
         tid: (fc & 0x00fc == 0x88).then_some((qos & 0x0f) as u8),
         retry: fc & 0x0800 != 0,
+        amsdu: qos & 0x80 != 0,
+        body_bytes,
+        ampdu: radio.ampdu_status.is_some(),
+        ampdu_last: radio
+            .ampdu_status
+            .is_some_and(|status| status.last == Some(true)),
         rssi: radio.antenna_signal.map(|v| v.value),
         frequency: radio.channel.map(|v| v.freq),
         body,
