@@ -683,7 +683,7 @@ gzip reception also verifies its CRC/footer.
 
 Completion requires a structurally parsed, zero-size `TRAILER!!!` after at least
 one member and a complete enclosing DVZip block. Extraction validates member
-types, paths, duplicate names, AppleDouble companions and approved files/sizes
+types, paths, duplicate names and resource limits
 before an atomic no-replace rename to `airdrop-TRANSFER_ID` and HTTP 200.
 Decode, validation, I/O or rename errors remove staging. Timeout/cancellation
 stops the worker and removes its temporary directory, even after the HTTP task
@@ -822,14 +822,10 @@ Each incoming header is bounded before the archive library allocates its name;
 member sizes and count are checked incrementally. Extraction rejects
 absolute/traversing paths, backslashes, NULs,
 duplicate members, symlinks, special files and hard links. It stages privately
-and atomically renames the completed transfer directory. Approved top-level
-files must be present with matching types and specified sizes.
-
-Apple may add `._<filename>` AppleDouble metadata. Such companions are allowed
-only for an approved file, with size 26 bytes to 1 MiB and header
-`00 05 16 07 00 02 00 00`. This checks the magic/version, not every AppleDouble
-entry's semantics. Companions are retained as received rather than applied as
-extended attributes.
+and atomically renames the completed transfer directory. Archive paths, types and
+sizes are independent of the offer's file list; Apple may wrap offered files in
+`NSIRD_AirDrop_*` directories. AppleDouble `._<filename>` companions are extracted
+as ordinary files, without applying their contents as extended attributes.
 
 The default receive limit is 4 GiB. At upload start, the effective budget is the
 smaller of that limit and one eighth of available output-disk bytes, reserving

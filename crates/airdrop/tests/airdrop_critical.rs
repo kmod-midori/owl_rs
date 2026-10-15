@@ -52,7 +52,9 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
     let mut random = vec![0; 90000];
     openssl::rand::rand_bytes(&mut random).unwrap();
     std::fs::write(tree.join("random.bin"), &random).unwrap();
-    let wire = archive::prepare(&[tree], 1024 * 1024).unwrap();
+    let standalone = dir.path().join("data.txt");
+    std::fs::write(&standalone, b"standalone").unwrap();
+    let wire = archive::prepare(&[tree, standalone], 1024 * 1024).unwrap();
     let destination = dir.path().join("received");
     let original = std::fs::read(wire.file.path()).unwrap();
     let bytes = cpio_bytes(&wire);
@@ -88,11 +90,11 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
             &destination,
             id,
             1024 * 1024,
-            &wire.items,
         )
         .unwrap();
         assert!(!destination.join(format!("airdrop-{id}")).exists());
         let out = pending.commit().unwrap();
+        assert_eq!(std::fs::read(out.join("data.txt")).unwrap(), b"standalone");
         assert_eq!(
             std::fs::read(out.join("folder/random.bin")).unwrap(),
             random
@@ -107,26 +109,10 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
         &destination,
         "cancelled",
         1024 * 1024,
-        &wire.items,
     )
     .unwrap();
     drop(pending);
     assert!(!destination.join("airdrop-cancelled").exists());
-    let unapproved = [archive::Item {
-        name: "other".into(),
-        size: 0,
-        directory: true,
-    }];
-    assert!(
-        archive::receive(
-            std::io::Cursor::new(original.clone()),
-            &destination,
-            "unapproved",
-            1024 * 1024,
-            &unapproved
-        )
-        .is_err()
-    );
     let next_member = bytes
         .windows(6)
         .enumerate()
@@ -151,14 +137,7 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
         ("size-limit", original, 100),
     ] {
         assert!(
-            archive::receive(
-                std::io::Cursor::new(data),
-                &destination,
-                id,
-                limit,
-                &wire.items
-            )
-            .is_err(),
+            archive::receive(std::io::Cursor::new(data), &destination, id, limit,).is_err(),
             "{id}"
         );
         assert!(!destination.join(format!("airdrop-{id}")).exists());
@@ -218,7 +197,6 @@ fn extraction_streams_before_eof_and_removes_failed_staging() {
             &destination,
             "fixture",
             1024 * 1024,
-            &prepared.items,
         );
         assert!(
             observed.get(),
@@ -268,35 +246,18 @@ fn extraction_streams_before_eof_and_removes_failed_staging() {
         }
     }
     let destination = dir.path().join("newc");
-    let expected = [archive::Item {
-        name: "file.txt".into(),
-        size: 3,
-        directory: false,
-    }];
     let mut cpio = Vec::new();
     member(&mut cpio, "file.txt", 0o100644, b"abc");
     member(&mut cpio, "TRAILER!!!", 0, b"");
     let wire_newc = stored(&cpio);
-    let out = archive::receive(
-        Cursor::new(wire_newc),
-        &destination,
-        "fixture",
-        1024,
-        &expected,
-    )
-    .unwrap()
-    .commit()
-    .unwrap();
+    let out = archive::receive(Cursor::new(wire_newc), &destination, "fixture", 1024)
+        .unwrap()
+        .commit()
+        .unwrap();
     assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"abc");
     // Failed publication preserves the existing transfer and removes staging.
-    let pending = archive::receive(
-        Cursor::new(wire),
-        &destination,
-        "fixture",
-        1024 * 1024,
-        &prepared.items,
-    )
-    .unwrap();
+    let pending =
+        archive::receive(Cursor::new(wire), &destination, "fixture", 1024 * 1024).unwrap();
     assert!(pending.commit().is_err());
     assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"abc");
     assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
@@ -339,7 +300,13 @@ async fn native_https_transfer_and_connection_bound_upload() {
     let mut payload = vec![0; 8 * 1024 * 1024];
     openssl::rand::rand_bytes(&mut payload).unwrap();
     std::fs::write(&path, &payload).unwrap();
-    let prepared = archive::prepare(&[path], 16 * 1024 * 1024).unwrap();
+    let wrapper = dir.path().join("NSIRD_AirDrop_fixture");
+    std::fs::create_dir(&wrapper).unwrap();
+    std::fs::write(wrapper.join("second.txt"), b"second file").unwrap();
+    let mut prepared = archive::prepare(&[path, wrapper], 16 * 1024 * 1024).unwrap();
+    // Apple can put an offered file inside an archive-only temporary directory.
+    prepared.items[1].name = "second.txt".into();
+    prepared.items[1].directory = false;
     let mut reader = cpio_archive::reader(std::io::Cursor::new(cpio_bytes(&prepared))).unwrap();
     let header = reader.read_next().unwrap().unwrap();
     // A trailing slash makes Apple's extractor treat a regular file as a directory.
@@ -359,6 +326,17 @@ async fn native_https_transfer_and_connection_bound_upload() {
     assert_eq!(
         std::fs::read(records[0].output.as_ref().unwrap().join("payload.txt")).unwrap(),
         payload
+    );
+    assert_eq!(
+        std::fs::read(
+            records[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .join("NSIRD_AirDrop_fixture/second.txt")
+        )
+        .unwrap(),
+        b"second file"
     );
     // Even a known ID cannot authorize another TLS connection to upload.
     let tcp = tokio::net::TcpStream::connect(address).await.unwrap();

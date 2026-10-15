@@ -779,7 +779,6 @@ impl Receiver {
         let (chunks, reader) = mpsc::channel(4);
         let output = self.output.clone();
         let id = offer.id.clone();
-        let expected = offer.items.clone();
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let mut decoded = tokio::task::spawn_blocking(move || {
@@ -794,7 +793,6 @@ impl Receiver {
                 &output,
                 &id,
                 budget,
-                &expected,
             )
         });
         let mut chunks = Some(chunks);

@@ -309,14 +309,8 @@ impl Validated {
 }
 /// Validate incoming DVZip blocks and CPIO structure without waiting for HTTP EOF.
 /// Gzip reception completes after its CRC/footer, rather than transport EOF.
-pub fn receive(
-    input: impl Read,
-    output: &Path,
-    id: &str,
-    limit: u64,
-    expected: &[Item],
-) -> Result<Validated> {
-    extract_cpio(decoder(input, limit)?, output, id, limit, expected)
+pub fn receive(input: impl Read, output: &Path, id: &str, limit: u64) -> Result<Validated> {
+    extract_cpio(decoder(input, limit)?, output, id, limit)
 }
 /// Bound untrusted sizes before the archive library allocates its name buffer.
 /// Fixed headers and names remain small; member data is consumed separately.
@@ -366,7 +360,6 @@ fn extract_cpio<R: Read>(
     output: &Path,
     id: &str,
     limit: u64,
-    expected: &[Item],
 ) -> Result<Validated> {
     let target = safe_path(&format!("airdrop-{id}"))?;
     ensure!(target.components().count() == 1, "invalid transfer ID");
@@ -435,49 +428,6 @@ fn extract_cpio<R: Read>(
         let padding = header.file_size().wrapping_neg() % align;
         input.read_exact(&mut [0; 3][..padding as usize])?;
         offset += header.file_size() + padding;
-    }
-    let roots = std::fs::read_dir(staging.path())?.collect::<std::io::Result<Vec<_>>>()?;
-    for root in &roots {
-        let name = root.file_name();
-        let name = name.to_str().context("invalid extracted name")?;
-        if expected.iter().any(|i| i.name == name) {
-            continue;
-        }
-        let original = name
-            .strip_prefix("._")
-            .context("archive includes an unapproved file")?;
-        ensure!(
-            expected.iter().any(|i| i.name == original),
-            "unapproved metadata companion"
-        );
-        let meta = root.metadata()?;
-        ensure!(
-            meta.is_file() && (26..=1024 * 1024).contains(&meta.len()),
-            "invalid metadata companion"
-        );
-        let mut header = [0; 8];
-        File::open(root.path())?.read_exact(&mut header)?;
-        ensure!(
-            header == [0, 5, 22, 7, 0, 2, 0, 0],
-            "invalid AppleDouble metadata"
-        );
-    }
-    for item in expected {
-        let path = safe_path(&item.name)?;
-        ensure!(
-            path.components().count() == 1,
-            "offered name must be a basename"
-        );
-        let meta =
-            std::fs::metadata(staging.path().join(path)).context("approved file is missing")?;
-        ensure!(
-            meta.is_dir() == item.directory,
-            "approved file type changed"
-        );
-        // FileSize is optional in Apple offers; zero means unspecified.
-        if !item.directory && item.size != 0 {
-            ensure!(meta.len() == item.size, "approved file size changed");
-        }
     }
     Ok(Validated { staging, target })
 }
