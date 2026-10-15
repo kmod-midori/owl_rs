@@ -676,17 +676,17 @@ pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u
     }
     tlv(&mut out, 24, &e);
     tlv(&mut out, 6, &[0; 9]);
+    if let Some(ht) = &a.capabilities.ht
+        && let Some(last) = ht.rx_mask.iter().rposition(|b| *b != 0)
+    {
+        let mut value = vec![0, 0];
+        le16(&mut value, ht.cap_info);
+        value.push(ht.ampdu_params);
+        value.extend_from_slice(&ht.rx_mask[..=last]);
+        value.extend_from_slice(&[0, 0]);
+        tlv(&mut out, 7, &value);
+    }
     if subtype == 3 {
-        if let Some(ht) = &a.capabilities.ht
-            && let Some(last) = ht.rx_mask.iter().rposition(|b| *b != 0)
-        {
-            let mut value = vec![0, 0];
-            le16(&mut value, ht.cap_info);
-            value.push(ht.ampdu_params);
-            value.extend_from_slice(&ht.rx_mask[..=last]);
-            value.extend_from_slice(&[0, 0]);
-            tlv(&mut out, 7, &value);
-        }
         if let Some(vht) = &a.capabilities.vht {
             // IEEE VHT Capability IE (191, length 12) inside AWDL container 17.
             let mut value = vec![191, 12];

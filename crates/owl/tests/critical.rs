@@ -1015,10 +1015,14 @@ fn hardware_capabilities_use_current_band_and_awdl_wire_layout() {
         assert_eq!(tags(&engine.action_frame_on_channel(3, 0, 6))[&7], expected);
     }
     let psf = tags(&engine.action_frame_on_channel(0, 0, 149));
-    assert!(!psf.contains_key(&7) && !psf.contains_key(&17));
+    assert_eq!(psf[&7], five[&7]);
+    assert!(!psf.contains_key(&17) && !psf.contains_key(&16));
+    assert!(five.contains_key(&16));
     engine.config.capabilities = RadioCapabilities::default();
-    let absent = tags(&engine.action_frame_on_channel(3, 0, 149));
-    assert!(!absent.contains_key(&7) && !absent.contains_key(&17));
+    for subtype in [0, 3] {
+        let absent = tags(&engine.action_frame_on_channel(subtype, 0, 149));
+        assert!(!absent.contains_key(&7) && !absent.contains_key(&17));
+    }
 
     let template = engine.action_frame_on_channel(3, 0, 149);
     let with_tag = |kind: u8, value: &[u8]| {

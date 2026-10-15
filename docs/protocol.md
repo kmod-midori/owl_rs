@@ -201,7 +201,7 @@ The implemented TLVs include:
 | 24 | Election parameters v2 | Master/sync MACs, counter, height, metrics and self counter; preferred over v1 |
 | 16 | ARPA name | Bounded hostname, advertised in MIFs |
 | 21 | Version/device class | Needed with a MIF to mark a peer valid |
-| 7 | HT capabilities | Hardware HT flags, A-MPDU parameters and RX MCS mask, emitted in MIFs |
+| 7 | HT capabilities | Hardware HT flags, A-MPDU parameters and RX MCS mask, emitted in PSFs and MIFs |
 | 17 | IEEE 802.11 container | Hardware VHT Capability IE, emitted in MIFs when supported by the current band |
 | 6, 12 | Compatibility fields | Emitted using the inherited OWL shapes; not fully interpreted |
 
