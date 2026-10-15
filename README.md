@@ -27,6 +27,22 @@ just probe
 Commands run the development build without installing a package. Use
 `just check` for formatting, Clippy and automated tests.
 
+## Arch Linux package
+
+The `PKGBUILD` builds `owl_rs-git` from the GitHub repository with tray support:
+
+```sh
+makepkg -si
+sudo systemctl enable --now "owld@$(id -un).service"
+systemctl --user enable --now airdropd.service
+```
+
+Enable the radio service for one user only. Configure daemon arguments with
+`systemctl edit` / `systemctl --user edit`. The package installs `owld`,
+`airdropd`, and `catdrop`; use `catdrop` for the transfer commands below instead
+of the development `just` helpers. Receiving starts off; enable it with
+`catdrop discoverable everyone` or `catdrop discoverable contacts`.
+
 ## Send and receive
 
 Start the radio service in its own terminal:
