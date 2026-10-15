@@ -255,6 +255,16 @@ by 16 one- or two-byte entries. Encoding 0 stores a channel byte; encoding 1
 uses the second byte for the channel; encoding 3 stores channel then operating
 class. Local fixed sequences use `51` for channel 6 and `80` for 44/149.
 
+Action-frame synchronization subtracts the wrapping 32-bit difference between
+PHY and target transmit timestamps from capture time. Live capture explicitly
+uses host microsecond timestamps mapped to the runtime's monotonic epoch, so
+userspace queueing does not shift the AWDL clock. Invalid capture timestamps
+fall back to processing time; a detected wall-clock offset change over 10 ms
+disables capture-time mapping for the session. Outgoing action frames retain
+the construction timestamp and update the PHY timestamp immediately before
+injection. USB/driver receive latency and post-injection transmit delays remain
+unmeasured; these are not hardware on-air timestamps.
+
 Counters wrap at 16 bits. Clock calculations use signed phase and wrapping
 arithmetic to handle rollover and peers whose epoch precedes the local epoch.
 Election normally ranks counter before metric; exclusive mode ranks metric

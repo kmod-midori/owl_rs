@@ -263,9 +263,10 @@ impl Clock {
     pub fn next_tu(&self, now: i64) -> u16 {
         (64 - (now - self.epoch_us).div_euclid(1024).rem_euclid(64)) as u16
     }
-    pub fn error_tu(&self, now: i64, next: u16, counter: u16) -> i64 {
+    /// Peer phase relative to our clock, retaining sub-TU receive precision.
+    pub fn error_us(&self, now: i64, next: u16, counter: u16) -> i64 {
         let delta = ((counter / 4).wrapping_sub(self.current_aw(now) / 4) << 2) as i16 as i64;
-        delta * 16 - (next as i64 - self.next_tu(now) as i64)
+        delta * 16 * 1024 - (i64::from(next) * 1024 - self.next_us(now))
     }
     pub fn update(&mut self, now: i64, next: u16, counter: u16) {
         self.epoch_us = now - (64 - next as i64) * 1024;

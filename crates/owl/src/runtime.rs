@@ -172,6 +172,8 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
         .snaplen(MAX_FRAME as i32)
         .promisc(true)
         .immediate_mode(true)
+        .tstamp_type(pcap::TimestampType::Host)
+        .precision(pcap::Precision::Micro)
         .timeout(opts.timeouts.capture_read.as_millis().max(1) as i32)
         .open()?
         .setnonblock()?;
@@ -253,9 +255,8 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     });
     let mut pending_channel = None;
     let start = Instant::now();
-    if let Ok(epoch) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let clock_epoch_us =
-            (epoch.as_micros() as u64).saturating_sub(elapsed_us(start).max(0) as u64);
+    let mut capture_clock = CaptureClock::new(wall_us(), elapsed_us(start));
+    if let Some(clock_epoch_us) = capture_clock.epoch_us {
         info!(clock_epoch_us, "AWDL runtime clock");
     }
     let advertised_port = config.airdrop_port;
@@ -329,11 +330,15 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                 },
                 packet = stream.next() => {
                     let packet = packet.context("radio stream ended")??;
+                    let received = capture_clock.receive_time(
+                        packet.header.ts.tv_sec, packet.header.ts.tv_usec,
+                        wall_us(), elapsed_us(start),
+                    );
                     let view = Packet { header: &packet.header, data: &packet.data };
                     if let Some(save) = &mut save {
                         save.write(&view);
                     }
-                    match engine.receive(&packet.data, elapsed_us(start)) {
+                    match engine.receive(&packet.data, received) {
                         Ok((frames, events)) => {
                             for event in events {
                                 match event {
@@ -439,7 +444,9 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             engine.config.airdrop_port = (*control.policy.borrow()).then_some(advertised_port).flatten();
                         }
                         if now >= mif_at {
-                            if !inject(stream.capture_mut(), &engine.action_frame_on_channel(3, now, desired))? { continue; }
+                            let mut frame = engine.action_frame_on_channel(3, now, desired);
+                            crate::protocol::stamp_action_tx(&mut frame, elapsed_us(start))?;
+                            if !inject(stream.capture_mut(), &frame)? { continue; }
                             if engine.stats.tx_action == 0 {
                                 debug!(channel=desired, "first AWDL action frame submitted to radio");
                             }
@@ -447,7 +454,9 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             mif_at = now + engine.clock.next_us(now) + SLOT_MIDDLE;
                         }
                         if now >= psf_at {
-                            if !inject(stream.capture_mut(), &engine.action_frame_on_channel(0, now, desired))? { continue; }
+                            let mut frame = engine.action_frame_on_channel(0, now, desired);
+                            crate::protocol::stamp_action_tx(&mut frame, elapsed_us(start))?;
+                            if !inject(stream.capture_mut(), &frame)? { continue; }
                             engine.stats.tx_action += 1;
                             psf_at = now + 110 * 1024;
                         }
@@ -511,6 +520,61 @@ async fn receive_tap(tap: &Option<AsyncDevice>, buf: &mut [u8]) -> std::io::Resu
         tap.recv(buf).await
     } else {
         std::future::pending().await
+    }
+}
+
+fn wall_us() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|time| i64::try_from(time.as_micros()).ok())
+}
+
+/// libpcap host timestamps use CLOCK_REALTIME; the engine uses Instant elapsed time.
+struct CaptureClock {
+    epoch_us: Option<i64>,
+}
+impl CaptureClock {
+    const MAX_CLOCK_SHIFT_US: u64 = 10_000;
+    const MAX_CAPTURE_AGE_US: i64 = 5_000_000;
+    const SAMPLE_SKEW_US: i64 = 1_000;
+
+    fn new(wall: Option<i64>, now: i64) -> Self {
+        Self {
+            epoch_us: wall.and_then(|wall| wall.checked_sub(now)),
+        }
+    }
+    fn receive_time(&mut self, seconds: i64, micros: i64, wall: Option<i64>, now: i64) -> i64 {
+        let Some(epoch) = self.epoch_us else {
+            return now;
+        };
+        // A wall-clock step makes buffered timestamps ambiguous. Fall back for
+        // this session instead of propagating the step into AWDL synchronization.
+        if wall
+            .and_then(|wall| wall.checked_sub(now))
+            .is_none_or(|current| current.abs_diff(epoch) > Self::MAX_CLOCK_SHIFT_US)
+        {
+            self.epoch_us = None;
+            warn!("capture clock changed; using processing time for this session");
+            return now;
+        }
+        if seconds <= 0 || !(0..1_000_000).contains(&micros) {
+            return now;
+        }
+        let received = seconds
+            .checked_mul(1_000_000)
+            .and_then(|stamp| stamp.checked_add(micros))
+            .and_then(|stamp| stamp.checked_sub(epoch));
+        // Reject missing, implausibly old or future timestamps, allowing a small
+        // sampling skew. Signed times also support packets captured during setup.
+        received
+            .filter(|&time| {
+                (now.saturating_sub(Self::MAX_CAPTURE_AGE_US)
+                    ..=now.saturating_add(Self::SAMPLE_SKEW_US))
+                    .contains(&time)
+            })
+            .map(|time| time.min(now))
+            .unwrap_or(now)
     }
 }
 
@@ -607,6 +671,41 @@ async fn wait_cancel(control: &Option<Control>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_time_removes_queue_delay_and_rejects_clock_steps() {
+        let epoch = 1_700_000_000_000_000;
+        let mut clock = CaptureClock::new(Some(epoch + 100), 100);
+        // Queued captures, setup captures before our epoch, and invalid stamps.
+        for (seconds, micros, expected) in [
+            (epoch / 1_000_000, 12_345, 12_345),
+            (epoch / 1_000_000 - 1, 999_000, -1_000),
+            (0, 0, 40_000),
+            (epoch / 1_000_000, 1_000_000, 40_000),
+            (epoch / 1_000_000 + 1, 0, 40_000),
+        ] {
+            assert_eq!(
+                clock.receive_time(seconds, micros, Some(epoch + 40_000), 40_000),
+                expected
+            );
+        }
+        for jump in [-1_000_000, 1_000_000] {
+            let mut clock = CaptureClock::new(Some(epoch), 0);
+            assert_eq!(
+                clock.receive_time(
+                    epoch / 1_000_000,
+                    12_345,
+                    Some(epoch + 40_000 + jump),
+                    40_000
+                ),
+                40_000
+            );
+            // Do not reinterpret queued pre-step packets using a new clock epoch.
+            assert_eq!(
+                clock.receive_time(epoch / 1_000_000, 12_345, Some(epoch + 50_000), 50_000),
+                50_000
+            );
+        }
+    }
     #[test]
     fn injection_errors_distinguish_backpressure_oversize_and_failure() {
         for errno in [Errno::EAGAIN, Errno::ENOBUFS] {

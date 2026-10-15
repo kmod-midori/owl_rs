@@ -181,10 +181,43 @@ fn counter_rollover_and_negative_phase() {
     clock.counter = 65532;
     assert_eq!(clock.current_aw(64 * 1024), 0);
     assert_eq!(clock.slot(64 * 1024), 0);
-    assert_eq!(clock.error_tu(64 * 1024, 64, 0), 0);
+    assert_eq!(clock.error_us(64 * 1024, 64, 0), 0);
     clock.update(1, 32, 8);
     assert_eq!(clock.next_tu(1), 32);
-    assert_eq!(Clock::new(0).error_tu(0, 64, 65532), -64);
+    assert_eq!(Clock::new(0).error_us(0, 64, 65532), -64 * 1024);
+}
+#[test]
+fn action_timestamps_compensate_queue_delay_across_wrap() {
+    let own = Mac([2, 0, 0, 0, 0, 1]);
+    let peer = Mac([2, 0, 0, 0, 0, 2]);
+    for (target, delay) in [
+        (0u32, 0u32),
+        (1_000, 12_345),
+        (u32::MAX - 5_000, 70_123), // Timestamp wrap and a full queued EAW.
+    ] {
+        let mut frame = mif(peer, 520, 0, &Sequence::fixed(6));
+        let offset = u16::from_le_bytes([frame[2], frame[3]]) as usize + 24;
+        frame[offset + 12..offset + 16].copy_from_slice(&target.to_le_bytes());
+        protocol::stamp_action_tx(&mut frame, i64::from(target.wrapping_add(delay))).unwrap();
+        let parsed = protocol::parse(&frame).unwrap().unwrap();
+        let Body::Action(action) = parsed.body else {
+            panic!("expected action")
+        };
+        assert_eq!(action.tx_delay_us, delay);
+        assert_eq!(&frame[offset + 12..offset + 16], &target.to_le_bytes());
+
+        let mut engine = Engine::new(config(own), 0);
+        engine.election.sync = peer;
+        // Capture time is independent of the remote timestamp's absolute epoch.
+        engine.receive(&frame, 20_000).unwrap();
+        let reference = 20_000 - i64::from(delay);
+        assert_eq!(engine.clock.epoch_us, reference);
+        assert_eq!(
+            engine.clock.next_us(20_000),
+            SLOT_US - i64::from(delay).rem_euclid(SLOT_US)
+        );
+        assert_eq!(engine.peers[&peer].sync_offset_us, Some(-reference));
+    }
 }
 #[test]
 fn metric_first_election_and_fixed_radio_intersection_union() {

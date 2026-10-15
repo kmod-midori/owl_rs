@@ -420,9 +420,11 @@ impl Engine {
             peer.v2 |= a.v2;
         }
         if let Some(sync) = &a.sync {
-            peer.sync_offset_us = Some(self.clock.error_tu(now, sync.next, sync.counter) * 1024);
+            // The countdown was measured at frame creation, before sender queuing.
+            let reference = now - i64::from(a.tx_delay_us);
+            peer.sync_offset_us = Some(self.clock.error_us(reference, sync.next, sync.counter));
             if self.election.sync == f.source {
-                self.clock.update(now, sync.next, sync.counter);
+                self.clock.update(reference, sync.next, sync.counter);
             }
         }
         if a.subtype == 3 {

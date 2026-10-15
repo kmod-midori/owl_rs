@@ -105,6 +105,8 @@ pub struct SyncParams {
 #[derive(Clone, Debug)]
 pub struct Action {
     pub subtype: u8,
+    /// Sender queue delay, with the 32-bit microsecond clock wrapping naturally.
+    pub tx_delay_us: u32,
     pub sync: Option<SyncParams>,
     pub sequence: Option<Sequence>,
     pub election: Option<Election>,
@@ -248,9 +250,12 @@ fn parse_action(data: &[u8]) -> Result<Option<Action>, Error> {
     if subtype != 0 && subtype != 3 {
         return Ok(None);
     }
-    r.take(9)?;
+    r.take(1)?; // Reserved.
+    let phy_time = r.le32()?;
+    let target_time = r.le32()?;
     let mut a = Action {
         subtype,
+        tx_delay_us: phy_time.wrapping_sub(target_time),
         sync: None,
         sequence: None,
         election: None,
@@ -591,6 +596,23 @@ pub fn encode_addba_rejection(
     le16(&mut out, request.parameters & 0x003e); // Echo TID/policy; no A-MSDU or buffer agreement.
     le16(&mut out, 0);
     out
+}
+
+/// Update only the PHY timestamp immediately before submitting a generated AF.
+/// The target timestamp and countdown retain their frame-construction time.
+pub fn stamp_action_tx(frame: &mut [u8], now_us: i64) -> Result<(), Error> {
+    let mut r = Reader::new(frame);
+    r.take(2)?;
+    let radio_len = r.le16()? as usize;
+    let offset = radio_len + 24;
+    if frame.get(offset..offset + 6) != Some(&[127, 0, 0x17, 0xf2, 8, 0x10]) {
+        return Err(Error::Invalid("action timestamp header"));
+    }
+    frame
+        .get_mut(offset + 8..offset + 12)
+        .ok_or(Error::Truncated)?
+        .copy_from_slice(&(now_us as u32).to_le_bytes());
+    Ok(())
 }
 
 pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u8> {
