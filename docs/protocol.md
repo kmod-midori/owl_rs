@@ -99,7 +99,7 @@ including the active-monitor flag for hardware ACKs. Interface state/MAC,
 link-local IPv6 address scope and `NODAD`, address readiness, and permanent
 neighbors use routing netlink. Operation-scoped connection tasks close during
 cleanup. NetworkManager ownership and saved connection restoration use
-`nmcli`; `ip` and `iw` executables are not required.
+the system D-Bus API.
 
 [Radio profiles](radio.md#modes-and-backends) select IBSS or active-monitor
 context in exclusive mode, which works without an AP. Active-monitor setup

@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tun-rs.workspace = true
 wl-nl80211.workspace = true
+zbus.workspace = true
 owl-ipc.workspace = true
 
 [dev-dependencies]

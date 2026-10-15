@@ -233,7 +233,7 @@ are protocol parameters, rather than application timeout options.
 | `--transport-shutdown-timeout` | 2 | Transport task shutdown deadline. |
 | `--name-probe-timeout` | 8 | Per-peer HTTPS name resolution deadline. |
 | `--netlink-timeout` | 5 | Kernel netlink request deadline. |
-| `--network-manager-timeout` | 15 | NetworkManager setup and restoration command deadline. |
+| `--network-manager-timeout` | 15 | NetworkManager D-Bus operation deadline. |
 | `--reconnect-timeout` | 10 | NetworkManager saved-AP reconnection wait. |
 | `--ibss-ready-timeout` | 10 | Ad-hoc cell readiness deadline. |
 | `--ibss-tune-timeout` | 15 | Ad-hoc channel retuning deadline. |

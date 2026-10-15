@@ -143,8 +143,8 @@ both comparison runs.
 
 See [Architecture](architecture.md) for crate boundaries and native-library use,
 and the [source map](protocol.md#source-map) for subsystem implementations.
-Radio/link operations use bounded `wl-nl80211`/`rtnetlink` requests; only
-NetworkManager ownership and saved-AP restoration require `nmcli`, not `ip` or `iw`.
+Radio/link operations use bounded `wl-nl80211`/`rtnetlink` requests.
+NetworkManager ownership and saved-AP restoration use the system D-Bus API.
 
 Hardware setup checks cover active monitors, 80/40/20 MHz tuning on channels
 149/44, channel 6 at 20 MHz, TAP MTU/IPv6 readiness, neighbors, rollback,

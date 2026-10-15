@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Transactional radio setup. The recovery journal survives a killed daemon.
-use crate::{netlink::Netlink, protocol::Mac};
+use crate::{netlink::Netlink, network_manager, protocol::Mac};
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use fs2::FileExt;
@@ -10,7 +10,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::process::Command;
 use wl_nl80211::Nl80211InterfaceType as IfType;
 
 // Enough room for the largest supported A-MSDU plus radiotap and MAC headers.
@@ -185,22 +184,6 @@ impl Profile {
         );
         Ok(())
     }
-}
-pub(crate) async fn nmcli(timeout: Duration, args: &[&str]) -> Result<String> {
-    let p = tokio::time::timeout(
-        timeout,
-        Command::new("nmcli").args(args).kill_on_drop(true).output(),
-    )
-    .await
-    .context("NetworkManager command timed out")??;
-    if !p.status.success() {
-        bail!(
-            "nmcli {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&p.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&p.stdout).trim().to_owned())
 }
 pub fn interface_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -425,28 +408,11 @@ impl Radio {
             }
         }
         let up = net.is_up(&probe.station).await?;
-        let nm = nmcli(
-            timeouts.network_manager,
-            &[
-                "-g",
-                "GENERAL.NM-MANAGED,GENERAL.CON-UUID",
-                "device",
-                "show",
-                &probe.station,
-            ],
-        )
-        .await
-        .ok();
-        let managed = nm.as_deref().and_then(|s| match s.lines().next()? {
-            "yes" => Some(true),
-            "no" => Some(false),
-            _ => None,
-        });
-        let connection = nm
-            .as_deref()
-            .and_then(|s| s.lines().nth(1))
-            .filter(|s| !s.is_empty() && *s != "--")
-            .map(str::to_owned);
+        let nm = network_manager::snapshot(&probe.station, timeouts.network_manager)
+            .await
+            .ok();
+        let managed = nm.as_ref().map(|(managed, _)| *managed);
+        let connection = nm.and_then(|(_, connection)| connection);
         if probe.associated && probe.profile.mode == Mode::Exclusive && connection.is_none() {
             bail!(
                 "cannot save the connected AP for restoration; NetworkManager connection UUID is unavailable"
@@ -555,11 +521,8 @@ impl Radio {
         } else {
             &self.state.monitor
         };
-        let _ = nmcli(
-            self.state.timeouts.network_manager,
-            &["device", "set", name, "managed", "no"],
-        )
-        .await;
+        let _ =
+            network_manager::set_managed(name, false, self.state.timeouts.network_manager).await;
         let mut mac = self.mac;
         if !ibss
             && self.state.profile.mode == Mode::Exclusive
@@ -585,21 +548,15 @@ impl Radio {
             self.persist()?;
             if self.state.managed == Some(true) {
                 let phy = self.net.interface(&station).await?.phy;
-                nmcli(
-                    self.state.timeouts.network_manager,
-                    &["device", "set", &station, "managed", "no"],
-                )
-                .await?;
+                let device =
+                    network_manager::Device::open(&station, self.state.timeouts.network_manager)
+                        .await?;
+                device.set_managed(false).await?;
                 // Wait for both the NM transition and release of same-PHY
                 // supplicant/P2P interfaces before changing the station.
                 tokio::time::timeout(self.state.timeouts.network_manager, async {
                     loop {
-                        let state = nmcli(
-                            self.state.timeouts.network_manager,
-                            &["-g", "GENERAL.STATE", "device", "show", &station],
-                        )
-                        .await?;
-                        if state.split_whitespace().next() == Some("10") {
+                        if device.is_unmanaged().await? {
                             let blockers = self.net.handoff_blockers(&station, phy).await?;
                             if blockers.is_empty() {
                                 return Ok::<_, anyhow::Error>(());
@@ -715,15 +672,10 @@ async fn restore(state: &Journal) -> Result<()> {
             net.set_mac(&state.station, state.mac).await?;
             net.set_up(&state.station, state.up).await?;
             if let Some(managed) = state.managed {
-                nmcli(
+                network_manager::set_managed(
+                    &state.station,
+                    managed,
                     state.timeouts.network_manager,
-                    &[
-                        "device",
-                        "set",
-                        &state.station,
-                        "managed",
-                        if managed { "yes" } else { "no" },
-                    ],
                 )
                 .await?;
             }
@@ -738,18 +690,11 @@ async fn restore(state: &Journal) -> Result<()> {
     if (state.touched || state.profile.reconnect)
         && state.managed == Some(true)
         && let Some(uuid) = &state.connection
-        && let Err(e) = nmcli(
+        && let Err(e) = network_manager::reconnect(
+            &state.station,
+            uuid,
             state.timeouts.network_manager,
-            &[
-                "--wait",
-                &state.timeouts.reconnect.as_secs_f64().ceil().to_string(),
-                "connection",
-                "up",
-                "uuid",
-                uuid,
-                "ifname",
-                &state.station,
-            ],
+            state.timeouts.reconnect,
         )
         .await
     {

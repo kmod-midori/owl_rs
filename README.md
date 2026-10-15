@@ -17,7 +17,7 @@ cargo build --workspace --release --locked --no-default-features
 
 The radio service requires `/dev/net/tun`, root and a supported Wi-Fi
 adapter. AirDrop transport and the CLI run as your regular user. NetworkManager
-integration uses `nmcli`; Bluetooth wake-up uses BlueZ with LE advertising.
+integration uses the system D-Bus API; Bluetooth wake-up uses BlueZ with LE advertising.
 
 ```sh
 just build

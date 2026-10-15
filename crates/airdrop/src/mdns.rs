@@ -7,7 +7,7 @@ use std::{
     net::{Ipv6Addr, SocketAddrV6},
     os::fd::AsRawFd,
 };
-use tokio::io::unix::AsyncFd;
+use tokio::{io::Interest, net::UdpSocket};
 
 pub(crate) struct Datagram {
     pub len: usize,
@@ -16,7 +16,7 @@ pub(crate) struct Datagram {
     pub hop_limit: i32,
 }
 pub(crate) struct Socket {
-    io: AsyncFd<socket2::Socket>,
+    io: UdpSocket,
     index: u32,
     address: Ipv6Addr,
 }
@@ -44,7 +44,7 @@ impl Socket {
         socket::setsockopt(&socket, socket::sockopt::Ipv6RecvHopLimit, &true)?;
         socket.set_nonblocking(true)?;
         Ok(Self {
-            io: AsyncFd::new(socket)?,
+            io: UdpSocket::from_std(socket.into())?,
             index,
             address,
         })
@@ -66,10 +66,10 @@ impl Socket {
             ipi6_ifindex: self.index,
         };
         loop {
-            let mut ready = self.io.writable().await?;
-            let result = ready.try_io(|fd| {
+            self.io.writable().await?;
+            let result = self.io.try_io(Interest::WRITABLE, || {
                 socket::sendmsg(
-                    fd.get_ref().as_raw_fd(),
+                    self.io.as_raw_fd(),
                     &[IoSlice::new(bytes)],
                     &[ControlMessage::Ipv6PacketInfo(&packet_info)],
                     MsgFlags::MSG_DONTWAIT,
@@ -77,7 +77,7 @@ impl Socket {
                 )
                 .map_err(io::Error::from)
             });
-            if let Ok(result) = result {
+            if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
                 ensure!(
                     result.context("send IPv6 mDNS datagram")? == bytes.len(),
                     "partial mDNS datagram"
@@ -88,12 +88,12 @@ impl Socket {
     }
     pub async fn receive(&self, bytes: &mut [u8]) -> Result<Option<Datagram>> {
         loop {
-            let mut ready = self.io.readable().await?;
-            let result = ready.try_io(|fd| {
+            self.io.readable().await?;
+            let result = self.io.try_io(Interest::READABLE, || {
                 let mut iov = [IoSliceMut::new(bytes)];
                 let mut control = nix::cmsg_space!(nix::libc::in6_pktinfo, nix::libc::c_int);
                 let message = socket::recvmsg::<SockaddrIn6>(
-                    fd.get_ref().as_raw_fd(),
+                    self.io.as_raw_fd(),
                     &mut iov,
                     Some(&mut control),
                     MsgFlags::MSG_DONTWAIT,
@@ -124,7 +124,7 @@ impl Socket {
                     },
                 ))
             });
-            if let Ok(result) = result {
+            if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
                 return result.context("receive IPv6 mDNS datagram");
             }
         }
@@ -138,14 +138,7 @@ mod tests {
     async fn udp_preserves_scoped_source_and_receive_metadata_without_raw_sockets() {
         let index = nix::net::if_::if_nametoindex("lo").unwrap();
         let socket = Socket::open_port("lo", index, Ipv6Addr::LOCALHOST, 0).unwrap();
-        let port = socket
-            .io
-            .get_ref()
-            .local_addr()
-            .unwrap()
-            .as_socket_ipv6()
-            .unwrap()
-            .port();
+        let port = socket.io.local_addr().unwrap().port();
         let peer = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
         socket2::SockRef::from(&peer)
             .set_unicast_hops_v6(255)

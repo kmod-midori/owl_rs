@@ -168,9 +168,10 @@ impl Link {
             "AWDL stopped during startup"
         );
         // LinkManager must not autoconfigure the temporary Ethernet TAP.
-        if let Err(e) = crate::radio::nmcli(
+        if let Err(e) = crate::network_manager::set_managed(
+            &opts.radio.host_interface,
+            false,
             opts.timeouts.network_manager,
-            &["device", "set", &opts.radio.host_interface, "managed", "no"],
         )
         .await
         {
