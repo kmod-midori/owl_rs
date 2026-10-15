@@ -75,13 +75,63 @@ sudo target/release/owld awdl --interface owlmon0 --channel 6 \
 
 `--listen-only` observes the existing channel without retuning, TAP creation or
 transmission. Active diagnostics can tune and inject; use an interface prepared
-for that purpose. `--fixed-radio` holds the physical channel, relaxes multicast
-gates and disables unicast retries. `--metric-first` ranks metric before counter.
+for that purpose. `--fixed-radio` holds the physical channel and relaxes multicast gates.
+`--tx-ack profile|normal|noack` controls hardware ACK waiting independently.
+`--metric-first` ranks metric before counter.
 `--strategy verbatim|rotate|pin|widen|intersect` controls the advertised schedule.
 Other options include `--rate`, `--mac`, `--no-rssi-filter`, `--duration`,
 `--save`, `--save-invalid PCAP` and `--summary`. Use `awdl --help` for details.
 
 `--verbose` is global and repeatable; `RUST_LOG` overrides its logging level.
+
+## ACK timing diagnostics
+
+For receive-performance investigations, start `owld` with
+`RUST_LOG=owl=info,owl::tx=debug` and save its stderr alongside the radio capture.
+Use the existing `--save` prefix to preserve each radio session, and capture the
+TAP concurrently with `tcpdump -i awdl0 -p -n -s 0 -U -w tcp.pcap ip6 and tcp`.
+Start the TAP capture as soon as the interface appears, before the transfer.
+Keep local captures and test helpers under ignored `build/` and `dev/`.
+
+Each `AWDL TCP ACK injection` record identifies a payload-free TCP ACK by a
+session-local `ack_id`, peer, ports, sequence/acknowledgment, raw receive window
+and optional TCP timestamp. An `options_crc` fingerprints the complete TCP
+options, including SACK blocks, for matching against TAP packets. SYN, FIN, RST
+and packets with payload are excluded. Aggregation and retries preserve the ACK
+ID; `injection_id` identifies each backend call independently. Outcomes are
+`accepted`, `backpressure`, `too_large` and `failed`; a rejected attempt is not counted as
+an injected ACK. `AWDL TCP ACK dropped` records explicit queue drops.
+
+`queued_us` is when the radio runtime reads the packet from TAP.
+`injection_started_us` and `injection_finished_us` bracket the libpcap call.
+`queue_wait_us` ends at the start of that call, and `injection_us` measures its
+duration. These timestamps use the runtime's monotonic microsecond clock;
+`AWDL runtime clock` supplies `clock_epoch_us` to approximately align them with
+PCAP wall-clock timestamps. System-clock adjustments can affect that alignment.
+Compare TAP timestamps with `queued_us` to detect delays before the TX queue.
+
+`schedule_blocked` and `airtime_blocked` indicate that the ACK was deferred
+directly or behind an earlier frame for that peer. `backpressured` records an
+injection retry. These flags identify encountered causes, not durations spent
+in each cause. Rate, channel, slot and aggregate member count describe the
+attempt; `coding` records the selected injection FEC. An accepted call means
+backend submission, not on-air transmission or receipt of the Wi-Fi hardware
+ACK; the receive PCAP cannot prove TX delivery.
+
+`status.awdl.stats.tx_ack` exposes bounded summary counters without detailed
+logging. Queue wait totals/maxima cover successfully injected ACK packets;
+injection totals/maxima and attempt counts cover backend calls containing ACKs,
+including failed attempts, once per aggregate. Cause counts cover completed
+or explicitly dropped ACK packets once each. Summaries are also logged every
+ten seconds and at shutdown; the final queue record counts pending packets and
+ACKs left when the session ends.
+
+For a comparison, use the same file, discovery/transmission channels and phone
+position. First measure automatic rate selection; a later separate run can
+override `--rate` to investigate the return ACK path. Record upload throughput,
+incoming PHY rates/retry flags, peer availability, ACK queue wait and TCP
+sequence holes. Detailed logging adds overhead, so enable it consistently in
+both comparison runs.
 
 ## Implementation and validation
 
@@ -123,7 +173,8 @@ Open Wireless Link / Milan Stute attribution and GPL-3.0-or-later license are
 retained; see [COPYING](../COPYING).
 
 The port includes TX-rate selection, MAC override, fixed radio, metric-first
-election, fixed-radio unicast NOACK and fixed-channel pinning. It also adapts
+election and fixed-channel pinning. Unicast ACK policy follows the driver
+profile; Intel and MT76x2U use NOACK workarounds. It also adapts
 [omdrop-owl PR #11](https://github.com/t4t5/omdrop-owl/pull/11) for nonblocking
 injection backpressure, data-refreshed peer liveness and DAD-free TAP setup, and
 [omdrop-plugin PR #41](https://github.com/brentkearney/omdrop-plugin/pull/41)

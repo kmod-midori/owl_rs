@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! PHY rate parsing and capability-based selection. Auto is resolved before encoding.
+//! PHY rates and per-peer delivery feedback. Auto is resolved before encoding.
 use crate::{channel::ChannelDefinition, protocol::BandCapabilities};
 use radiotap::field::ext::{Bandwidth, GuardInterval, ht_rate, vht_rate};
 use serde::{Serialize, Serializer};
@@ -8,6 +8,84 @@ use std::{fmt, str::FromStr};
 // Injection policy: MCS9 stalled transfers despite advertised support.
 // Keep the hardware capability maps intact for advertisement and reception.
 const MAX_TX_VHT_MCS: u8 = 8;
+
+/// Requested data-frame coding, independent of PHY rate selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum FecPolicy {
+    Auto,
+    #[default]
+    Bcc,
+    Ldpc,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Coding {
+    #[default]
+    Bcc,
+    Ldpc,
+}
+impl fmt::Display for Coding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bcc => "bcc",
+            Self::Ldpc => "ldpc",
+        })
+    }
+}
+/// Concrete per-frame parameters, also used as the radiotap cache key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TxParameters {
+    pub rate: Rate,
+    pub coding: Coding,
+}
+impl From<Rate> for TxParameters {
+    fn from(rate: Rate) -> Self {
+        Self {
+            rate,
+            coding: Coding::Bcc,
+        }
+    }
+}
+impl FecPolicy {
+    pub fn validate_rate(self, rate: Rate) -> Result<(), crate::protocol::Error> {
+        if self == Self::Ldpc && matches!(rate, Rate::Legacy(_)) {
+            return Err(crate::protocol::Error::Invalid(
+                "LDPC requires an HT or VHT data rate",
+            ));
+        }
+        Ok(())
+    }
+    pub fn resolve(
+        self,
+        rate: Rate,
+        tx_ldpc: bool,
+        peer: &BandCapabilities,
+    ) -> Result<TxParameters, crate::protocol::Error> {
+        // Discovery and legacy fallback frames always use BCC.
+        if matches!(rate, Rate::Legacy(_)) || self == Self::Bcc {
+            return Ok(rate.into());
+        }
+        let receiver_ldpc = match rate {
+            Rate::Mcs { .. } => peer.ht.as_ref().is_some_and(|h| h.cap_info & 1 != 0),
+            Rate::Vht { .. } => peer
+                .vht
+                .as_ref()
+                .is_some_and(|v| v.cap_info & (1 << 4) != 0),
+            _ => false,
+        };
+        let coding = if tx_ldpc && receiver_ldpc {
+            Coding::Ldpc
+        } else {
+            if self == Self::Ldpc {
+                return Err(crate::protocol::Error::Invalid(
+                    "LDPC requires a supported injection driver and peer RX LDPC capability",
+                ));
+            }
+            Coding::Bcc
+        };
+        Ok(TxParameters { rate, coding })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rate {
@@ -247,4 +325,181 @@ impl BandCapabilities {
                 .is_some_and(|h| h.cap_info & (1 << if width == 40 { 6 } else { 5 }) != 0),
         }
     }
+}
+
+/// Hardware ACK policy, independent of channel scheduling.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AckPolicy {
+    #[default]
+    Auto,
+    Normal,
+    Noack,
+}
+impl AckPolicy {
+    pub fn noack(self, profile_noack: bool) -> bool {
+        match self {
+            Self::Auto => profile_noack,
+            Self::Normal => false,
+            Self::Noack => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AutoRate {
+    context: Option<(ChannelDefinition, u32, BandCapabilities, BandCapabilities)>,
+    rates: Vec<Rate>,
+    selected: usize,
+    failures: u16,
+    frames: u16,
+    retries: u32,
+    clean: u16,
+    pub generation: u64,
+}
+impl AutoRate {
+    pub fn select(
+        &mut self,
+        channel: ChannelDefinition,
+        local: &BandCapabilities,
+        peer: &BandCapabilities,
+        peer_width: u32,
+    ) -> Rate {
+        let context = (channel, peer_width, local.clone(), peer.clone());
+        if self.context.as_ref() != Some(&context) {
+            let generation = self.generation.wrapping_add(1);
+            *self = Self {
+                generation,
+                ..Self::default()
+            };
+            self.context = Some(context);
+            let mut rates = vec![Rate::Legacy(6), Rate::DISCOVERY, Rate::Legacy(24)];
+            for width in [20, 40, 80] {
+                if width > channel.width_mhz || width > peer_width {
+                    continue;
+                }
+                for index in 0..=MAX_TX_VHT_MCS {
+                    for nss in 1..=8 {
+                        for sgi in [false, true] {
+                            let rate = Rate::Vht {
+                                index,
+                                nss,
+                                width: width as u8,
+                                sgi,
+                            };
+                            if rate.phy_mbps().is_some()
+                                && rate.for_peer(channel, local, peer, peer_width) == rate
+                            {
+                                rates.push(rate);
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(tx), Some(rx)) = (&local.ht, &peer.ht) {
+                for index in 0..32 {
+                    let byte = index as usize / 8;
+                    if peer.single_stream() && index >= 8 {
+                        continue;
+                    }
+                    if tx
+                        .tx_mask
+                        .is_none_or(|mask| mask[byte] & rx.rx_mask[byte] & (1 << (index % 8)) == 0)
+                    {
+                        continue;
+                    }
+                    for sgi in [false, true] {
+                        if !sgi || (local.short_gi(20) && peer.short_gi(20)) {
+                            rates.push(Rate::Mcs { index, sgi });
+                        }
+                    }
+                }
+            }
+            // Start with the same capability ceiling as Auto; lower rates are recovery choices.
+            let ceiling = Rate::Auto
+                .for_peer(channel, local, peer, peer_width)
+                .phy_mbps()
+                .unwrap_or(12.0);
+            rates.retain(|r| r.phy_mbps().is_some_and(|v| v <= ceiling));
+            rates.sort_by(|a, b| b.phy_mbps().unwrap().total_cmp(&a.phy_mbps().unwrap()));
+            rates.dedup();
+            self.rates = rates;
+        }
+        self.rates
+            .get(self.selected)
+            .copied()
+            .unwrap_or(Rate::DISCOVERY)
+    }
+    pub fn feedback(&mut self, requested: Rate, failed: bool, retries: u8) {
+        // Delayed completions from an older selection cannot undo a backoff.
+        if self.rates.get(self.selected) != Some(&requested) {
+            return;
+        }
+        let previous = self.selected;
+        self.frames += 1;
+        self.failures += u16::from(failed);
+        self.retries += u32::from(retries);
+        self.clean = if failed || retries != 0 {
+            0
+        } else {
+            self.clean + 1
+        };
+        if self.failures >= 4 || (self.frames >= 16 && self.retries >= u32::from(self.frames) * 2) {
+            let speed = requested.phy_mbps().unwrap_or(12.0) * 0.85;
+            self.selected = ((self.selected + 1)..self.rates.len())
+                .find(|&i| self.rates[i].phy_mbps().unwrap() <= speed)
+                .unwrap_or(self.rates.len().saturating_sub(1));
+            self.clean = 0;
+            self.frames = 0;
+            self.failures = 0;
+            self.retries = 0;
+        } else if self.clean >= 128 {
+            self.selected = self.selected.saturating_sub(1);
+            self.clean = 0;
+            self.frames = 0;
+            self.failures = 0;
+            self.retries = 0;
+        } else if self.frames >= 32 {
+            self.frames = 0;
+            self.failures = 0;
+            self.retries = 0;
+        }
+        if self.selected != previous {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+}
+
+pub(crate) fn reported_rate(radio: &radiotap::Radiotap) -> Option<Rate> {
+    use radiotap::field::ext::GuardInterval;
+    if let Some(vht) = &radio.vht {
+        let user = vht.users[0]?;
+        return Some(Rate::Vht {
+            index: user.index,
+            nss: user.nss,
+            width: vht.bw?.bandwidth,
+            sgi: vht.gi? == GuardInterval::Short,
+        });
+    }
+    if let Some(mcs) = &radio.mcs {
+        if mcs.bw?.bandwidth != 20 {
+            return None;
+        }
+        return Some(Rate::Mcs {
+            index: mcs.index?,
+            sgi: mcs.gi? == GuardInterval::Short,
+        });
+    }
+    let value = radio.rate?.value;
+    (value.fract() == 0.0).then_some(Rate::Legacy(value as u8))
 }

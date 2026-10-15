@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Privileged, single-owner radio leases. No user files, contacts, TLS or archives.
-use crate::{link::Link, radio::RadioArgs, rate::Rate, timeouts::Timeouts};
+use crate::{
+    link::Link,
+    radio::RadioArgs,
+    rate::{FecPolicy, Rate},
+    timeouts::Timeouts,
+};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use owl_ipc::{Event, LinkInfo, Mac, Request};
@@ -28,6 +33,9 @@ pub struct Options {
     /// Data transmit rate; VHT requests are capped at MCS8.
     #[arg(long, default_value = "auto")]
     pub rate: Rate,
+    /// Data coding: BCC by default; auto/LDPC require a supported injection backend.
+    #[arg(long, value_enum, default_value = "bcc")]
+    pub fec: FecPolicy,
     #[arg(long, default_value_t = 60)]
     pub election_metric: u32,
     #[arg(long, default_value_t = 0)]
@@ -86,7 +94,7 @@ async fn connection(
         }
     };
     let (policy, public) = watch::channel(false);
-    let (traffic, transfers) = watch::channel(0);
+    let (traffic, transfers) = watch::channel(owl_ipc::TransferState::default());
     let generation = owl_ipc::generation();
     let save = opts
         .save
@@ -102,6 +110,7 @@ async fn connection(
         service_port: port,
         save,
         rate: opts.rate,
+        fec: opts.fec,
         election_metric: opts.election_metric,
         election_counter: opts.election_counter,
     };
@@ -132,6 +141,7 @@ async fn connection(
     let result = async {
         send(&mut writer, Event::Ready { link: info }, timeouts.control_request).await?;
         let mut snapshot = link.snapshot.clone();
+        let mut channel_ready = link.channel_ready.clone();
         let mut monitor = tokio::time::interval(Duration::from_millis(250));
         // Only client control messages refresh this deadline, never snapshots.
         let mut last_request = tokio::time::Instant::now();
@@ -146,14 +156,33 @@ async fn connection(
                     value["timeouts"] = serde_json::to_value(crate::timeouts::RadioTimeouts::from(timeouts))?;
                     send(&mut writer, Event::Snapshot { value }, timeouts.control_request).await?;
                 }
+                ready = channel_ready.changed(), if !opts.no_radio => {
+                    ready.context("AWDL channel readiness stream ended")?;
+                    let applied = *channel_ready.borrow_and_update();
+                    let state = *traffic.borrow();
+                    if applied == Some(state.epoch) && state.transfers > 0 {
+                        send(&mut writer, Event::ChannelReady {
+                            generation: generation.clone(), transfer_epoch: state.epoch,
+                        }, timeouts.control_request).await?;
+                    }
+                }
                 request = owl_ipc::read::<_, Request>(&mut reader) => {
                     last_request = tokio::time::Instant::now();
                     match request? {
-                        Request::State { generation: id, service_enabled, transfers } => {
+                        Request::State { generation: id, service_enabled, transfers, transfer_epoch } => {
                             ensure!(id == generation, "stale link generation");
                             ensure!(transfers <= 64, "too many active transfers");
+                            let previous = *traffic.borrow();
+                            ensure!(transfer_epoch > previous.epoch ||
+                                (transfer_epoch == previous.epoch && transfers == previous.transfers),
+                                "stale transfer activity revision");
                             policy.send_replace(service_enabled);
-                            traffic.send_replace(transfers as usize);
+                            traffic.send_replace(owl_ipc::TransferState { epoch: transfer_epoch, transfers });
+                            if opts.no_radio && transfers > 0 {
+                                send(&mut writer, Event::ChannelReady {
+                                    generation: generation.clone(), transfer_epoch,
+                                }, timeouts.control_request).await?;
+                            }
                         }
                         Request::Release { generation: id } => { ensure!(id == generation, "stale link generation"); break; }
                         Request::Acquire { .. } => bail!("link lease already acquired"),
@@ -164,7 +193,7 @@ async fn connection(
         Ok::<_, anyhow::Error>(())
     }.await;
     policy.send_replace(false);
-    traffic.send_replace(0);
+    traffic.send_modify(|state| state.transfers = 0);
     let cleanup = link.stop().await;
     // No subsequent acquire can overlap cleanup, including after a bad request.
     drop(permit);
@@ -182,6 +211,7 @@ async fn connection(
 }
 pub async fn run(opts: Options, timeouts: Timeouts) -> Result<()> {
     timeouts.validate()?;
+    opts.fec.validate_rate(opts.rate)?;
     ensure!(
         nix::unistd::geteuid().is_root() || opts.no_radio,
         "owld requires root for WLAN operations"
@@ -353,6 +383,7 @@ mod tests {
                         generation: "stale".into(),
                         service_enabled: true,
                         transfers: 1,
+                        transfer_epoch: 1,
                     },
                 )
                 .await
@@ -363,6 +394,26 @@ mod tests {
                 assert!(error.unwrap().contains("stale"));
                 task.await.unwrap().unwrap();
             } else {
+                owl_ipc::write(
+                    &mut write,
+                    &Request::State {
+                        generation: link.generation.clone(),
+                        service_enabled: false,
+                        transfers: 1,
+                        transfer_epoch: 1,
+                    },
+                )
+                .await
+                .unwrap();
+                let Event::ChannelReady {
+                    generation,
+                    transfer_epoch,
+                } = owl_ipc::read(&mut read).await.unwrap()
+                else {
+                    panic!("channel ready")
+                };
+                assert_eq!(generation, link.generation);
+                assert_eq!(transfer_epoch, 1);
                 // Lost transport clients must release their radio owner without an RPC.
                 drop(read);
                 drop(write);

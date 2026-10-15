@@ -18,6 +18,14 @@
 #   station stops receiving afterward.
 # mt76_pm: disable mt76 runtime power management and deep sleep for the session,
 #   then restore the saved settings during cleanup.
+# supports_tx_ldpc: the injection driver can request hardware LDPC encoding.
+#   Defaults to false when omitted. This declares support; --fec bcc remains the
+#   CLI default. Opt in with --fec auto or --fec ldpc. RX LDPC bits do not prove
+#   TX support. MT76x2 support follows the upstream TX descriptor implementation;
+#   injected LDPC still needs on-air validation.
+# tx_noack: request unicast transmission without waiting for hardware ACKs.
+#   Defaults to false. Keep true only for a driver workaround; --tx-ack normal
+#   overrides it. This is independent of shared/exclusive mode and channel pinning.
 # exclusive_backend:
 #   ibss: join AWDL's BSSID on owlibss0 and inject through a passive monitor.
 #   active-monitor: an active monitor ACKs unicast; the existing station becomes
@@ -34,28 +42,36 @@ mode = "shared"
 mon_mac = "station"
 reconnect = true
 mt76_pm = true
+supports_tx_ldpc = false
 exclusive_backend = "ibss"
 
 # Intel AX201, kernel 6.8. Associated, the firmware passes up no AWDL frames.
 # Starts no ad-hoc cell on 5 GHz, so runs on channel 6: a 2.4 MB photo from an
 # iPhone in 17 s, to it in 10.5 s. The AX200 and AX211 are untested.
 [profiles.iwlwifi]
+# Retain the original Intel firmware workaround.
+tx_noack = true
 tested = true
 mode = "exclusive"
 mon_mac = "station"
 reconnect = false
 mt76_pm = false
+supports_tx_ldpc = false
 exclusive_backend = "ibss"
 
 # MediaTek MT7612U USB (0e8d:7612), kernel 7.2.9. Active monitor plus the existing
 # station as a passive monitor; channel 6 is preferred for discovery. Images
 # transferred in both directions; sending uses BLE wake-up.
+# Channel changes can cancel the driver's TX-status cleanup worker, causing
+# normal-ACK injection to stall. Use --tx-ack normal after the driver is fixed.
 [profiles.mt76x2u]
+tx_noack = true
 tested = true
 mode = "exclusive"
 mon_mac = "station"
 reconnect = false
-mt76_pm = false
+mt76_pm = true
+supports_tx_ldpc = true
 exclusive_backend = "active-monitor"
 
 # Any other card. Needs monitor-mode injection while associated, and an AP on
@@ -66,4 +82,5 @@ mode = "shared"
 mon_mac = "station"
 reconnect = true
 mt76_pm = false
+supports_tx_ldpc = false
 exclusive_backend = "ibss"

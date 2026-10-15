@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{
     channel::Sequence,
-    rate::{Rate, vht_width_code},
+    rate::{Coding, Rate, TxParameters, vht_width_code},
 };
 use serde::Serialize;
 
@@ -115,8 +115,23 @@ pub struct Action {
     pub capabilities: BandCapabilities,
 }
 #[derive(Debug)]
+pub struct TxStatus {
+    pub failed: bool,
+    pub retries: u8,
+    pub noack: bool,
+    pub rate: Option<Rate>,
+    pub fingerprint: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddBaRequest {
+    pub dialog_token: u8,
+    pub parameters: u16,
+}
+#[derive(Debug)]
 pub enum Body {
+    TxStatus(TxStatus),
     Action(Action),
+    AddBaRequest(AddBaRequest),
     Data(Vec<Vec<u8>>),
 }
 #[derive(Debug)]
@@ -179,17 +194,40 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Frame>, Error> {
     if flags.is_some_and(|f| f.data_pad) {
         r.take((4 - header_len % 4) % 4)?;
     }
-    let body = match fc & 0x00fc {
-        0xd0 => match parse_action(r.rest())? {
-            Some(a) => Body::Action(a),
-            None => return Ok(None),
-        },
-        0x08 | 0x88 => Body::Data(if qos & 0x80 != 0 {
-            parse_amsdu(r.rest())?
-        } else {
-            vec![parse_data(r.rest(), source, destination)?]
-        }),
-        _ => return Ok(None),
+    let completion = radio
+        .tx_flags
+        .zip(radio.data_retries)
+        .filter(|_| matches!(fc & 0x00fc, 0x08 | 0x88));
+    let body = if let Some((flags, retries)) = completion {
+        Body::TxStatus(TxStatus {
+            failed: flags.fail,
+            retries: retries.value,
+            noack: flags.no_ack,
+            rate: crate::rate::reported_rate(&radio),
+            fingerprint: tx_fingerprint(r.rest(), qos & 0x80 != 0).ok_or(Error::Truncated)?,
+        })
+    } else {
+        match fc & 0x00fc {
+            0xd0 if r.rest().starts_with(&[3, 0]) => {
+                r.take(2)?; // Block Ack category, ADDBA request.
+                let request = AddBaRequest {
+                    dialog_token: r.u8()?,
+                    parameters: r.le16()?,
+                };
+                r.take(4)?; // Timeout and starting sequence control must be present.
+                Body::AddBaRequest(request)
+            }
+            0xd0 => match parse_action(r.rest())? {
+                Some(a) => Body::Action(a),
+                None => return Ok(None),
+            },
+            0x08 | 0x88 => Body::Data(if qos & 0x80 != 0 {
+                parse_amsdu(r.rest())?
+            } else {
+                vec![parse_data(r.rest(), source, destination)?]
+            }),
+            _ => return Ok(None),
+        }
     };
     Ok(Some(Frame {
         source,
@@ -394,7 +432,11 @@ fn parse_amsdu(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(out)
 }
 
-pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Result<Vec<u8>, Error> {
+pub fn radiotap_tx(parameters: TxParameters, noack: bool, fcs: bool) -> Result<Vec<u8>, Error> {
+    let TxParameters { rate, coding } = parameters;
+    if coding == Coding::Ldpc && !matches!(rate, Rate::Mcs { .. } | Rate::Vht { .. }) {
+        return Err(Error::Invalid("LDPC requires an HT or VHT rate"));
+    }
     if rate.phy_mbps().is_none() {
         return Err(Error::Invalid("concrete transmit rate"));
     }
@@ -408,16 +450,21 @@ pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Result<Vec<u8>, Error>
         present |= 1 << 2;
         fields.push(rate * 2);
     }
-    if noack {
-        present |= 1 << 15;
-        if (8 + fields.len()) % 2 != 0 {
-            fields.push(0);
-        }
-        fields.extend_from_slice(&8u16.to_le_bytes());
+    // Shared-mode injection can be adopted by the matching station interface.
+    // Preserve our sequence number so hardware reports still match the ledger.
+    present |= 1 << 15;
+    if (8 + fields.len()) % 2 != 0 {
+        fields.push(0);
     }
+    fields.extend_from_slice(&(0x10u16 | if noack { 8 } else { 0 }).to_le_bytes());
     if let Rate::Mcs { index, sgi } = rate {
         present |= 1 << 19;
-        fields.extend_from_slice(&[7, if sgi { 4 } else { 0 }, index]);
+        let ldpc = coding == Coding::Ldpc;
+        fields.extend_from_slice(&[
+            7 | if ldpc { 0x10 } else { 0 },
+            (if sgi { 4 } else { 0 }) | if ldpc { 0x10 } else { 0 },
+            index,
+        ]);
     }
     if let Rate::Vht {
         index,
@@ -426,11 +473,18 @@ pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Result<Vec<u8>, Error>
         sgi,
     } = rate
     {
+        if coding == Coding::Ldpc {
+            // Linux 7.2's VHT injection parser ignores its coding byte. A preceding
+            // MCS field sets TX_CTL_LDPC; VHT overrides the rate, keeping that flag.
+            // HAVE_MCS is required: a FEC-only MCS field is skipped by mac80211.
+            present |= 1 << 19;
+            fields.extend_from_slice(&[0x12, 0x10, 0]);
+        }
         present |= 1 << 21;
         if (8 + fields.len()) % 2 != 0 {
             fields.push(0);
         }
-        // VHT known GI/bandwidth, SU user 0, BCC, no beamforming or STBC.
+        // VHT known GI/bandwidth, SU user 0, selected FEC, no beamforming or STBC.
         fields.extend_from_slice(&0x0044u16.to_le_bytes());
         fields.extend_from_slice(&[
             if sgi { 4 } else { 0 },
@@ -439,7 +493,7 @@ pub fn radiotap_tx(rate: Rate, noack: bool, fcs: bool) -> Result<Vec<u8>, Error>
             0,
             0,
             0,
-            0,
+            u8::from(coding == Coding::Ldpc),
             0,
             0,
             0,
@@ -471,7 +525,7 @@ fn le32(v: &mut Vec<u8>, n: u32) {
     v.extend_from_slice(&n.to_le_bytes());
 }
 /// AWDL's compact HT field carries RX MCS 0–31, not the full IEEE HT MCS set.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HtCapabilities {
     pub cap_info: u16,
     pub ampdu_params: u8,
@@ -480,7 +534,7 @@ pub struct HtCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_mask: Option<[u8; 4]>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VhtCapabilities {
     pub cap_info: u32,
     pub rx_mcs_map: u16,
@@ -488,7 +542,7 @@ pub struct VhtCapabilities {
     pub tx_mcs_map: u16,
     pub tx_highest: u16,
 }
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct BandCapabilities {
     pub ht: Option<HtCapabilities>,
     pub vht: Option<VhtCapabilities>,
@@ -522,8 +576,25 @@ pub struct Advertisement<'a> {
     pub now_us: i64,
 }
 
+/// Decline RX Block Ack negotiation; no BA/reorder state is established.
+pub fn encode_addba_rejection(
+    source: Mac,
+    destination: Mac,
+    request: AddBaRequest,
+    sequence: u16,
+    noack: bool,
+) -> Vec<u8> {
+    let mut out = radiotap_tx(Rate::DISCOVERY.into(), noack, false).expect("valid management rate");
+    header(&mut out, source, destination, sequence, 0xd0);
+    out.extend_from_slice(&[3, 1, request.dialog_token]);
+    le16(&mut out, 37); // WLAN_STATUS_REQUEST_DECLINED.
+    le16(&mut out, request.parameters & 0x003e); // Echo TID/policy; no A-MSDU or buffer agreement.
+    le16(&mut out, 0);
+    out
+}
+
 pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u8> {
-    let mut out = radiotap_tx(Rate::DISCOVERY, false, false).expect("valid discovery rate");
+    let mut out = radiotap_tx(Rate::DISCOVERY.into(), false, false).expect("valid discovery rate");
     header(&mut out, a.mac, BROADCAST, sequence, 0xd0);
     out.extend_from_slice(&[127, 0, 0x17, 0xf2, 8, 0x10, subtype, 0]);
     le32(&mut out, a.now_us as u32);
@@ -645,12 +716,12 @@ pub fn encode_data(
     ethernet: &[u8],
     sequence: u16,
     data_sequence: u16,
-    rate: Rate,
-    fixed: bool,
+    parameters: TxParameters,
+    noack: bool,
     fcs: bool,
 ) -> Result<Vec<u8>, Error> {
     let (destination, source, ipv6) = ethernet_payload(ethernet)?;
-    let mut out = radiotap_tx(rate, fixed && !destination.multicast(), fcs)?;
+    let mut out = radiotap_tx(parameters, noack && !destination.multicast(), fcs)?;
     let header_start = out.len();
     header(&mut out, source, destination, sequence, 8);
     data_payload(&mut out, ipv6, data_sequence);
@@ -661,8 +732,8 @@ pub fn encode_amsdu(
     packets: &[&[u8]],
     sequence: u16,
     data_sequence: u16,
-    rate: Rate,
-    fixed: bool,
+    parameters: TxParameters,
+    noack: bool,
     fcs: bool,
 ) -> Result<Vec<u8>, Error> {
     if !(2..=MAX_AMSDU_PACKETS).contains(&packets.len()) {
@@ -672,7 +743,7 @@ pub fn encode_amsdu(
     if !destination.valid_unicast() || !source.valid_unicast() {
         return Err(Error::Invalid("A-MSDU address"));
     }
-    let mut out = radiotap_tx(rate, fixed, fcs)?;
+    let mut out = radiotap_tx(parameters, noack, fcs)?;
     let header_start = out.len();
     header(&mut out, source, destination, sequence, 0x88);
     out.extend_from_slice(&[0x80, 0]); // TID 0, A-MSDU present, normal on-air ACK policy.
@@ -728,4 +799,67 @@ pub fn airdrop_service(mac: Mac, hostname: &str, port: u16) -> Vec<u8> {
     record(&mut out, &instance, 33, &srv);
     record(&mut out, &instance, 16, &label(b"flags=137"));
     out
+}
+
+/// Identity of one injected MPDU; excludes mutable frame-control/duration fields.
+pub(crate) fn transmit_key(bytes: &[u8]) -> Option<(Mac, u16, u32)> {
+    let rt = u16::from_le_bytes(bytes.get(2..4)?.try_into().ok()?) as usize;
+    if rt < 8 {
+        return None;
+    }
+    let data = bytes.get(rt..)?;
+    let dst = Mac(data.get(4..10)?.try_into().ok()?);
+    let seq = u16::from_le_bytes(data.get(22..24)?.try_into().ok()?) >> 4;
+    let fc = u16::from_le_bytes(data.get(..2)?.try_into().ok()?);
+    let qos = fc & 0x00fc == 0x88;
+    let control = if qos {
+        u16::from_le_bytes(data.get(24..26)?.try_into().ok()?)
+    } else {
+        0
+    };
+    let header = if qos {
+        26 + if fc & 0x8000 != 0 { 4 } else { 0 }
+    } else {
+        24
+    };
+    Some((
+        dst,
+        seq,
+        tx_fingerprint(data.get(header..)?, control & 0x80 != 0)?,
+    ))
+}
+
+// mt76 USB completion SKBs retain up to seven bytes of DMA alignment/trailer
+// padding. Determine the logical MPDU body from checked protocol lengths;
+// never trim zeros from application payload or accept unbounded suffixes.
+fn tx_fingerprint(body: &[u8], aggregate: bool) -> Option<u32> {
+    fn msdu_len(body: &[u8]) -> Option<usize> {
+        if body.get(16)? >> 4 != 6 {
+            return None;
+        }
+        Some(56 + u16::from_be_bytes(body.get(20..22)?.try_into().ok()?) as usize)
+    }
+    let end = if aggregate {
+        let mut at = 0usize;
+        loop {
+            let len = u16::from_be_bytes(body.get(at + 12..at + 14)?.try_into().ok()?) as usize;
+            let end = at.checked_add(14 + len)?;
+            let subframe = body.get(at + 14..end)?;
+            if msdu_len(subframe)? != len {
+                return None;
+            }
+            let tail = body.get(end..)?;
+            if tail.len() <= 7 && tail.iter().all(|&b| b == 0) {
+                break end;
+            }
+            at = (end + 3) & !3;
+        }
+    } else {
+        msdu_len(body)?
+    };
+    let tail = body.get(end..)?;
+    if tail.len() > 7 || tail.iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(crc32fast::hash(body.get(..end)?))
 }

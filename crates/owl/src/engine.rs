@@ -2,7 +2,7 @@
 use crate::{
     channel::{Clock, SLOT_US, SLOTS, Sequence, Strategy},
     protocol::{self, Action, Advertisement, Body, Election, Error, Frame, Mac},
-    rate::Rate,
+    rate::{FecPolicy, Rate, TxParameters},
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -53,7 +53,9 @@ pub struct Peer {
     pub sync_offset_us: Option<i64>,
     pub rssi: Option<i8>,
     pub capabilities: protocol::BandCapabilities,
-    pub tx_rate: Option<Rate>,
+    pub tx_parameters: Option<TxParameters>,
+    #[serde(skip)]
+    rate_control: crate::rate::AutoRate,
     #[serde(skip)]
     mif: bool,
     #[serde(skip)]
@@ -75,7 +77,8 @@ impl Peer {
             sync_offset_us: None,
             rssi: None,
             capabilities: protocol::BandCapabilities::default(),
-            tx_rate: None,
+            tx_parameters: None,
+            rate_control: Default::default(),
             mif: false,
             v2: false,
             recent: VecDeque::new(),
@@ -93,12 +96,16 @@ pub struct Config {
     pub channel: u8,
     pub strategy: Strategy,
     pub fixed_radio: bool,
+    pub tx_noack: bool,
     pub metric_first: bool,
     pub election_metric: u32,
     pub election_counter: u32,
     pub widen: usize,
     pub filter_rssi: bool,
     pub rate: Rate,
+    pub fec: FecPolicy,
+    /// TX encoder support supplied by the radio backend, not RX advertisements.
+    pub tx_ldpc: bool,
     pub capabilities: protocol::RadioCapabilities,
     pub operating_channel: Option<crate::channel::ChannelDefinition>,
 }
@@ -110,10 +117,26 @@ impl Config {
             .unwrap_or_else(|| Sequence::fixed(channel))
     }
 }
+/// Link-local diagnostics for payload-free TCP ACKs, independent of AirDrop.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AckTiming {
+    pub injected: u64,
+    pub dropped: u64,
+    pub schedule_blocked: u64,
+    pub airtime_blocked: u64,
+    pub backpressured: u64,
+    pub queue_wait_us_total: u64,
+    pub queue_wait_us_max: u64,
+    pub injection_attempts: u64,
+    pub injection_us_total: u64,
+    pub injection_us_max: u64,
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Stats {
     pub captured: u64,
     pub rx_action: u64,
+    pub rx_addba_requests: u64,
+    pub tx_addba_rejections: u64,
     pub rx_data: u64,
     pub rx_unknown: u64,
     pub rx_ignored: u64,
@@ -126,6 +149,11 @@ pub struct Stats {
     pub tx_backpressure: u64,
     pub tx_unicast: u64,
     pub tx_packets: u64,
+    pub tx_status_acked: u64,
+    pub tx_status_failed: u64,
+    pub tx_status_retries: u64,
+    pub tx_status_ignored: u64,
+    pub tx_ack: AckTiming,
     pub tx_amsdu: u64,
     pub tx_aggregated_packets: u64,
     pub tx_aggregation_rejected: u64,
@@ -137,6 +165,10 @@ pub struct Stats {
 pub enum Event {
     Added(Mac),
     Removed(Mac),
+    AddBaRequest {
+        peer: Mac,
+        request: protocol::AddBaRequest,
+    },
 }
 #[derive(Debug, Serialize)]
 pub struct Summary<'a> {
@@ -145,6 +177,15 @@ pub struct Summary<'a> {
     pub election: &'a Election,
     pub sequence: &'a Sequence,
     pub frequencies_mhz: &'a BTreeMap<u16, u64>,
+}
+struct PendingTx {
+    destination: Mac,
+    sequence: u16,
+    fingerprint: u32,
+    rate: Rate,
+    channel: Option<crate::channel::ChannelDefinition>,
+    sent_us: i64,
+    generation: u64,
 }
 pub struct Engine {
     pub config: Config,
@@ -160,6 +201,7 @@ pub struct Engine {
     pending_rotation: Option<usize>,
     source: Option<Mac>,
     pending_syns: VecDeque<PendingSyn>,
+    pending_tx: VecDeque<PendingTx>,
 }
 impl Engine {
     pub fn new(config: Config, now: i64) -> Self {
@@ -182,6 +224,7 @@ impl Engine {
             pending_rotation: None,
             source: None,
             pending_syns: VecDeque::new(),
+            pending_tx: VecDeque::new(),
         }
     }
     pub fn summary(&self) -> Summary<'_> {
@@ -207,6 +250,10 @@ impl Engine {
                 return Err(e);
             }
         };
+        if let Body::TxStatus(status) = &frame.body {
+            self.tx_status(&frame, status, now);
+            return Ok((vec![], vec![]));
+        }
         if let Some(freq) = frame.frequency {
             *self.frequencies.entry(freq).or_default() += 1;
         }
@@ -215,6 +262,23 @@ impl Engine {
             return Ok((vec![], vec![]));
         }
         match &frame.body {
+            Body::TxStatus(_) => unreachable!("handled before RX"),
+            Body::AddBaRequest(request) => {
+                if frame.destination != self.config.mac
+                    || !self.peers.get(&frame.source).is_some_and(|p| p.valid)
+                {
+                    self.stats.rx_ignored += 1;
+                    return Ok((vec![], vec![]));
+                }
+                self.stats.rx_addba_requests += 1;
+                Ok((
+                    vec![],
+                    vec![Event::AddBaRequest {
+                        peer: frame.source,
+                        request: *request,
+                    }],
+                ))
+            }
             Body::Action(a) => {
                 let events = self.action(&frame, a, now)?;
                 let frames = if events
@@ -578,6 +642,20 @@ impl Engine {
             true
         }
     }
+    pub(crate) fn addba_rejection(
+        &mut self,
+        peer: Mac,
+        request: protocol::AddBaRequest,
+    ) -> Vec<u8> {
+        let sequence = self.next_sequence();
+        protocol::encode_addba_rejection(
+            self.config.mac,
+            peer,
+            request,
+            sequence,
+            self.config.tx_noack,
+        )
+    }
     fn next_sequence(&mut self) -> u16 {
         let n = self.ieee_sequence;
         self.ieee_sequence = (n + 1) & 4095;
@@ -622,43 +700,134 @@ impl Engine {
         }
         frame
     }
-    pub fn data_rate(&mut self, destination: Mac) -> Rate {
+    pub(crate) fn has_pending_tx(&self, now: i64) -> bool {
+        self.pending_tx
+            .iter()
+            .any(|p| now.saturating_sub(p.sent_us) < self.config.pending_timeout.as_micros() as i64)
+    }
+    pub(crate) fn record_tx(&mut self, bytes: &[u8], parameters: TxParameters, now: i64) {
+        if self.config.tx_noack {
+            return;
+        }
+        let Some((destination, sequence, fingerprint)) = protocol::transmit_key(bytes) else {
+            return;
+        };
+        if destination.multicast() {
+            return;
+        }
+        // Bound memory and reject old completions after sequence-number wrap.
+        self.pending_tx.retain(|p| {
+            now.saturating_sub(p.sent_us) < self.config.pending_timeout.as_micros() as i64
+        });
+        if self.pending_tx.len() == 1024 {
+            self.pending_tx.pop_front();
+        }
+        self.pending_tx.push_back(PendingTx {
+            destination,
+            sequence,
+            fingerprint,
+            rate: parameters.rate,
+            channel: self.config.operating_channel,
+            sent_us: now,
+            generation: self
+                .peers
+                .get(&destination)
+                .map_or(0, |p| p.rate_control.generation),
+        });
+    }
+    fn tx_status(&mut self, frame: &Frame, status: &protocol::TxStatus, now: i64) {
+        // mt76 may synthesize an ACK when TX status is lost; those reports have
+        // no PHY rate. They do not prove delivery and must not train Auto.
+        if status.rate.is_none() || status.noack || self.config.tx_noack {
+            self.stats.tx_status_ignored += 1;
+            return;
+        }
+        let at = self.pending_tx.iter().position(|p| {
+            frame.source == self.config.mac
+                && frame.destination == p.destination
+                && frame.sequence == p.sequence
+                && status.fingerprint == p.fingerprint
+        });
+        let Some(at) = at else {
+            self.stats.tx_status_ignored += 1;
+            return;
+        };
+        let pending = self.pending_tx.remove(at).expect("matched pending TX");
+        if now.saturating_sub(pending.sent_us) >= self.config.pending_timeout.as_micros() as i64 {
+            self.stats.tx_status_ignored += 1;
+            return;
+        }
+        self.stats.tx_status_acked += u64::from(!status.failed);
+        self.stats.tx_status_failed += u64::from(status.failed);
+        self.stats.tx_status_retries += u64::from(status.retries);
+        debug!(peer=%frame.destination, sequence=frame.sequence, requested_rate=%pending.rate, reported_rate=?status.rate, failed=status.failed, retries=status.retries, completion_us=now.saturating_sub(pending.sent_us), "AWDL TX completion");
+        if self.config.rate == Rate::Auto
+            && pending.channel == self.config.operating_channel
+            && let Some(peer) = self.peers.get_mut(&frame.destination).filter(|p| p.valid)
+            && pending.generation == peer.rate_control.generation
+        {
+            peer.rate_control
+                .feedback(pending.rate, status.failed, status.retries);
+        }
+    }
+    pub fn data_parameters(&mut self, destination: Mac) -> Result<TxParameters, Error> {
         let requested = self.config.rate;
         let fallback = requested.fallback();
         // Automatic/VHT multicast discovery stays at the robust legacy rate.
         if destination.multicast() {
-            return fallback;
+            return Ok(fallback.into());
         }
         let Some(peer) = self.peers.get_mut(&destination).filter(|p| p.valid) else {
-            return fallback;
+            return Ok(fallback.into());
         };
         let rate = self.config.operating_channel.map_or(fallback, |channel| {
-            requested.for_peer(
-                channel,
-                self.config.capabilities.for_channel(channel.channel),
-                &peer.capabilities,
-                peer.sequence
-                    .as_ref()
-                    .map_or(20, |s| s.width_mhz(channel.channel)),
-            )
+            let local = self.config.capabilities.for_channel(channel.channel);
+            let width = peer
+                .sequence
+                .as_ref()
+                .map_or(20, |s| s.width_mhz(channel.channel));
+            if requested == Rate::Auto && !self.config.tx_noack {
+                peer.rate_control
+                    .select(channel, local, &peer.capabilities, width)
+            } else {
+                requested.for_peer(channel, local, &peer.capabilities, width)
+            }
         });
-        if peer.tx_rate != Some(rate) {
-            info!(peer=%destination, %requested, %rate, "selected data injection rate");
-            peer.tx_rate = Some(rate);
+        let parameters = self
+            .config
+            .fec
+            .resolve(rate, self.config.tx_ldpc, &peer.capabilities)?;
+        if peer.tx_parameters != Some(parameters) {
+            info!(peer=%destination, %requested, %rate, requested_fec=?self.config.fec, coding=%parameters.coding, "selected data injection parameters");
+            peer.tx_parameters = Some(parameters);
         }
-        rate
+        Ok(parameters)
     }
-    pub(crate) fn data_frame(&mut self, packets: &[&[u8]], rate: Rate) -> Result<Vec<u8>, Error> {
+    pub(crate) fn data_frame(
+        &mut self,
+        packets: &[&[u8]],
+        parameters: TxParameters,
+    ) -> Result<Vec<u8>, Error> {
         let seq = self.next_sequence();
         let data_seq = self.data_sequence;
         self.data_sequence = self.data_sequence.wrapping_add(packets.len() as u16);
         match packets {
-            [packet] => {
-                protocol::encode_data(packet, seq, data_seq, rate, self.config.fixed_radio, false)
-            }
-            _ => {
-                protocol::encode_amsdu(packets, seq, data_seq, rate, self.config.fixed_radio, false)
-            }
+            [packet] => protocol::encode_data(
+                packet,
+                seq,
+                data_seq,
+                parameters,
+                self.config.tx_noack,
+                false,
+            ),
+            _ => protocol::encode_amsdu(
+                packets,
+                seq,
+                data_seq,
+                parameters,
+                self.config.tx_noack,
+                false,
+            ),
         }
     }
     /// Remaining common-channel airtime, excluding the existing boundary guard.

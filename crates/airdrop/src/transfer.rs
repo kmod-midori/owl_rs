@@ -682,21 +682,24 @@ impl Receiver {
             .context("too many concurrent uploads")?;
         crate::identity::private_directory(&self.output)?;
         let disk = nix::sys::statvfs::statvfs(&self.output)?;
-        // Bound concurrent decoded archives, extracted data and temporary storage.
+        // Four uploads each stage one decoded transfer; reserve additional free space.
         let budget = self
             .limit
-            .min(disk.blocks_available().saturating_mul(disk.fragment_size()) / 12);
+            .min(disk.blocks_available().saturating_mul(disk.fragment_size()) / 8);
         ensure!(budget > 0, "insufficient receive disk space");
         let (chunks, reader) = mpsc::channel(4);
         let output = self.output.clone();
         let id = offer.id.clone();
         let expected = offer.items.clone();
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         let mut decoded = tokio::task::spawn_blocking(move || {
             // A cancelled HTTP task must not free a slot while its decoder runs.
             let _permit = permit;
             archive::receive(
                 UploadReader {
                     chunks: reader,
+                    cancel,
                     current: std::io::Cursor::new(Bytes::new()),
                 },
                 &output,
@@ -733,14 +736,19 @@ impl Receiver {
     }
 }
 // Bounded adapter between asynchronous HTTP input and the blocking archive
-// decoder. Cancellation drops the sender, unblocking reads with EOF.
+// decoder. Cancellation rejects buffered input; dropping the sender also
+// unblocks a pending channel read so the worker can discard its staging.
 struct UploadReader {
     chunks: mpsc::Receiver<Bytes>,
+    cancel: CancellationToken,
     current: std::io::Cursor<Bytes>,
 }
 impl std::io::Read for UploadReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(std::io::Error::other("upload cancelled"));
+            }
             let n = std::io::Read::read(&mut self.current, out)?;
             if n != 0 || out.is_empty() {
                 return Ok(n);
@@ -938,7 +946,12 @@ impl Sender {
         if !links {
             let mut exchange = activity.map(|a| a.acquire()).transpose()?;
             if let Some(lease) = &mut exchange {
-                lease.transmitting();
+                let started = tokio::time::Instant::now();
+                lease.channel_ready().await?;
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "transfer channel ready"
+                );
             }
             let file = file.context("file transfer has no archive")?;
             let input = tokio::fs::File::open(file).await?;

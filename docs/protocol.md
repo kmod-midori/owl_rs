@@ -48,9 +48,14 @@ The Cargo workspace runs two distinct layers in separate processes:
   using the leased link's address and interface without owning radio configuration.
 
 `catdrop` controls the user daemon. Authenticated Unix IPC acquires the radio,
-reports service visibility and active transfer count, streams link snapshots,
+reports service visibility and revisioned transfer activity, acknowledges the
+committed transfer channel, streams link snapshots,
 and releases the lease. TCP file data travels through the kernel TAP/IPv6 stack.
-Disconnect or heartbeat expiry makes `owld` drain and restore the link. See
+The outgoing sender waits for its activity revision's channel-ready acknowledgment
+before starting `/Upload`, bounded by `--channel-ready-timeout` (15 seconds).
+`owld` chooses the channel; the acknowledgment confirms local tuning, not peer
+availability in the current slot. Disconnect or heartbeat expiry makes `owld`
+drain and restore the link. See
 [Architecture](architecture.md) for the process boundary.
 
 An outgoing operation, peer browse or active incoming HTTPS request holds a
@@ -337,16 +342,81 @@ CLI syntax and overrides are documented in [Radio configuration](radio.md#transm
 
 The codec rejects unresolved `auto` and invalid PHY rates. VHT radiotap field
 21 has two-byte alignment, known GI/bandwidth, bandwidth code 0/1/4, and a
-single user's MCS/NSS nibble pair with BCC coding. Encoding follows the
+single user's MCS/NSS nibble pair with selected coding. Encoding follows the
 [radiotap VHT specification](https://www.radiotap.org/fields/VHT.html) and
 [mac80211 injection format](https://docs.kernel.org/networking/mac80211-injection.html).
 Queued packets keep their 802.11/AWDL sequence numbers across backpressure;
-retuning or capability changes refresh only the radiotap rate header. The
+retuning or capability changes refresh only the radiotap transmission header. The
 encoder can combine queued packets in A-MSDUs as described below.
 
-Fixed-radio unicast injection requests NOACK, inherited from the C patch. This
-transmit setting is distinct from the radio backend's hardware reception ACKs.
+Unicast hardware ACK handling is independent of fixed-channel scheduling.
+The driver profile's `tx_noack` workaround defaults to false and is overridden
+with `--tx-ack normal|noack`. Injection also requests NOSEQNO so a matching
+shared station cannot rewrite sequence numbers used for completion correlation.
+The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
+channel changes; the Intel profile retains the original NOACK workaround.
+Incoming hardware reception ACKs are configured by the radio backend separately.
+
+Radiotap TX_FLAGS plus DATA_RETRIES identify local driver completion reports.
+They never enter TAP or refresh incoming peers. A bounded ledger correlates
+successful unicast submissions using destination, 802.11 sequence and body
+fingerprint; reports without a known PHY rate (including mt76 synthetic ACKs
+after lost status), stale, duplicate, foreign and uncorrelated reports do not affect
+rate selection. The existing queued-packet timeout bounds ledger age. Debug
+logs include hardware outcome, retry count, requested/reported rate and latency.
+USB completion padding is excluded using checked IPv6/A-MSDU lengths, preserving
+zeros within application data. Radio cleanup also waits for pending completion
+reports, bounded by the existing radio-drain and queued-packet timeouts.
+
+`auto` starts at the shared capability ceiling. Four failures within a 32-frame
+window, or at least two retries per frame after 16 reports, lower the target
+PHY rate by at least 15% when a slower candidate exists. After 128 consecutive
+successes without retries, it probes the next faster candidate. Late reports
+from an older rate or channel cannot change the new selection. Explicit rates
+remain fixed. Capability/channel changes reset the candidate ladder. No feedback
+is synthesized from capture gaps or successful packet injection. Missing driver
+reports leave capability-based selection in place.
 FCS presence and radiotap padding are handled explicitly.
+
+### Block Ack negotiation
+
+`owld` declines IEEE 802.11 ADDBA requests addressed to its MAC by validated AWDL
+peers. It echoes the dialog token, TID and policy with status 37 (Request declined),
+without establishing an RX Block Ack window. Responses use the management rate
+and the configured unicast ACK policy. They stay in a bounded MAC management
+queue, share airtime/slot gating with data, and retain their sequence across
+injection backpressure. The existing queued-packet timeout expires stale replies.
+Listen-only diagnostics never respond. No management frame enters TAP or AirDrop.
+
+`rx_addba_requests` and `tx_addba_rejections` report received requests and responses
+successfully submitted to the driver; submission does not prove on-air delivery.
+A-MSDU aggregation remains available. Accepting ADDBA would additionally require
+working RX Block Ack support in the driver/hardware.
+
+### Transmit coding
+
+BCC remains the default; `--fec auto|ldpc` explicitly opts in. Coding is resolved
+per peer after the concrete rate is selected. HT checks RX LDPC capability bit
+0; VHT checks RX LDPC bit 4. Local TX support is supplied by the selected driver profile
+(`supports_tx_ldpc`, false when omitted), independently of local advertised RX
+capabilities. Declaring support does not enable LDPC; the default remains BCC.
+
+HT LDPC sets radiotap MCS HAVE_FEC and FEC_LDPC. VHT sets the user-0 coding bit.
+The upstream [Linux 7.2.9 injection parser](https://github.com/gregkh/linux/blob/v7.2.9/net/mac80211/tx.c)
+ignores that VHT coding byte, so VHT LDPC additionally includes a preceding
+MCS field `[0x12, 0x10, 0]`: HAVE_MCS|HAVE_FEC, LDPC, MCS0. HAVE_MCS is required
+for Linux to process FEC. The later VHT field replaces the temporary HT rate
+while retaining `IEEE80211_TX_CTL_LDPC`. This field is injection metadata and
+is removed before transmission; the resulting requested PHY remains VHT.
+The [MT76x2 driver](https://github.com/openwrt/mt76/blob/master/mt76x02_mac.c)
+then sets its hardware LDPC descriptor bit. This path needs on-air validation
+on the installed kernel before enabling it by default.
+
+The codec leaves VHT's separate LDPC extra-OFDM-symbol field unknown; symbol
+padding is a hardware decision. Cached frames include both rate and coding in
+their key. A coding change refreshes only radiotap, preserving the 802.11/AWDL
+sequence numbers and payload. Aggregation budgets use the actual header length,
+including the VHT compatibility field and alignment padding.
 
 ### Transmit aggregation
 
@@ -371,7 +441,7 @@ padding aligns subsequent subframes to four bytes. No trailing padding is added.
 The queue limit counts Ethernet packets, including members of cached aggregates.
 Per-peer ordering and original expiry times survive batching and backpressure.
 The encoded frame and sequences are retained until successful submission;
-rate changes replace its radiotap header. If new capabilities no longer permit
+Rate or coding changes replace its radiotap header. If new capabilities no longer permit
 that aggregate, its unsent members are repacked. An aggregate rejected with
 `EMSGSIZE` disables aggregation for that link session and retries the members
 individually. Other permanent injection errors remain fatal.
@@ -604,22 +674,30 @@ preserves the body and Content-Type behavior while changing connection closure.
 Some captured iPhone transfers deliver a complete archive without finishing
 its HTTP chunk terminator. The receiver now feeds incoming bytes through a
 bounded queue to a blocking archive decoder, independent of HTTP completion.
-Each complete DVZip block is checked for its length and zlib checksum, then an
-incremental CPIO cursor checks newly available headers, names and member bounds.
-It skips declared file contents rather than searching for trailer text. Gzip
-reception verifies the gzip CRC/footer before completing.
+DVZip decoding uses a 64 KiB input buffer and incremental zlib state. Bounded
+CPIO headers are parsed as they arrive and each regular file is streamed directly
+into a private `.owl-rs-*` directory inside the destination. No complete wire
+archive, compressed block or decoded CPIO archive is buffered in RAM; reception
+also avoids the former intermediate decoded-archive disk file. File contents
+are consumed by their declared lengths, rather than searched for trailer text.
+Gzip reception verifies its CRC/footer before completing.
 
 A structurally parsed, zero-size `TRAILER!!!` entry after at least one member
 marks archive completion. The enclosing DVZip block must also be complete.
-The existing extraction checks then verify safe member types, duplicate names,
-AppleDouble companions and all approved files and sizes. Validated files remain
-in private staging until the receive task commits them and sends HTTP 200;
-cancelling a receive discards staging instead of publishing a detached worker's
-result. No quiet-period timer or repeated whole-archive decoding is needed;
+Extraction checks safe member types and duplicate names before writing, then
+verifies AppleDouble companions and all approved files and sizes. Validated files
+remain in destination-local staging until the receive task renames the entire
+directory to `airdrop-TRANSFER_ID` with an atomic no-replace rename and sends
+HTTP 200. Decode, validation, I/O
+and rename failures remove staging. Timeout or cancellation stops the worker;
+its temporary directory is removed when it exits, even if the HTTP task has
+already ended. An existing completed transfer is preserved. No quiet-period timer
+or repeated whole-archive decoding is needed;
 `--upload-idle-timeout` still rejects stalled incomplete uploads. Hyper retains
 partial chunk headers and body data while the decoder runs.
 
-A live 14.76 MiB image receive verified this path without an HTTP terminator:
+The earlier disk-backed incremental validator was tested with a live 14.76 MiB
+image receive without an HTTP terminator:
 HTTP 200 was ready 89 ms after the final upload TCP packet, and the phone sent
 FIN after 265 ms. The phone reported Sent and the extracted file matched its
 source hash. A preceding quiet-period receive took 4.06 seconds from the final
@@ -745,8 +823,9 @@ Directories use mode `040755`, files `100644`, and members end with
 `TRAILER!!!`. No symlinks, special files or hard-link entries are sent.
 
 Receiving supports ODC and new ASCII CPIO (`070701`, four-byte alignment).
-Preflight bounds names, sizes and member count before the archive library reads
-members. Extraction rejects absolute/traversing paths, backslashes, NULs,
+Each incoming header is bounded before the archive library allocates its name;
+member sizes and count are checked incrementally. Extraction rejects
+absolute/traversing paths, backslashes, NULs,
 duplicate members, symlinks, special files and hard links. It stages privately
 and atomically renames the completed transfer directory. Approved top-level
 files must be present with matching types and specified sizes.
@@ -758,8 +837,8 @@ entry's semantics. Companions are retained as received rather than applied as
 extended attributes.
 
 The default receive limit is 4 GiB. At upload start, the effective budget is the
-smaller of that limit and one twelfth of available output-disk bytes, allowing
-for four concurrent uploads and their wire, decoded and extracted data. There
+smaller of that limit and one eighth of available output-disk bytes, reserving
+space for four concurrent extracted transfers with additional headroom. There
 are at most 32 HTTPS connections, four uploads and 256 transfer records. These
 are implementation limits configurable or revisable independently of the wire
 protocol.

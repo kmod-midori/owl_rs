@@ -41,10 +41,17 @@ configuration and returns a generation ID, actual MAC, link-local address,
 interface index/name and heartbeat deadline. Exclusive leases reuse the radio
 daemon's random MAC; shared mode retains the AP station's current MAC.
 
-`State { generation, service_enabled, transfers }` publishes public service
+`State { generation, service_enabled, transfers, transfer_epoch }` publishes public service
 visibility only after HTTPS and mDNS sockets have been bound, and reports the number
 of active transfers. `owld` uses this count to hold the selected transfer channel;
 it has no knowledge of HTTP requests, filenames or contact authorization.
+Activity revisions increase when transfers start or end. Once its selected channel
+and width are committed, `owld` returns `ChannelReady { generation, transfer_epoch }`.
+The sender waits for its revision (or a newer active revision) before starting
+`/Upload`; snapshots and older readiness events cannot unblock it. The wait is
+bounded by `--channel-ready-timeout` (15 seconds) and fails if the radio link closes.
+Channel selection and tuning remain entirely in `owld`. Readiness confirms local
+tuning, not that the peer is currently listening; AWDL slot gating still applies.
 Periodic State messages refresh the connection lease; link snapshots do not.
 Stale generations and malformed or oversized messages terminate the lease.
 Framing is cancellation-safe and bounded to 1 MiB per message.

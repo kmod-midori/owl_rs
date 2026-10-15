@@ -87,7 +87,10 @@ described in [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 
 `owld` and `owld awdl` default to `--rate auto`, selecting the fastest
 mutually supported VHT or HT20 rate for each peer and the current channel.
-Selection uses advertised capabilities and does not adapt to packet loss.
+Automatic selection starts at the capability ceiling and adapts per peer using
+correlated hardware TX-completion failures and retry counts. Explicit rates
+remain fixed within capability and channel limits. Drivers without completion
+reports retain capability-based selection.
 VHT transmission is capped at **MCS8**, including explicit MCS9 requests,
 because MCS9 caused stalled uploads in radio tests. Hardware capability
 advertisements and reception retain full MCS9 support.
@@ -101,12 +104,56 @@ advertisements and reception retain full MCS9 support.
 
 VHT requests are upper limits, constrained by both peers and the tuned channel.
 Invalid PHY combinations are rejected. VHT requires 5 GHz; multicast discovery
-and unavailable capabilities use 12 Mbps. Effective peer rates appear in
-`status` and rate-change logs. See [Transmit rates](protocol.md#transmit-rates)
+and unavailable capabilities use 12 Mbps. Effective peer transmission parameters
+appear in `status` and selection logs. See [Transmit rates](protocol.md#transmit-rates)
 for capability and encoding details. HT/VHT unicast packets already in the
 link queue are aggregated into A-MSDUs within peer, interface and slot limits;
 `status` exposes the aggregation counters. See
 [Transmit aggregation](protocol.md#transmit-aggregation) for retry and fallback behavior.
+
+## Unicast acknowledgments
+
+Channel pinning and hardware ACK policy are independent. `--tx-ack auto`
+(default) follows `tx_noack` in the driver profile, which defaults to false.
+The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
+channel changes. The Intel profile retains its original NOACK firmware workaround.
+`--tx-ack normal` or `--tx-ack noack` overrides it.
+NOACK suppresses hardware acknowledgment waiting and may suppress delivery
+reports; it also disables feedback-based rate adaptation.
+
+`status` exposes `tx_status_acked`, `tx_status_failed`, `tx_status_retries` and
+`tx_status_ignored`. Debug logs record requested/reported rates and completion
+latency. These are driver reports, distinct from successful libpcap submission.
+Hardware retry limits remain driver-owned; radiotap DATA_RETRIES does not bound
+per-packet retries on mt76x02. Queue airtime remains an estimate, so slot-edge
+behavior needs on-air verification with ACK waiting enabled.
+
+## Transmit coding
+
+`owld` and `owld awdl` default to `--fec bcc`; LDPC is implemented but disabled
+by default. Coding is separate from `--rate` and belongs to the radio service.
+
+| Override | Selection |
+| --- | --- |
+| `--fec bcc` | BCC for every frame (default). |
+| `--fec auto` | LDPC for HT/VHT unicast when the driver and the peer's corresponding RX capability support it; otherwise BCC. |
+| `--fec ldpc` | Request LDPC for HT/VHT unicast; require driver TX support and the peer's corresponding RX capability. |
+
+The selected driver profile declares TX support with `supports_tx_ldpc`, which
+defaults to false when omitted. The bundled `mt76x2u` profile sets it to true
+based on the upstream MT76x2 transmit descriptor implementation.
+Custom `--profiles PATH` files control the capability for both `owld` and
+`owld awdl` live diagnostics.
+Local RX capability bits do not establish TX support. Explicit LDPC with a legacy `--rate` is
+rejected. Discovery/multicast and legacy capability fallbacks retain BCC.
+Peer `tx_parameters` and selection logs report the requested injection rate and
+coding; they do not prove the hardware transmitted those parameters.
+
+LDPC encoding is performed by the adapter. It affects our data frames,
+including TCP ACKs during incoming transfers, and does not change the phone's
+coding or the card's automatic Wi-Fi ACK responses. The VHT injection workaround
+is source-derived and still needs on-air validation; see
+[Transmit coding](protocol.md#transmit-coding).
 
 ## Election experiments
 

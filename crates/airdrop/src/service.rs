@@ -420,6 +420,11 @@ async fn session(active: &Active) -> Result<()> {
         )
         .await?
     };
+    if !opts.no_radio {
+        active
+            .activity
+            .set_channel_ready(link.channel_ready.clone());
+    }
     let result = async {
         let receiver = Receiver::new(
             opts.name.clone(), identity.clone(), output, opts.max_bytes,
@@ -1359,7 +1364,7 @@ mod tests {
         .unwrap();
         assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
         assert_eq!(active.sending.borrow().len(), 1);
-        assert_eq!(*active.activity.traffic().borrow(), 0); // Pending approval stays on discovery.
+        assert_eq!(active.activity.traffic().borrow().transfers, 0); // Pending approval stays on discovery.
         let incoming = Sender {
             name: "fixture".into(),
             id: "fixture".into(),
@@ -1375,7 +1380,7 @@ mod tests {
             _ => unreachable!(),
         };
         incoming.discover(address).await.unwrap();
-        assert_eq!(*active.activity.traffic().borrow(), 0); // HTTPS discovery cannot select a transfer channel.
+        assert_eq!(active.activity.traffic().borrow().transfers, 0); // HTTPS discovery cannot select a transfer channel.
         incoming
             .send(
                 address,

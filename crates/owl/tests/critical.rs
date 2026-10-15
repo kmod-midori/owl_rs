@@ -3,7 +3,7 @@ use owl::{
     channel::{Clock, Encoding, SLOT_US, Sequence, Strategy},
     engine::{Config, Engine},
     protocol::{self, Advertisement, Body, Election, Mac},
-    rate::Rate,
+    rate::{Coding, FecPolicy, Rate, TxParameters},
 };
 fn config(mac: Mac) -> Config {
     Config {
@@ -16,12 +16,15 @@ fn config(mac: Mac) -> Config {
         channel: 6,
         strategy: Strategy::Intersect,
         fixed_radio: true,
+        tx_noack: false,
         metric_first: true,
         election_metric: 60,
         election_counter: 0,
         widen: 4,
         filter_rssi: false,
         rate: Rate::Legacy(12),
+        fec: FecPolicy::Bcc,
+        tx_ldpc: false,
         capabilities: Default::default(),
         operating_channel: None,
     }
@@ -107,7 +110,7 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
             sgi: false,
         },
     ] {
-        assert!(protocol::radiotap_tx(rate, false, false).is_err());
+        assert!(protocol::radiotap_tx(rate.into(), false, false).is_err());
     }
     for rate in [
         "12",
@@ -138,12 +141,12 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         assert!(rate.parse::<Rate>().is_err());
     }
     assert_eq!(
-        protocol::radiotap_tx(Rate::Legacy(12), true, false).unwrap(),
-        [0, 0, 12, 0, 4, 128, 0, 0, 24, 0, 8, 0]
+        protocol::radiotap_tx(Rate::Legacy(12).into(), true, false).unwrap(),
+        [0, 0, 12, 0, 4, 128, 0, 0, 24, 0, 24, 0]
     );
     assert_eq!(
-        protocol::radiotap_tx("mcs7-sgi".parse().unwrap(), true, false).unwrap(),
-        [0, 0, 13, 0, 0, 128, 8, 0, 8, 0, 7, 4, 7]
+        protocol::radiotap_tx("mcs7-sgi".parse::<Rate>().unwrap().into(), true, false).unwrap(),
+        [0, 0, 13, 0, 0, 128, 8, 0, 24, 0, 7, 4, 7]
     );
     for rate in [
         Rate::Legacy(12),
@@ -153,7 +156,7 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
         let mut maximum = vec![2, 0, 0, 0, 0, 1, 2, 1, 2, 3, 4, 5, 0x86, 0xdd];
         maximum.extend(vec![0; owl::runtime::HOST_MTU as usize]);
         assert!(
-            protocol::encode_data(&maximum, 0, 0, rate, true, false)
+            protocol::encode_data(&maximum, 0, 0, rate.into(), true, false)
                 .unwrap()
                 .len()
                 <= 1514
@@ -163,7 +166,8 @@ fn rate_parsing_alignment_and_ethernet_roundtrip() {
     ethernet.extend_from_slice(&[0x60; 48]);
     for fcs in [false, true] {
         let frame =
-            protocol::encode_data(&ethernet, 4095, 65535, Rate::Legacy(12), true, fcs).unwrap();
+            protocol::encode_data(&ethernet, 4095, 65535, Rate::Legacy(12).into(), true, fcs)
+                .unwrap();
         let parsed = protocol::parse(&frame).unwrap().unwrap();
         let Body::Data(frames) = parsed.body else {
             panic!("not data");
@@ -268,7 +272,7 @@ fn outgoing_amsdu_roundtrip_padding_sequences_and_bounds() {
             &[&first, &second],
             4095,
             65535,
-            "vht4-nss2-bw40-sgi".parse().unwrap(),
+            "vht4-nss2-bw40-sgi".parse::<Rate>().unwrap().into(),
             true,
             fcs,
         )
@@ -288,23 +292,53 @@ fn outgoing_amsdu_roundtrip_padding_sequences_and_bounds() {
     let mut mixed = second.clone();
     mixed[5] ^= 1;
     assert!(
-        protocol::encode_amsdu(&[&first, &mixed], 0, 0, Rate::Legacy(12), true, false).is_err()
+        protocol::encode_amsdu(
+            &[&first, &mixed],
+            0,
+            0,
+            Rate::Legacy(12).into(),
+            true,
+            false
+        )
+        .is_err()
     );
     mixed = second.clone();
     mixed[11] ^= 1;
     assert!(
-        protocol::encode_amsdu(&[&first, &mixed], 0, 0, Rate::Legacy(12), true, false).is_err()
+        protocol::encode_amsdu(
+            &[&first, &mixed],
+            0,
+            0,
+            Rate::Legacy(12).into(),
+            true,
+            false
+        )
+        .is_err()
     );
     let large = packet(1500);
     assert!(
-        protocol::encode_amsdu(&[large.as_slice(); 6], 0, 0, Rate::Legacy(12), true, false)
-            .is_err()
+        protocol::encode_amsdu(
+            &[large.as_slice(); 6],
+            0,
+            0,
+            Rate::Legacy(12).into(),
+            true,
+            false
+        )
+        .is_err()
     );
     assert!(
-        protocol::encode_amsdu(&[first.as_slice(); 65], 0, 0, Rate::Legacy(12), true, false)
-            .is_err()
+        protocol::encode_amsdu(
+            &[first.as_slice(); 65],
+            0,
+            0,
+            Rate::Legacy(12).into(),
+            true,
+            false
+        )
+        .is_err()
     );
-    assert!(protocol::encode_amsdu(&[&first], 0, 0, Rate::Legacy(12), true, false).is_err());
+    assert!(protocol::encode_amsdu(&[&first], 0, 0, Rate::Legacy(12).into(), true, false).is_err());
 }
 
 #[test]
@@ -319,18 +353,27 @@ fn amsdu_bounds_and_retry_deduplication() {
     ethernet.extend(peer.0);
     ethernet.extend([0x86, 0xdd]);
     ethernet.extend([0x60; 48]);
-    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12), false, false).unwrap();
+    let frame =
+        protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12).into(), false, false).unwrap();
     assert_eq!(e.receive(&frame, 10).unwrap().0.len(), 1);
     let mut retry = frame.clone();
-    retry[10] |= 8;
+    let rt = radiotap::Radiotap::from_bytes(&retry)
+        .unwrap()
+        .header
+        .length;
+    retry[rt + 1] |= 8;
     assert!(e.receive(&retry, 20).unwrap().0.is_empty());
     assert_eq!(e.stats.rx_duplicates, 1);
-    let mut amsdu = frame[..9 + 24].to_vec();
-    amsdu[9] = 0x88;
+    let rt = radiotap::Radiotap::from_bytes(&frame)
+        .unwrap()
+        .header
+        .length;
+    let mut amsdu = frame[..rt + 24].to_vec();
+    amsdu[rt] = 0x88;
     amsdu.extend([0x80, 0]);
     amsdu.extend(own.0);
     amsdu.extend(peer.0);
-    let payload = &frame[9 + 24..];
+    let payload = &frame[rt + 24..];
     amsdu.extend((payload.len() as u16).to_be_bytes());
     amsdu.extend(payload);
     let Body::Data(frames) = protocol::parse(&amsdu).unwrap().unwrap().body else {
@@ -351,7 +394,8 @@ fn busy_peer_data_refreshes_liveness_without_discovering_unknown_peers() {
     ethernet.extend(peer.0);
     ethernet.extend([0x86, 0xdd]);
     ethernet.extend([0x60; 48]);
-    let frame = protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12), false, false).unwrap();
+    let frame =
+        protocol::encode_data(&ethernet, 1, 1, Rate::Legacy(12).into(), false, false).unwrap();
     assert!(engine.receive(&frame, 0).unwrap().0.is_empty());
     assert!(engine.peers.is_empty());
     engine
@@ -363,7 +407,11 @@ fn busy_peer_data_refreshes_liveness_without_discovering_unknown_peers() {
     engine.tick(5_000_001);
     assert!(engine.peers.contains_key(&peer));
     let mut retry = frame.clone();
-    retry[10] |= 8;
+    let rt = radiotap::Radiotap::from_bytes(&retry)
+        .unwrap()
+        .header
+        .length;
+    retry[rt + 1] |= 8;
     assert!(engine.receive(&retry, 5_100_000).unwrap().0.is_empty());
     assert_eq!(engine.peers[&peer].last_seen_us, 5_100_000);
     let mut truncated = frame;
@@ -390,7 +438,7 @@ fn early_syns_wait_for_peer_validation_and_are_bounded_deduplicated_and_expired(
             &ethernet,
             seq as u16,
             seq as u16,
-            Rate::Legacy(12),
+            Rate::Legacy(12).into(),
             false,
             false,
         )
@@ -555,22 +603,137 @@ fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
 }
 
 #[test]
+fn ldpc_coding_capabilities_and_radiotap_carrier() {
+    use protocol::{BandCapabilities, HtCapabilities, VhtCapabilities};
+    use radiotap::{
+        RadiotapIterator,
+        field::{Kind, ext::FEC},
+    };
+    let mut peer = BandCapabilities {
+        ht: Some(HtCapabilities {
+            cap_info: 1,
+            ampdu_params: 0,
+            rx_mask: [255, 0, 0, 0],
+            tx_mask: None,
+        }),
+        vht: Some(VhtCapabilities {
+            cap_info: 1 << 4,
+            rx_mcs_map: 0xfffc,
+            tx_mcs_map: 0xffff,
+            rx_highest: 0,
+            tx_highest: 0,
+        }),
+    };
+    assert_eq!(FecPolicy::default(), FecPolicy::Bcc);
+    let ethernet = [2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60];
+    for rate in
+        ["mcs7-sgi", "vht4-nss2-bw40-sgi", "vht8-nss2-bw80"].map(|s| s.parse::<Rate>().unwrap())
+    {
+        for (policy, backend, coding) in [
+            (FecPolicy::Bcc, true, Coding::Bcc),
+            (FecPolicy::Auto, false, Coding::Bcc),
+            (FecPolicy::Auto, true, Coding::Ldpc),
+        ] {
+            assert_eq!(policy.resolve(rate, backend, &peer).unwrap().coding, coding);
+        }
+        assert!(FecPolicy::Ldpc.resolve(rate, false, &peer).is_err());
+        // ACK/FCS combinations are covered by the general radiotap alignment tests.
+        let parameters = TxParameters {
+            rate,
+            coding: Coding::Ldpc,
+        };
+        let frame = protocol::encode_data(&ethernet, 4095, 65535, parameters, true, false).unwrap();
+        let (rt, body) = radiotap::Radiotap::parse(&frame).unwrap();
+        assert_eq!(rt.mcs.unwrap().fec, Some(FEC::LDPC));
+        let fields: Vec<_> = RadiotapIterator::from_bytes(&frame)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let mcs = fields
+            .iter()
+            .find(|(kind, _)| *kind == Kind::MCS)
+            .unwrap()
+            .1;
+        if let Rate::Vht { index, nss, .. } = rate {
+            // HAVE_MCS is essential for Linux to read FEC before VHT overrides the rate.
+            assert_eq!(mcs, [0x12, 0x10, 0]);
+            let vht = fields
+                .iter()
+                .find(|(kind, _)| *kind == Kind::VHT)
+                .unwrap()
+                .1;
+            assert_eq!((vht[4], vht[8]), ((index << 4) | nss, 1));
+            assert_eq!(rt.vht.unwrap().users[0].unwrap().index, index);
+        } else {
+            assert_eq!(mcs, [0x17, 0x14, 7]);
+        }
+        let bcc = protocol::encode_data(&ethernet, 4095, 65535, rate.into(), true, false).unwrap();
+        assert_eq!(body, radiotap::Radiotap::parse(&bcc).unwrap().1);
+        let Body::Data(packets) = protocol::parse(&frame).unwrap().unwrap().body else {
+            panic!("data")
+        };
+        assert_eq!(packets, [ethernet.to_vec()]);
+    }
+    let ht: Rate = "mcs7".parse().unwrap();
+    let vht: Rate = "vht4-nss1-bw20".parse().unwrap();
+    // HT and VHT receive capabilities are independent.
+    for (ht_caps, vht_caps, ht_coding, vht_coding) in [
+        (0, 1 << 4, Coding::Bcc, Coding::Ldpc),
+        (1, 0, Coding::Ldpc, Coding::Bcc),
+    ] {
+        peer.ht.as_mut().unwrap().cap_info = ht_caps;
+        peer.vht.as_mut().unwrap().cap_info = vht_caps;
+        for (rate, coding) in [(ht, ht_coding), (vht, vht_coding)] {
+            assert_eq!(
+                FecPolicy::Auto.resolve(rate, true, &peer).unwrap().coding,
+                coding
+            );
+            assert_eq!(
+                FecPolicy::Ldpc.resolve(rate, true, &peer).is_ok(),
+                coding == Coding::Ldpc
+            );
+        }
+    }
+    assert!(FecPolicy::Ldpc.validate_rate(Rate::Legacy(12)).is_err());
+    assert!(
+        protocol::radiotap_tx(
+            TxParameters {
+                rate: Rate::Legacy(12),
+                coding: Coding::Ldpc
+            },
+            false,
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(
+        FecPolicy::Ldpc
+            .resolve(Rate::Legacy(12), true, &peer)
+            .unwrap()
+            .coding,
+        Coding::Bcc
+    );
+}
+
+#[test]
 fn vht_radiotap_alignment_and_peer_limits() {
     use owl::channel::ChannelDefinition;
     use protocol::{BandCapabilities, HtCapabilities, VhtCapabilities};
     let rate: Rate = "vht4-nss2-bw40-sgi".parse().unwrap();
     assert_eq!(
-        protocol::radiotap_tx(rate, true, false).unwrap(),
+        protocol::radiotap_tx(rate.into(), true, false).unwrap(),
         [
-            0, 0, 22, 0, 0, 128, 32, 0, 8, 0, 0x44, 0, 4, 1, 0x42, 0, 0, 0, 0, 0, 0, 0
+            0, 0, 22, 0, 0, 128, 32, 0, 24, 0, 0x44, 0, 4, 1, 0x42, 0, 0, 0, 0, 0, 0, 0
         ]
     );
     let ethernet = [2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 0x86, 0xdd, 0x60];
     for width in [20, 40, 80] {
         for noack in [false, true] {
             for fcs in [false, true] {
-                let rate = format!("vht4-nss2-bw{width}-sgi").parse().unwrap();
-                let frame = protocol::encode_data(&ethernet, 1, 2, rate, noack, fcs).unwrap();
+                let rate: Rate = format!("vht4-nss2-bw{width}-sgi").parse().unwrap();
+                let frame =
+                    protocol::encode_data(&ethernet, 1, 2, rate.into(), noack, fcs).unwrap();
                 // Exercise flags/TX-flags/VHT alignment with an independently parsed header.
                 let (rt, _) = radiotap::Radiotap::parse(&frame).unwrap();
                 let vht = rt.vht.unwrap();
@@ -683,15 +846,24 @@ fn vht_radiotap_alignment_and_peer_limits() {
     cfg.capabilities.ghz5 = local;
     let mut engine = Engine::new(cfg, 0);
     engine.receive(&peer.action_frame(3, 0), 0).unwrap();
-    assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(12));
+    assert_eq!(
+        engine.data_parameters(peer_mac).unwrap().rate,
+        Rate::Legacy(12)
+    );
     engine.set_operating_channel(channel);
-    assert_eq!(engine.data_rate(peer_mac), selected);
-    assert_eq!(engine.data_rate(protocol::BROADCAST), Rate::Legacy(12));
-    assert_eq!(engine.peers[&peer_mac].tx_rate, Some(selected));
+    assert_eq!(engine.data_parameters(peer_mac).unwrap().rate, selected);
+    assert_eq!(
+        engine.data_parameters(protocol::BROADCAST).unwrap().rate,
+        Rate::Legacy(12)
+    );
+    assert_eq!(engine.peers[&peer_mac].tx_parameters, Some(selected.into()));
     engine.config.rate = Rate::Auto;
-    assert_eq!(engine.data_rate(peer_mac), selected);
+    assert_eq!(engine.data_parameters(peer_mac).unwrap().rate, selected);
     engine.config.rate = Rate::Legacy(24);
-    assert_eq!(engine.data_rate(peer_mac), Rate::Legacy(24));
+    assert_eq!(
+        engine.data_parameters(peer_mac).unwrap().rate,
+        Rate::Legacy(24)
+    );
     let mut bad = peer.action_frame(3, 0);
     bad.pop();
     assert!(engine.receive(&bad, 0).is_err());

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! AWDL link TX queue: opportunistic A-MSDU batching and atomic injection retries.
 use crate::{
-    engine::Engine,
+    engine::{AckTiming, Engine},
     protocol::{self, BandCapabilities, Mac},
-    rate::Rate,
+    rate::{Rate, TxParameters},
 };
-use std::collections::{BTreeSet, VecDeque};
-use tracing::warn;
+use std::collections::{BTreeMap, VecDeque};
+use tracing::{debug, warn};
 
 pub(crate) const QUEUE_LIMIT: usize = 128;
 pub(crate) enum InjectionError<E> {
@@ -19,15 +19,158 @@ pub(crate) struct Report {
     pub last_sent_us: Option<i64>,
     pub last_tcp_us: Option<i64>,
 }
+#[derive(Clone, Copy)]
+enum Block {
+    Schedule,
+    Airtime,
+}
+struct Ack {
+    id: u64,
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    window: u16,
+    timestamp: Option<u32>,
+    options_crc: u32,
+    schedule_blocked: bool,
+    airtime_blocked: bool,
+    backpressured: bool,
+}
+fn tcp_metadata(ethernet: &[u8]) -> (bool, Option<Ack>) {
+    let Ok(packet) = etherparse::SlicedPacket::from_ethernet(ethernet) else {
+        return (false, None);
+    };
+    let Some(etherparse::TransportSlice::Tcp(tcp)) = packet.transport else {
+        return (false, None);
+    };
+    let ack = (tcp.ack() && !tcp.syn() && !tcp.fin() && !tcp.rst() && tcp.payload().is_empty())
+        .then(|| Ack {
+            id: 0,
+            source_port: tcp.source_port(),
+            destination_port: tcp.destination_port(),
+            sequence: tcp.sequence_number(),
+            acknowledgment: tcp.acknowledgment_number(),
+            window: tcp.window_size(),
+            timestamp: tcp
+                .options_iterator()
+                .find_map(|option| match option.ok()? {
+                    etherparse::TcpOptionElement::Timestamp(value, _) => Some(value),
+                    _ => None,
+                }),
+            options_crc: crc32fast::hash(tcp.options()),
+            schedule_blocked: false,
+            airtime_blocked: false,
+            backpressured: false,
+        });
+    (true, ack)
+}
+impl AckTiming {
+    fn finished(&mut self, ack: &Ack) {
+        self.schedule_blocked += u64::from(ack.schedule_blocked);
+        self.airtime_blocked += u64::from(ack.airtime_blocked);
+        self.backpressured += u64::from(ack.backpressured);
+    }
+}
 struct Packet {
     ethernet: Vec<u8>,
     queued_us: i64,
+    tcp: bool,
+    ack: Option<Ack>,
+}
+impl Packet {
+    fn dropped(&self, timing: &mut AckTiming, now: i64, reason: &'static str) {
+        if let Some(ack) = &self.ack {
+            timing.dropped += 1;
+            timing.finished(ack);
+            debug!(
+                ack_id = ack.id,
+                queued_us = self.queued_us,
+                dropped_us = now,
+                queue_wait_us = now.saturating_sub(self.queued_us).max(0),
+                reason,
+                "AWDL TCP ACK dropped"
+            );
+        }
+    }
+}
+struct Injection {
+    id: u64,
+    channel: u8,
+    parameters: TxParameters,
+    started_us: i64,
+    finished_us: i64,
 }
 struct Frame {
     packets: Vec<Packet>,
-    encoded: Option<(Rate, Vec<u8>)>,
+    encoded: Option<(TxParameters, Vec<u8>)>,
 }
 impl Frame {
+    fn blocked(&mut self, reason: Block) {
+        for ack in self.packets.iter_mut().filter_map(|p| p.ack.as_mut()) {
+            match reason {
+                Block::Schedule => ack.schedule_blocked = true,
+                Block::Airtime => ack.airtime_blocked = true,
+            }
+        }
+    }
+    fn record_injection<E>(
+        &mut self,
+        engine: &mut Engine,
+        injection: Injection,
+        result: &Result<(), InjectionError<E>>,
+    ) {
+        let Injection {
+            id: injection_id,
+            channel,
+            parameters,
+            started_us: injection_started_us,
+            finished_us: injection_finished_us,
+        } = injection;
+        let injection_us = injection_finished_us
+            .saturating_sub(injection_started_us)
+            .max(0) as u64;
+        let outcome = match result {
+            Ok(()) => "accepted",
+            Err(InjectionError::Backpressure) => "backpressure",
+            Err(InjectionError::TooLarge(_)) => "too_large",
+            Err(InjectionError::Fatal(_)) => "failed",
+        };
+        if self.packets.iter().any(|p| p.ack.is_some()) {
+            let timing = &mut engine.stats.tx_ack;
+            let count = self.packets.len();
+            let dst = self.destination();
+            timing.injection_attempts += 1;
+            timing.injection_us_total = timing.injection_us_total.saturating_add(injection_us);
+            timing.injection_us_max = timing.injection_us_max.max(injection_us);
+            for p in &mut self.packets {
+                if let Some(ack) = &mut p.ack {
+                    ack.backpressured |= matches!(result, Err(InjectionError::Backpressure));
+                    let queue_wait_us =
+                        injection_started_us.saturating_sub(p.queued_us).max(0) as u64;
+                    if result.is_ok() {
+                        timing.injected += 1;
+                        timing.finished(ack);
+                        timing.queue_wait_us_total =
+                            timing.queue_wait_us_total.saturating_add(queue_wait_us);
+                        timing.queue_wait_us_max = timing.queue_wait_us_max.max(queue_wait_us);
+                    }
+                    debug!(
+                        ack_id=ack.id, injection_id, peer=%dst,
+                        source_port=ack.source_port, destination_port=ack.destination_port,
+                        sequence=ack.sequence, acknowledgment=ack.acknowledgment,
+                        window=ack.window, timestamp=?ack.timestamp, options_crc=ack.options_crc,
+                        queued_us=p.queued_us, injection_started_us, injection_finished_us,
+                        queue_wait_us, injection_us, outcome, channel,
+                        slot=engine.clock.slot(injection_started_us), rate=%parameters.rate, coding=%parameters.coding,
+                        aggregate_packets=count, schedule_blocked=ack.schedule_blocked,
+                        airtime_blocked=ack.airtime_blocked, backpressured=ack.backpressured,
+                        "AWDL TCP ACK injection"
+                    );
+                }
+            }
+        }
+    }
     fn single(packet: Packet) -> Self {
         Self {
             packets: vec![packet],
@@ -49,39 +192,55 @@ impl Frame {
         }
         Some(len)
     }
-    fn encoded(&mut self, engine: &mut Engine, rate: Rate) -> Result<&[u8], protocol::Error> {
+    fn encoded(
+        &mut self,
+        engine: &mut Engine,
+        parameters: TxParameters,
+    ) -> Result<&[u8], protocol::Error> {
         let destination = self.destination();
         if let Some((previous, bytes)) = &mut self.encoded {
-            if *previous != rate {
+            if *previous != parameters {
                 let old_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
                 bytes.splice(
                     ..old_len,
                     protocol::radiotap_tx(
-                        rate,
-                        engine.config.fixed_radio && !destination.multicast(),
+                        parameters,
+                        engine.config.tx_noack && !destination.multicast(),
                         false,
                     )?,
                 );
-                *previous = rate;
+                *previous = parameters;
             }
         } else {
             let packets: Vec<_> = self.packets.iter().map(|p| p.ethernet.as_slice()).collect();
-            self.encoded = Some((rate, engine.data_frame(&packets, rate)?));
+            self.encoded = Some((parameters, engine.data_frame(&packets, parameters)?));
         }
         Ok(&self.encoded.as_ref().expect("encoded frame").1)
     }
 }
+struct ManagementFrame {
+    peer: Mac,
+    request: protocol::AddBaRequest,
+    queued_us: i64,
+    bytes: Vec<u8>,
+}
 pub(crate) struct Queue {
     frames: VecDeque<Frame>,
+    management: VecDeque<ManagementFrame>,
     aggregation: bool,
     reserved_until_us: i64,
+    next_ack_id: u64,
+    next_injection_id: u64,
 }
 impl Default for Queue {
     fn default() -> Self {
         Self {
             frames: VecDeque::new(),
+            management: VecDeque::new(),
             aggregation: true,
             reserved_until_us: 0,
+            next_ack_id: 1,
+            next_injection_id: 1,
         }
     }
 }
@@ -89,8 +248,15 @@ impl Queue {
     pub fn len(&self) -> usize {
         self.frames.iter().map(|f| f.packets.len()).sum()
     }
+    pub fn pending_acks(&self) -> usize {
+        self.frames
+            .iter()
+            .flat_map(|f| &f.packets)
+            .filter(|p| p.ack.is_some())
+            .count()
+    }
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.frames.is_empty() && self.management.is_empty()
     }
     pub fn is_idle(&self, now: i64, quiet_us: i64) -> bool {
         self.is_empty() && now.saturating_sub(self.reserved_until_us) >= quiet_us
@@ -99,38 +265,115 @@ impl Queue {
         self.reserved_until_us > now
     }
     pub fn has_tcp(&self) -> bool {
-        self.frames
-            .iter()
-            .flat_map(|f| &f.packets)
-            .any(|p| protocol::tcp_frame(&p.ethernet))
+        self.frames.iter().flat_map(|f| &f.packets).any(|p| p.tcp)
     }
     pub fn push(&mut self, ethernet: Vec<u8>, queued_us: i64) {
         assert!(
             ethernet.len() >= 14 && self.len() < QUEUE_LIMIT,
             "checked bounded Ethernet queue"
         );
+        let (tcp, mut ack) = tcp_metadata(&ethernet);
+        if let Some(ack) = &mut ack {
+            ack.id = self.next_ack_id;
+            self.next_ack_id = self.next_ack_id.wrapping_add(1);
+        }
         self.frames.push_back(Frame::single(Packet {
             ethernet,
             queued_us,
+            tcp,
+            ack,
         }));
+    }
+    pub fn reject_addba(
+        &mut self,
+        engine: &mut Engine,
+        peer: Mac,
+        request: protocol::AddBaRequest,
+        now: i64,
+    ) {
+        // Collapse retransmissions only while their response is still queued.
+        // A later request must get another reply if the first one was lost.
+        if self
+            .management
+            .iter()
+            .any(|f| f.peer == peer && f.request == request)
+        {
+            return;
+        }
+        if self.management.len() == QUEUE_LIMIT {
+            engine.stats.dropped += 1;
+            return;
+        }
+        self.management.push_back(ManagementFrame {
+            peer,
+            request,
+            queued_us: now,
+            bytes: engine.addba_rejection(peer, request),
+        });
     }
     fn split(&mut self, index: usize, frame: Frame) {
         for packet in frame.packets.into_iter().rev() {
             self.frames.insert(index, Frame::single(packet));
         }
     }
-    pub fn flush<E: std::fmt::Display>(
+    pub fn flush<E: std::fmt::Display + Into<anyhow::Error>>(
         &mut self,
         engine: &mut Engine,
         channel: u8,
         monitor_limit: usize,
         mut now: impl FnMut() -> i64,
         mut inject: impl FnMut(&[u8]) -> Result<(), InjectionError<E>>,
-    ) -> Result<Report, E> {
+    ) -> anyhow::Result<Report> {
         let mut report = Report::default();
+        // MAC management responses share airtime accounting but never enter TAP
+        // or A-MSDU aggregation. Bound retries/expiry like the Ethernet queue.
+        for _ in 0..self.management.len() {
+            let frame = self.management.pop_front().expect("management queue count");
+            let time = now();
+            if time.saturating_sub(frame.queued_us)
+                >= engine.config.pending_timeout.as_micros() as i64
+                || !engine.peers.get(&frame.peer).is_some_and(|p| p.valid)
+            {
+                engine.stats.dropped += 1;
+                continue;
+            }
+            let outstanding = self.reserved_until_us.saturating_sub(time).max(0);
+            if channel != engine.current_channel(time)
+                || !fits_window(
+                    Rate::DISCOVERY,
+                    frame.bytes.len(),
+                    engine
+                        .tx_window_us(frame.peer, time)
+                        .saturating_sub(outstanding),
+                )
+            {
+                self.management.push_back(frame);
+                continue;
+            }
+            match inject(&frame.bytes) {
+                Ok(()) => {
+                    self.reserved_until_us = self.reserved_until_us.max(time).saturating_add(
+                        airtime_us(Rate::DISCOVERY, frame.bytes.len()).unwrap_or(0),
+                    );
+                    engine.stats.tx_addba_rejections += 1;
+                    report.last_sent_us = Some(time);
+                    debug!(peer=%frame.peer, dialog_token=frame.request.dialog_token,
+                        tid=(frame.request.parameters >> 2) & 15, status=37, channel,
+                        "ADDBA rejection submitted");
+                }
+                Err(InjectionError::Backpressure) => {
+                    engine.stats.tx_backpressure += 1;
+                    self.management.push_front(frame);
+                    return Ok(report);
+                }
+                Err(InjectionError::TooLarge(error) | InjectionError::Fatal(error)) => {
+                    return Err(error.into());
+                }
+            }
+        }
         let mut examined = 0;
         let budget = self.len();
-        let mut blocked = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
         let mut index = 0;
         while examined < budget {
             let Some(mut frame) = self.frames.remove(index) else {
@@ -140,7 +383,12 @@ impl Queue {
             let old_len = frame.packets.len();
             examined += old_len;
             frame.packets.retain(|p| {
-                time.saturating_sub(p.queued_us) < engine.config.pending_timeout.as_micros() as i64
+                let keep = time.saturating_sub(p.queued_us)
+                    < engine.config.pending_timeout.as_micros() as i64;
+                if !keep {
+                    p.dropped(&mut engine.stats.tx_ack, time, "expired");
+                }
+                keep
             });
             let expired = old_len - frame.packets.len();
             engine.stats.dropped += expired as u64;
@@ -153,20 +401,26 @@ impl Queue {
             let dst = frame.destination();
             if !dst.multicast() && !engine.peers.get(&dst).is_some_and(|p| p.valid) {
                 engine.stats.dropped += frame.packets.len() as u64;
+                for p in &frame.packets {
+                    p.dropped(&mut engine.stats.tx_ack, time, "unknown_peer");
+                }
                 continue;
             }
-            if blocked.contains(&dst)
-                || channel != engine.current_channel(time)
-                || !engine.send_ready(dst, time)
-            {
-                blocked.insert(dst);
+            let reason = blocked.get(&dst).copied().or_else(|| {
+                (channel != engine.current_channel(time) || !engine.send_ready(dst, time))
+                    .then_some(Block::Schedule)
+            });
+            if let Some(reason) = reason {
+                frame.blocked(reason);
+                blocked.insert(dst, reason);
                 self.frames.insert(index, frame);
                 index += 1;
                 continue;
             }
-            let rate = engine.data_rate(dst);
+            let parameters = engine.data_parameters(dst)?;
+            let rate = parameters.rate;
             let limit = if self.aggregation {
-                aggregate_limit(engine, dst, rate, monitor_limit)
+                aggregate_limit(engine, dst, parameters, monitor_limit)
             } else {
                 0
             };
@@ -212,31 +466,46 @@ impl Queue {
                 frame.packets[0].ethernet.len() + 30
             };
             if !fits_window(rate, physical_len, window) {
-                blocked.insert(dst);
+                frame.blocked(Block::Airtime);
+                blocked.insert(dst, Block::Airtime);
                 self.frames.insert(index, frame);
                 index += 1;
                 continue;
             }
             let count = frame.packets.len();
-            let bytes = match frame.encoded(engine, rate) {
+            let bytes = match frame.encoded(engine, parameters) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     engine.stats.dropped += count as u64;
+                    for p in &frame.packets {
+                        p.dropped(&mut engine.stats.tx_ack, time, "encoding");
+                    }
                     continue;
                 }
             };
-            match inject(bytes) {
+            let injection_started_us = now();
+            let result = inject(bytes);
+            let injection_finished_us = now();
+            let injection = Injection {
+                id: self.next_injection_id,
+                channel,
+                parameters,
+                started_us: injection_started_us,
+                finished_us: injection_finished_us,
+            };
+            self.next_injection_id = self.next_injection_id.wrapping_add(1);
+            if result.is_ok() {
+                engine.record_tx(bytes, parameters, injection_finished_us);
+            }
+            frame.record_injection(engine, injection, &result);
+            match result {
                 Ok(()) => {
                     self.reserved_until_us = self
                         .reserved_until_us
                         .max(time)
                         .saturating_add(airtime_us(rate, physical_len).unwrap_or(0));
                     report.last_sent_us = Some(time);
-                    if frame
-                        .packets
-                        .iter()
-                        .any(|p| protocol::tcp_frame(&p.ethernet))
-                    {
+                    if frame.packets.iter().any(|p| p.tcp) {
                         report.last_tcp_us = Some(time);
                     }
                     engine.stats.tx_data += 1;
@@ -263,7 +532,7 @@ impl Queue {
                     self.split(index, frame);
                 }
                 Err(InjectionError::TooLarge(error) | InjectionError::Fatal(error)) => {
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -299,7 +568,13 @@ fn receive_limit(caps: &BandCapabilities, rate: Rate) -> Option<usize> {
         _ => None,
     }
 }
-fn aggregate_limit(engine: &Engine, dst: Mac, rate: Rate, monitor_limit: usize) -> usize {
+fn aggregate_limit(
+    engine: &Engine,
+    dst: Mac,
+    parameters: TxParameters,
+    monitor_limit: usize,
+) -> usize {
+    let rate = parameters.rate;
     if dst.multicast() {
         return 0;
     }
@@ -316,7 +591,7 @@ fn aggregate_limit(engine: &Engine, dst: Mac, rate: Rate, monitor_limit: usize) 
     ) else {
         return 0;
     };
-    let Ok(radiotap) = protocol::radiotap_tx(rate, engine.config.fixed_radio, false) else {
+    let Ok(radiotap) = protocol::radiotap_tx(parameters, engine.config.tx_noack, false) else {
         return 0;
     };
     local
@@ -331,8 +606,10 @@ mod tests {
         channel::{ChannelDefinition, SLOT_US, Sequence, Strategy},
         engine::Config,
         protocol::{Advertisement, Body, Election, HtCapabilities},
+        rate::FecPolicy,
         timeouts::Timeouts,
     };
+    type TestError = pcap::Error;
     const OWN: Mac = Mac([2, 0, 0, 0, 0, 1]);
     const PEER: Mac = Mac([2, 0, 0, 0, 0, 2]);
     fn engine() -> Engine {
@@ -348,12 +625,15 @@ mod tests {
                 channel: 6,
                 strategy: Strategy::Pin,
                 fixed_radio: true,
+                tx_noack: false,
                 metric_first: true,
                 election_metric: 60,
                 election_counter: 0,
                 widen: 4,
                 filter_rssi: false,
                 rate: "mcs7-sgi".parse().unwrap(),
+                fec: FecPolicy::Bcc,
+                tx_ldpc: true,
                 capabilities: Default::default(),
                 operating_channel: Some(ChannelDefinition::new(6, 20).unwrap()),
             },
@@ -406,9 +686,10 @@ mod tests {
         engine: &mut Engine,
         mtu: usize,
         time: i64,
-        inject: impl FnMut(&[u8]) -> Result<(), InjectionError<&'static str>>,
+        inject: impl FnMut(&[u8]) -> Result<(), InjectionError<TestError>>,
     ) -> Report {
-        queue.flush(engine, 6, mtu, || time, inject).unwrap()
+        let channel = engine.current_channel(time);
+        queue.flush(engine, channel, mtu, || time, inject).unwrap()
     }
     fn send(queue: &mut Queue, engine: &mut Engine, mtu: usize, time: i64) -> Vec<Vec<Vec<u8>>> {
         let mut sent = Vec::new();
@@ -417,6 +698,294 @@ mod tests {
             Ok(())
         });
         sent
+    }
+    fn completion(bytes: &[u8], failed: bool, retries: u8) -> Vec<u8> {
+        // Independent Linux TX-status layout: RATE, TX_FLAGS, DATA_RETRIES.
+        let rt = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        let mut out = vec![
+            0,
+            0,
+            13,
+            0,
+            4,
+            0x80,
+            2,
+            0,
+            24,
+            0,
+            u8::from(failed),
+            0,
+            retries,
+        ];
+        out.extend_from_slice(&bytes[rt..]);
+        out.extend([0; 7]); // USB DMA padding must not break correlation.
+        out
+    }
+    #[test]
+    fn unicast_delivery_feedback_is_correlated_and_never_enters_rx() {
+        let mut engine = engine();
+        engine.config.rate = Rate::Auto;
+        let initial = engine.data_parameters(PEER).unwrap();
+        let transmit = |engine: &mut Engine, now| {
+            let parameters = engine.data_parameters(PEER).unwrap();
+            let bytes = engine.data_frame(&[&packet(PEER, 1)], parameters).unwrap();
+            engine.record_tx(&bytes, parameters, now);
+            bytes
+        };
+        let mut queue = Queue::default();
+        queue.push(packet(PEER, 1), 10_000);
+        queue.push(packet(PEER, 2), 10_000);
+        let mut encoded = Vec::new();
+        flush(&mut queue, &mut engine, 8192, 10_000, |bytes| {
+            // Channel pinning must not disable hardware acknowledgments, even in an aggregate.
+            let flags = radiotap::Radiotap::from_bytes(bytes)
+                .unwrap()
+                .tx_flags
+                .unwrap();
+            assert!(!flags.no_ack && flags.no_seq);
+            encoded.push(bytes.to_vec());
+            Ok(())
+        });
+        assert!(engine.has_pending_tx(10_000));
+        let report = completion(&encoded[0], false, 2);
+        // mt76's missing-status cleanup can claim ACKed with no known rate.
+        let mut synthetic = report.clone();
+        synthetic.drain(8..10);
+        synthetic[2] = 11;
+        synthetic[4] = 0;
+        engine.receive(&synthetic, 10_500).unwrap();
+        assert_eq!(engine.stats.tx_status_acked, 0);
+        assert!(engine.has_pending_tx(10_500));
+        let before_rx = engine.stats.rx_data;
+        let last_seen = engine.peers[&PEER].last_seen_us;
+        let (frames, events) = engine.receive(&report, 11_000).unwrap();
+        assert!(frames.is_empty() && events.is_empty());
+        assert_eq!(engine.stats.rx_data, before_rx);
+        assert_eq!(engine.peers[&PEER].last_seen_us, last_seen);
+        assert_eq!(engine.stats.tx_status_acked, 1);
+        assert_eq!(engine.stats.tx_status_retries, 2);
+        assert!(!engine.has_pending_tx(11_000));
+        engine.receive(&report, 12_000).unwrap(); // A duplicate is not a second success.
+        assert_eq!(engine.stats.tx_status_acked, 1);
+        let late = transmit(&mut engine, 13_000);
+        for n in 0..4 {
+            let bytes = transmit(&mut engine, 14_000 + n);
+            let mut foreign = completion(&bytes, false, 0);
+            let last_payload = foreign.len() - 8;
+            foreign[last_payload] ^= 1;
+            engine.receive(&foreign, 15_000 + n).unwrap();
+            engine
+                .receive(&completion(&bytes, true, 0), 16_000 + n)
+                .unwrap();
+        }
+        let lower = engine.data_parameters(PEER).unwrap();
+        assert!(lower.rate.phy_mbps().unwrap() <= initial.rate.phy_mbps().unwrap() * 0.85);
+        engine
+            .receive(&completion(&late, false, 0), 20_000)
+            .unwrap();
+        assert_eq!(engine.data_parameters(PEER).unwrap(), lower);
+        for n in 0..16 {
+            let bytes = transmit(&mut engine, 21_000 + n);
+            engine
+                .receive(&completion(&bytes, false, 3), 22_000 + n)
+                .unwrap();
+        }
+        let heavily_retried = engine.data_parameters(PEER).unwrap();
+        assert!(heavily_retried.rate.phy_mbps() < lower.rate.phy_mbps());
+        for n in 0..128 {
+            let bytes = transmit(&mut engine, 30_000 + n);
+            engine
+                .receive(&completion(&bytes, false, 0), 31_000 + n)
+                .unwrap();
+        }
+        assert!(
+            engine.data_parameters(PEER).unwrap().rate.phy_mbps() > heavily_retried.rate.phy_mbps()
+        );
+        // Fixed-rate commands still collect diagnostics but do not adapt.
+        engine.config.rate = Rate::Legacy(12);
+        for n in 0..4 {
+            let bytes = transmit(&mut engine, 40_000 + n);
+            engine
+                .receive(&completion(&bytes, true, 0), 41_000 + n)
+                .unwrap();
+        }
+        assert_eq!(engine.data_parameters(PEER).unwrap().rate, Rate::Legacy(12));
+        // Reports outside the ledger's age bound cannot change selection or success totals.
+        let expired = transmit(&mut engine, 50_000);
+        let successes = engine.stats.tx_status_acked;
+        engine
+            .receive(&completion(&expired, false, 0), 3_000_000)
+            .unwrap();
+        assert_eq!(engine.stats.tx_status_acked, successes);
+        engine.config.tx_noack = true;
+        let bytes = transmit(&mut engine, 3_001_000);
+        assert!(
+            radiotap::Radiotap::from_bytes(&bytes)
+                .unwrap()
+                .tx_flags
+                .unwrap()
+                .no_ack
+        );
+    }
+    #[test]
+    fn addba_rejection_checks_wire_target_and_preserves_scheduled_retries() {
+        let mut engine = engine();
+        engine.config.tx_noack = true;
+        let request = protocol::AddBaRequest {
+            dialog_token: 7,
+            parameters: 0x1017,
+        };
+        let mut raw = protocol::radiotap_tx(Rate::DISCOVERY.into(), false, false).unwrap();
+        raw.extend_from_slice(&[0xd0, 0, 0, 0]);
+        raw.extend_from_slice(&OWN.0);
+        raw.extend_from_slice(&PEER.0);
+        raw.extend_from_slice(&protocol::BSSID.0);
+        raw.extend_from_slice(&[0, 0, 3, 0, 7, 0x17, 0x10, 0, 0, 0, 0]);
+        for n in 0..raw.len() {
+            let _ = engine.receive(&raw[..n], 10_000);
+        }
+        assert_eq!(engine.stats.rx_addba_requests, 0);
+        let (data, events) = engine.receive(&raw, 10_000).unwrap();
+        assert!(data.is_empty());
+        assert!(
+            matches!(&events[..], [crate::engine::Event::AddBaRequest { peer: PEER, request: r }] if *r == request)
+        );
+        let mut foreign = raw.clone();
+        let offset = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+        foreign[offset + 4..offset + 10].copy_from_slice(&protocol::BROADCAST.0);
+        assert!(engine.receive(&foreign, 10_000).unwrap().1.is_empty());
+        let mut queue = Queue::default();
+        queue.reject_addba(&mut engine, PEER, request, 10_000);
+        queue.reject_addba(&mut engine, PEER, request, 10_000);
+        assert_eq!(queue.management.len(), 1);
+        let mut submitted = Vec::new();
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || 10_000,
+                |bytes| {
+                    submitted = bytes.to_vec();
+                    Err::<(), _>(InjectionError::<TestError>::Backpressure)
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.stats.tx_addba_rejections, 0);
+        engine.config.channel = 149;
+        queue
+            .flush::<TestError>(&mut engine, 6, 8192, || 11_000, |_| panic!("wrong channel"))
+            .unwrap();
+        engine.config.channel = 6;
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || 12_000,
+                |bytes| {
+                    assert_eq!(bytes, submitted);
+                    Ok::<(), InjectionError<TestError>>(())
+                },
+            )
+            .unwrap();
+        let (radio, body) = radiotap::Radiotap::parse(&submitted).unwrap();
+        assert!(radio.tx_flags.unwrap().no_ack);
+        assert_eq!(&body[4..10], &PEER.0);
+        assert_eq!(&body[10..16], &OWN.0);
+        assert_eq!(&body[16..22], &protocol::BSSID.0);
+        assert_eq!(&body[24..], &[3, 1, 7, 37, 0, 0x16, 0, 0, 0]);
+        assert!(queue.is_empty());
+        assert_eq!(engine.stats.tx_addba_rejections, 1);
+        queue.reject_addba(&mut engine, PEER, request, 20_000);
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || 3_000_000,
+                |_| -> Result<(), InjectionError<TestError>> { panic!("expired reply") },
+            )
+            .unwrap();
+        assert!(queue.is_empty());
+        assert_eq!(engine.stats.tx_addba_rejections, 1);
+    }
+    #[test]
+    fn ack_timing_keeps_identity_and_counts_members_once_across_retries() {
+        use std::cell::Cell;
+        let ack_packet = |marker, payload: &[u8]| {
+            let mut packet = Vec::new();
+            etherparse::PacketBuilder::ethernet2(OWN.0, PEER.0)
+                .ipv6(OWN.ipv6().octets(), PEER.ipv6().octets(), 64)
+                .tcp(1234, 8771, marker, 65535)
+                .ack(5000)
+                .write(&mut packet, payload)
+                .unwrap();
+            packet
+        };
+        assert!(tcp_metadata(&ack_packet(1, b"data")).1.is_none());
+        let mut fin = ack_packet(1, &[]);
+        fin[14 + 40 + 13] |= 1;
+        assert!(tcp_metadata(&fin).1.is_none());
+        let mut engine = engine();
+        let mut queue = Queue::default();
+        queue.push(ack_packet(1, &[]), 0);
+        queue.push(ack_packet(2, &[]), 500);
+        assert_eq!(queue.pending_acks(), 2);
+        engine.peers.get_mut(&PEER).unwrap().sequence = Some(Sequence::fixed(149));
+        flush(&mut queue, &mut engine, 8192, 1_000, |_| {
+            panic!("off channel")
+        });
+        assert_eq!(engine.stats.tx_ack.injection_attempts, 0);
+        engine.peers.get_mut(&PEER).unwrap().sequence = Some(Sequence::fixed(6));
+        flush(&mut queue, &mut engine, 8192, 10_000, |_| {
+            Err(InjectionError::Backpressure)
+        });
+        assert_eq!(
+            queue.frames[0]
+                .packets
+                .iter()
+                .map(|p| p.ack.as_ref().unwrap().id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(engine.stats.tx_ack.injected, 0);
+        let clock = Cell::new(25_000);
+        queue
+            .flush(
+                &mut engine,
+                6,
+                8192,
+                || clock.get(),
+                |_| {
+                    clock.set(clock.get() + 37);
+                    Ok::<(), InjectionError<TestError>>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(queue.pending_acks(), 0);
+        let timing = &engine.stats.tx_ack;
+        assert_eq!((timing.injected, timing.injection_attempts), (2, 2));
+        assert_eq!(
+            (timing.queue_wait_us_total, timing.queue_wait_us_max),
+            (49_500, 25_000)
+        );
+        assert_eq!(
+            (timing.injection_us_total, timing.injection_us_max),
+            (37, 37)
+        );
+        assert_eq!((timing.schedule_blocked, timing.backpressured), (2, 2));
+        assert_eq!(
+            (engine.stats.tx_amsdu, engine.stats.tx_aggregated_packets),
+            (1, 2)
+        );
+
+        queue.push(ack_packet(3, &[]), 150_000);
+        flush(&mut queue, &mut engine, 8192, 2_150_000, |_| {
+            panic!("expired")
+        });
+        assert_eq!(engine.stats.tx_ack.dropped, 1);
+        assert_eq!(engine.stats.tx_ack.injected, 2);
     }
     #[test]
     fn aggregation_retries_recheck_slots_and_preserve_sequences_on_rate_changes() {
@@ -434,6 +1003,14 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(engine.stats.tx_data, 0);
         assert_eq!(packets(&original), [first.clone(), second.clone()]);
+        engine.config.fec = FecPolicy::Ldpc;
+        flush(&mut queue, &mut engine, 8192, 10_000, |bytes| {
+            let (rt, body) = radiotap::Radiotap::parse(bytes).unwrap();
+            assert_eq!(body, radiotap::Radiotap::parse(&original).unwrap().1);
+            assert_eq!(rt.mcs.unwrap().index, Some(7));
+            assert_eq!(rt.mcs.unwrap().fec, Some(radiotap::field::ext::FEC::LDPC));
+            Err(InjectionError::Backpressure)
+        });
         engine
             .peers
             .get_mut(&PEER)
@@ -471,7 +1048,7 @@ mod tests {
             ),
             (1, 2, 1, 2)
         );
-        assert_eq!(engine.stats.tx_backpressure, 1);
+        assert_eq!(engine.stats.tx_backpressure, 2);
         // Do not inject a long aggregate near the end of a matching window.
         engine.config.rate = "mcs0".parse().unwrap();
         queue.push(first, 0);
@@ -528,7 +1105,9 @@ mod tests {
         queue.push(first.clone(), 0);
         queue.push(second.clone(), 0);
         flush(&mut queue, &mut engine, 8192, 10_000, |_| {
-            Err(InjectionError::TooLarge("size"))
+            Err(InjectionError::TooLarge(TestError::PcapError(
+                "size".into(),
+            )))
         });
         assert_eq!(queue.len(), 2);
         let sent = send(&mut queue, &mut engine, 8192, 10_000);
@@ -581,5 +1160,92 @@ mod tests {
         engine.peers.get_mut(&PEER).unwrap().sequence = Some(Sequence::fixed(6));
         let sent = send(&mut queue, &mut engine, 8192, 10_000);
         assert_eq!(sent, [vec![first], vec![packet(other, 4)], vec![second]]);
+        let mut engine = self::engine();
+        let channel = ChannelDefinition::new(149, 80).unwrap();
+        engine.set_operating_channel(channel);
+        engine.config.capabilities.ghz5 = engine.config.capabilities.ghz2.clone();
+        engine.config.capabilities.ghz5.vht = Some(protocol::VhtCapabilities {
+            cap_info: 1 | (1 << 4) | (1 << 5),
+            rx_mcs_map: 0xfffa,
+            tx_mcs_map: 0xfffa,
+            rx_highest: 0,
+            tx_highest: 0,
+        });
+        engine.peers.get_mut(&PEER).unwrap().capabilities = engine.config.capabilities.ghz5.clone();
+        engine.peers.get_mut(&PEER).unwrap().sequence = Some(Sequence::fixed_definition(channel));
+        engine.config.rate = "vht8-nss2-bw80-sgi".parse().unwrap();
+        let bcc = engine.data_parameters(PEER).unwrap();
+        let mut queue = Queue::default();
+        queue.push(packet(PEER, 1), 0);
+        queue.push(packet(PEER, 2), 0);
+        let mut original = Vec::new();
+        flush(&mut queue, &mut engine, 8192, 10_000, |bytes| {
+            original = bytes.to_vec();
+            Err(InjectionError::Backpressure)
+        });
+        engine.config.fec = FecPolicy::Ldpc;
+        let ldpc = engine.data_parameters(PEER).unwrap();
+        flush(&mut queue, &mut engine, 8192, 10_000, |bytes| {
+            assert_eq!(bytes.len(), original.len() + 4);
+            assert_eq!(
+                radiotap::Radiotap::parse(bytes).unwrap().1,
+                radiotap::Radiotap::parse(&original).unwrap().1
+            );
+            Err(InjectionError::Backpressure)
+        });
+        assert_eq!(
+            aggregate_limit(&engine, PEER, bcc, 2048) - aggregate_limit(&engine, PEER, ldpc, 2048),
+            4
+        );
+        // Repack a cached aggregate after the available monitor MTU shrinks.
+        flush(&mut queue, &mut engine, 2048, 10_000, |_| {
+            panic!("repacking")
+        });
+        flush(&mut queue, &mut engine, 2048, 10_000, |bytes| {
+            assert!(bytes.len() <= 2048);
+            assert_eq!(packets(bytes).len(), 1);
+            Ok(())
+        });
+        assert!(queue.is_empty());
+        engine
+            .peers
+            .get_mut(&PEER)
+            .unwrap()
+            .capabilities
+            .vht
+            .as_mut()
+            .unwrap()
+            .cap_info &= !(1 << 4);
+        queue.push(packet(PEER, 3), 0);
+        let error = queue
+            .flush(
+                &mut engine,
+                149,
+                8192,
+                || 10_000,
+                |_| -> Result<(), InjectionError<TestError>> {
+                    panic!("unsupported peer must not be injected")
+                },
+            )
+            .err()
+            .expect("unsupported peer");
+        assert!(error.to_string().contains("peer RX LDPC"));
+        engine.config.fec = FecPolicy::Bcc;
+        queue.push(packet(PEER, 4), 0);
+        let error = queue
+            .flush(
+                &mut engine,
+                149,
+                8192,
+                || 20_000,
+                |_| {
+                    Err(InjectionError::Fatal(TestError::PcapError(
+                        "backend failure".into(),
+                    )))
+                },
+            )
+            .err()
+            .expect("backend failure");
+        assert!(error.downcast_ref::<TestError>().is_some());
     }
 }

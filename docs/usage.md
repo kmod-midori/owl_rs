@@ -18,6 +18,9 @@ just send 'Example Phone' --url https://example.com
 
 Files and recursive folders are supported; symlinks and special files are refused.
 Received links are saved as inert `.url` files and never opened automatically.
+Incoming files stream into a private temporary directory inside the destination;
+the completed directory is renamed to `airdrop-TRANSFER_ID`. Failed or cancelled
+uploads discard their temporary files; partial transfers are never published.
 
 To receive, keep the foreground daemon running:
 
@@ -212,6 +215,7 @@ are protocol parameters, rather than application timeout options.
 | `--peer-idle-timeout` | 5 | AWDL neighbor inactivity deadline. |
 | `--queued-packet-timeout` | 2 | Queued AWDL packet and early SYN expiry; quiet tail before returning to discovery. |
 | `--link-startup-timeout` | 120 | User-side wait for owld link readiness. |
+| `--channel-ready-timeout` | 15 | Sender wait for owld to commit the transfer channel before upload. |
 | `--link-shutdown-timeout` | 180 | User-side wait for owld restoration. |
 | `--discovery-cache-timeout` | 120 | Local mDNS cache lifetime cap. |
 | `--discovery-fallback-timeout` | 2 | Transient AWDL fallback discovery candidate lifetime. |

@@ -26,6 +26,12 @@ pub struct LinkInfo {
     pub interface: Option<String>,
     pub lease_timeout: f64,
 }
+/// Monotonic activity revision; a readiness reply cannot satisfy a later transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferState {
+    pub epoch: u64,
+    pub transfers: u32,
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
@@ -36,6 +42,7 @@ pub enum Request {
         generation: String,
         service_enabled: bool,
         transfers: u32,
+        transfer_epoch: u64,
     },
     Release {
         generation: String,
@@ -44,10 +51,22 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Event {
-    Ready { link: LinkInfo },
-    Snapshot { value: serde_json::Value },
-    Closed { error: Option<String> },
-    Error { message: String },
+    Ready {
+        link: LinkInfo,
+    },
+    Snapshot {
+        value: serde_json::Value,
+    },
+    ChannelReady {
+        generation: String,
+        transfer_epoch: u64,
+    },
+    Closed {
+        error: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 pub type Reader<R> = FramedRead<R, LinesCodec>;
 pub fn reader<R: AsyncRead>(input: R) -> Reader<R> {

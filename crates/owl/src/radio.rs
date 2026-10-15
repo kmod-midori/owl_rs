@@ -16,6 +16,17 @@ use wl_nl80211::Nl80211InterfaceType as IfType;
 // Enough room for the largest supported A-MSDU plus radiotap and MAC headers.
 const MONITOR_MTU: u32 = 8192;
 
+pub fn driver_name(interface: &str) -> Result<String> {
+    interface_name(interface)?;
+    Ok(
+        std::fs::canonicalize(format!("/sys/class/net/{interface}/device/driver"))?
+            .file_name()
+            .context("missing radio driver")?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -55,6 +66,10 @@ pub struct RadioArgs {
     pub profiles: Option<PathBuf>,
     #[arg(long)]
     pub allow_untested: bool,
+    /// Unicast ACK policy; auto follows the driver profile, independent of channel pinning.
+    #[arg(long, value_enum, default_value = "auto")]
+    #[serde(default)]
+    pub tx_ack: crate::rate::AckPolicy,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +87,12 @@ pub struct Profile {
     pub mon_mac: MonMac,
     pub reconnect: bool,
     pub mt76_pm: bool,
+    /// TX encoder support; independent of RX advertisements and --fec selection.
+    #[serde(default)]
+    pub supports_tx_ldpc: bool,
+    /// Driver workaround: transmit without hardware ACK waiting or TX feedback.
+    #[serde(default)]
+    pub tx_noack: bool,
     pub exclusive_backend: Backend,
 }
 #[derive(Deserialize)]
@@ -80,6 +101,13 @@ struct Profiles {
     profiles: std::collections::BTreeMap<String, Profile>,
 }
 impl Profile {
+    pub fn load(driver: &str, path: Option<&Path>) -> Result<Self> {
+        let table = match path {
+            Some(path) => std::fs::read_to_string(path)?,
+            None => include_str!("../../../profiles.toml").into(),
+        };
+        Self::parse(&table, driver)
+    }
     pub fn parse(table: &str, driver: &str) -> Result<Self> {
         let mut profiles: Profiles = toml::from_str(table).context("parse radio profiles TOML")?;
         let mut profile = profiles
@@ -187,16 +215,8 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     }
     let base = PathBuf::from(format!("/sys/class/net/{station}"));
     let phy = format!("phy{}", iface.phy);
-    let driver = std::fs::canonicalize(base.join("device/driver"))?
-        .file_name()
-        .context("missing driver")?
-        .to_string_lossy()
-        .into_owned();
-    let table = match &args.profiles {
-        Some(p) => std::fs::read_to_string(p)?,
-        None => include_str!("../../../profiles.toml").into(),
-    };
-    let mut profile = Profile::parse(&table, &driver)?;
+    let driver = driver_name(&station)?;
+    let mut profile = Profile::load(&driver, args.profiles.as_deref())?;
     if let Some(mode) = args.mode {
         profile.mode = mode;
     }

@@ -8,6 +8,41 @@ use std::{
     io::{Read, Write},
     time::Duration,
 };
+// Independent, test-only decoding of known-valid outgoing fixtures. Production
+// reception has one streaming parser and never writes a decoded archive file.
+fn cpio_bytes(wire: &archive::Prepared) -> Vec<u8> {
+    let mut input = wire.file.reopen().unwrap();
+    let mut out = Vec::new();
+    loop {
+        let mut header = [0; 4];
+        if input.read(&mut header[..1]).unwrap() == 0 {
+            break;
+        }
+        input.read_exact(&mut header[1..]).unwrap();
+        let block = u32::from_be_bytes(header);
+        let mut section = (&mut input).take((block & 0x7fffffff) as u64);
+        if block & 0x80000000 != 0 {
+            std::io::copy(&mut section, &mut out).unwrap();
+        } else {
+            std::io::copy(&mut flate2::read::ZlibDecoder::new(&mut section), &mut out).unwrap();
+        }
+    }
+    out
+}
+fn stored(bytes: &[u8]) -> Vec<u8> {
+    let mut wire = ((bytes.len() as u32) | 0x80000000).to_be_bytes().to_vec();
+    wire.extend(bytes);
+    wire
+}
+fn staging_exists(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".owl-rs-")
+    })
+}
 #[test]
 fn archive_roundtrip_bounds_traversal_and_corruption() {
     let dir = tempfile::tempdir().unwrap();
@@ -18,54 +53,15 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
     openssl::rand::rand_bytes(&mut random).unwrap();
     std::fs::write(tree.join("random.bin"), &random).unwrap();
     let wire = archive::prepare(&[tree], 1024 * 1024).unwrap();
-    let out = archive::extract_checked(
-        wire.file.path(),
-        &dir.path().join("received"),
-        "fixture",
-        1024 * 1024,
-        &wire.items,
-    )
-    .unwrap();
-    assert_eq!(
-        std::fs::read(out.join("folder/random.bin")).unwrap(),
-        random
-    );
-    assert_eq!(
-        std::fs::read(out.join("folder/nested/data.txt")).unwrap(),
-        vec![b'a'; 180000]
-    );
-    assert!(
-        archive::extract_checked(
-            wire.file.path(),
-            &dir.path().join("received"),
-            "unapproved",
-            1024 * 1024,
-            &[archive::Item {
-                name: "other".into(),
-                size: 0,
-                directory: true
-            }]
-        )
-        .is_err()
-    );
-    assert!(!dir.path().join("received/airdrop-unapproved").exists());
-    // Apple's compressed blocks can expand beyond the streaming output buffer.
-    let decoded = archive::decode(wire.file.path(), 1024 * 1024).unwrap();
-    let bytes = std::fs::read(decoded.path()).unwrap();
+    let destination = dir.path().join("received");
+    let original = std::fs::read(wire.file.path()).unwrap();
+    let bytes = cpio_bytes(&wire);
+    // Apple's compressed blocks may expand beyond a decoder output buffer.
     let mut zip = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     zip.write_all(&bytes).unwrap();
     let compressed = zip.finish().unwrap();
-    let mut large = tempfile::NamedTempFile::new().unwrap();
-    large
-        .write_all(&(compressed.len() as u32).to_be_bytes())
-        .unwrap();
-    large.write_all(&compressed).unwrap();
-    assert_eq!(
-        std::fs::read(archive::decode(large.path(), 1024 * 1024).unwrap().path()).unwrap(),
-        bytes
-    );
-    // Fragmented reads must finish on a validated trailer/block or gzip
-    // footer, without consulting transport EOF. Headers can span DVZip blocks.
+    let mut large = (compressed.len() as u32).to_be_bytes().to_vec();
+    large.extend(compressed);
     struct Fragmented(std::io::Cursor<Vec<u8>>);
     impl Read for Fragmented {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
@@ -77,133 +73,235 @@ fn archive_roundtrip_bounds_traversal_and_corruption() {
             Ok(n)
         }
     }
-    let mut split = Vec::new();
-    for chunk in bytes.chunks(17) {
-        split.extend_from_slice(&((chunk.len() as u32) | 0x80000000).to_be_bytes());
-        split.extend_from_slice(chunk);
-    }
+    let split: Vec<_> = bytes.chunks(17).flat_map(stored).collect();
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gz.write_all(&bytes).unwrap();
-    let gzip = gz.finish().unwrap();
+    let mut gzip = gz.finish().unwrap();
     for (id, data) in [
-        ("stream-blocks", split),
-        ("stream-zlib", std::fs::read(large.path()).unwrap()),
-        ("stream-gzip", gzip.clone()),
+        ("original", original.clone()),
+        ("split", split),
+        ("zlib", large.clone()),
+        ("gzip", gzip.clone()),
     ] {
-        let out = archive::receive(
+        let pending = archive::receive(
             Fragmented(std::io::Cursor::new(data)),
-            &dir.path().join("received"),
+            &destination,
             id,
             1024 * 1024,
             &wire.items,
         )
         .unwrap();
-        assert!(!dir.path().join(format!("received/airdrop-{id}")).exists());
-        let out = out.commit().unwrap();
+        assert!(!destination.join(format!("airdrop-{id}")).exists());
+        let out = pending.commit().unwrap();
         assert_eq!(
             std::fs::read(out.join("folder/random.bin")).unwrap(),
             random
         );
+        assert_eq!(
+            std::fs::read(out.join("folder/nested/data.txt")).unwrap(),
+            vec![b'a'; 180000]
+        );
     }
     let pending = archive::receive(
-        std::fs::File::open(wire.file.path()).unwrap(),
-        &dir.path().join("received"),
+        std::io::Cursor::new(original.clone()),
+        &destination,
         "cancelled",
         1024 * 1024,
         &wire.items,
     )
     .unwrap();
     drop(pending);
-    assert!(!dir.path().join("received/airdrop-cancelled").exists());
-    assert!(
-        !std::fs::read_dir(dir.path().join("received"))
-            .unwrap()
-            .any(|e| e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".owl-rs-"))
-    );
-    let mut corrupt_gzip = gzip;
-    let last = corrupt_gzip.len() - 1;
-    corrupt_gzip[last] ^= 1;
+    assert!(!destination.join("airdrop-cancelled").exists());
+    let unapproved = [archive::Item {
+        name: "other".into(),
+        size: 0,
+        directory: true,
+    }];
     assert!(
         archive::receive(
-            std::io::Cursor::new(corrupt_gzip),
-            &dir.path().join("received"),
-            "corrupt-gzip",
+            std::io::Cursor::new(original.clone()),
+            &destination,
+            "unapproved",
             1024 * 1024,
-            &wire.items
+            &unapproved
         )
         .is_err()
     );
-    let mut missing_checksum = std::fs::read(large.path()).unwrap();
-    missing_checksum.pop();
-    assert!(
-        archive::receive(
-            std::io::Cursor::new(missing_checksum),
-            &dir.path().join("received"),
-            "missing-checksum",
-            1024 * 1024,
-            &wire.items
-        )
-        .is_err()
-    );
-    assert!(!dir.path().join("received/airdrop-corrupt-gzip").exists());
-    assert!(
-        !dir.path()
-            .join("received/airdrop-missing-checksum")
-            .exists()
-    );
-    // A complete DVZip block ending between CPIO members is not a complete
-    // archive; an empty archive must also be rejected.
-    let partial = tempfile::NamedTempFile::new().unwrap();
     let next_member = bytes
         .windows(6)
         .enumerate()
         .find(|(n, b)| *n > 0 && *b == b"070707")
         .unwrap()
         .0;
-    for raw in [&bytes[..next_member], &b""[..]] {
-        let mut stored = ((raw.len() as u32) | 0x80000000).to_be_bytes().to_vec();
-        stored.extend(raw);
-        std::fs::write(partial.path(), stored).unwrap();
-        assert!(archive::decode(partial.path(), 1024 * 1024).is_err());
-        assert!(
-            archive::receive(
-                std::fs::File::open(partial.path()).unwrap(),
-                &dir.path().join("received"),
-                "partial",
-                1024 * 1024,
-                &wire.items
-            )
-            .is_err()
-        );
-    }
-    let trailer_start = bytes
-        .windows(6)
-        .enumerate()
-        .rfind(|(_, b)| *b == b"070707")
-        .unwrap()
-        .0;
-    std::fs::write(partial.path(), &bytes[trailer_start..]).unwrap();
-    assert!(archive::preflight(partial.path(), 1024 * 1024).is_err());
-    assert!(archive::decode(wire.file.path(), 100).is_err());
-    for name in ["../escape", "/absolute", "x/../../escape", "x\\escape", ""] {
-        assert!(archive::safe_path(name).is_err());
-    }
-    let mut bytes = Vec::new();
-    wire.file.reopen().unwrap().read_to_end(&mut bytes).unwrap();
-    bytes.pop();
-    let mut bad = tempfile::NamedTempFile::new().unwrap();
-    bad.write_all(&bytes).unwrap();
-    assert!(archive::decode(bad.path(), 1024 * 1024).is_err());
+    let trailer = bytes.windows(6).rposition(|b| b == b"070707").unwrap();
+    *gzip.last_mut().unwrap() ^= 1;
+    large.pop();
+    let mut truncated = original.clone();
+    truncated.pop();
     let mut forged = vec![b'0'; 110];
     forged[..6].copy_from_slice(b"070701");
     forged[94..102].copy_from_slice(b"ffffffff");
-    std::fs::write(bad.path(), forged).unwrap();
-    assert!(archive::preflight(bad.path(), 1024 * 1024).is_err());
+    for (id, data, limit) in [
+        ("partial", stored(&bytes[..next_member]), 1024 * 1024),
+        ("empty", stored(&bytes[trailer..]), 1024 * 1024),
+        ("gzip-corrupt", gzip, 1024 * 1024),
+        ("missing-checksum", large, 1024 * 1024),
+        ("truncated", truncated, 1024 * 1024),
+        ("forged-name", stored(&forged), 1024 * 1024),
+        ("size-limit", original, 100),
+    ] {
+        assert!(
+            archive::receive(
+                std::io::Cursor::new(data),
+                &destination,
+                id,
+                limit,
+                &wire.items
+            )
+            .is_err(),
+            "{id}"
+        );
+        assert!(!destination.join(format!("airdrop-{id}")).exists());
+        assert!(!staging_exists(&destination), "{id}");
+    }
+    for name in ["../escape", "/absolute", "x/../../escape", "x\\escape", ""] {
+        assert!(archive::safe_path(name).is_err());
+    }
 }
+#[test]
+fn extraction_streams_before_eof_and_removes_failed_staging() {
+    use std::{cell::Cell, io::Cursor, path::Path};
+    struct Observed<'a> {
+        input: Cursor<Vec<u8>>,
+        destination: &'a Path,
+        observed: &'a Cell<bool>,
+        fail: bool,
+    }
+    impl Read for Observed<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.input.position() >= 128 * 1024 && !self.observed.get() {
+                let entries: Vec<_> =
+                    std::fs::read_dir(self.destination)?.collect::<Result<_, _>>()?;
+                assert_eq!(entries.len(), 1);
+                assert!(
+                    entries[0]
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".owl-rs-")
+                );
+                let len = std::fs::metadata(entries[0].path().join("payload.bin"))?.len();
+                assert!(len > 0 && len < 256 * 1024);
+                self.observed.set(true);
+                if self.fail {
+                    return Err(std::io::Error::other("connection failed"));
+                }
+            }
+            let n = out.len().min(8192);
+            self.input.read(&mut out[..n])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("payload.bin");
+    std::fs::write(&source, vec![0x5a; 256 * 1024]).unwrap();
+    let prepared = archive::prepare(&[source], 1024 * 1024).unwrap();
+    let wire = stored(&cpio_bytes(&prepared));
+    for fail in [false, true] {
+        let destination = dir.path().join(if fail { "failure" } else { "success" });
+        let observed = Cell::new(false);
+        let result = archive::receive(
+            Observed {
+                input: Cursor::new(wire.clone()),
+                destination: &destination,
+                observed: &observed,
+                fail,
+            },
+            &destination,
+            "fixture",
+            1024 * 1024,
+            &prepared.items,
+        );
+        assert!(
+            observed.get(),
+            "file must be written before the final block arrives"
+        );
+        if fail {
+            assert!(result.is_err());
+        } else {
+            let pending = result.unwrap();
+            assert!(!destination.join("airdrop-fixture").exists());
+            let out = pending.commit().unwrap();
+            assert_eq!(
+                std::fs::metadata(out.join("payload.bin")).unwrap().len(),
+                256 * 1024
+            );
+        }
+        assert!(!staging_exists(&destination));
+    }
+    // New ASCII CPIO aligns both names and file payloads to four bytes.
+    fn member(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        out.extend(b"070701");
+        for value in [
+            1,
+            mode,
+            0,
+            0,
+            1,
+            0,
+            data.len() as u32,
+            0,
+            0,
+            0,
+            0,
+            name.len() as u32 + 1,
+            0,
+        ] {
+            out.extend(format!("{value:08x}").bytes());
+        }
+        out.extend(name.bytes());
+        out.push(0);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        out.extend(data);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+    }
+    let destination = dir.path().join("newc");
+    let expected = [archive::Item {
+        name: "file.txt".into(),
+        size: 3,
+        directory: false,
+    }];
+    let mut cpio = Vec::new();
+    member(&mut cpio, "file.txt", 0o100644, b"abc");
+    member(&mut cpio, "TRAILER!!!", 0, b"");
+    let wire_newc = stored(&cpio);
+    let out = archive::receive(
+        Cursor::new(wire_newc),
+        &destination,
+        "fixture",
+        1024,
+        &expected,
+    )
+    .unwrap()
+    .commit()
+    .unwrap();
+    assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"abc");
+    // Failed publication preserves the existing transfer and removes staging.
+    let pending = archive::receive(
+        Cursor::new(wire),
+        &destination,
+        "fixture",
+        1024 * 1024,
+        &prepared.items,
+    )
+    .unwrap();
+    assert!(pending.commit().is_err());
+    assert_eq!(std::fs::read(out.join("file.txt")).unwrap(), b"abc");
+    assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
+}
+
 #[tokio::test]
 async fn native_https_transfer_and_connection_bound_upload() {
     let dir = tempfile::tempdir().unwrap();
@@ -242,8 +340,7 @@ async fn native_https_transfer_and_connection_bound_upload() {
     openssl::rand::rand_bytes(&mut payload).unwrap();
     std::fs::write(&path, &payload).unwrap();
     let prepared = archive::prepare(&[path], 16 * 1024 * 1024).unwrap();
-    let cpio = archive::decode(prepared.file.path(), 16 * 1024 * 1024).unwrap();
-    let mut reader = cpio_archive::reader(cpio.reopen().unwrap()).unwrap();
+    let mut reader = cpio_archive::reader(std::io::Cursor::new(cpio_bytes(&prepared))).unwrap();
     let header = reader.read_next().unwrap().unwrap();
     // A trailing slash makes Apple's extractor treat a regular file as a directory.
     assert_eq!(header.name(), "./payload.txt");
@@ -321,6 +418,24 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         stream.read_exact(&mut vec![0; length]).await.unwrap();
         headers
     }
+    async fn ask(
+        stream: &mut BufStream<tokio_openssl::SslStream<tokio::net::TcpStream>>,
+        metadata: &[u8],
+    ) {
+        stream
+            .write_all(
+                format!(
+                    "POST /Ask HTTP/1.1\r\nHost: AirDrop\r\nContent-Length: {}\r\n\r\n",
+                    metadata.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(metadata).await.unwrap();
+        stream.flush().await.unwrap();
+        assert!(reply(stream).await.starts_with("HTTP/1.1 200"));
+    }
     let dir = tempfile::tempdir().unwrap();
     let identity = Identity::load(&dir.path().join("keys"), "test").unwrap();
     let receiver = Receiver::new(
@@ -329,7 +444,12 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         dir.path().join("received"),
         1024 * 1024,
         true,
-    );
+    )
+    .with_timeouts(airdrop::timeouts::Timeouts {
+        upload_idle: Duration::from_secs(1),
+        upload_total: Duration::from_secs(3),
+        ..Default::default()
+    });
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -338,17 +458,23 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         let cancel = cancel.clone();
         async move { receiver.serve(listener, cancel).await }
     });
-    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
-    let ssl = identity
-        .connector()
-        .unwrap()
-        .configure()
-        .unwrap()
-        .into_ssl("AirDrop")
-        .unwrap();
-    let mut tls = tokio_openssl::SslStream::new(ssl, tcp).unwrap();
-    std::pin::Pin::new(&mut tls).connect().await.unwrap();
-    let mut stream = BufStream::new(tls);
+    async fn connect(
+        identity: &Identity,
+        address: std::net::SocketAddr,
+    ) -> BufStream<tokio_openssl::SslStream<tokio::net::TcpStream>> {
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let ssl = identity
+            .connector()
+            .unwrap()
+            .configure()
+            .unwrap()
+            .into_ssl("AirDrop")
+            .unwrap();
+        let mut tls = tokio_openssl::SslStream::new(ssl, tcp).unwrap();
+        std::pin::Pin::new(&mut tls).connect().await.unwrap();
+        BufStream::new(tls)
+    }
+    let mut stream = connect(&identity, address).await;
     let path = dir.path().join("photo.txt");
     let mut payload = vec![0; 90000];
     openssl::rand::rand_bytes(&mut payload).unwrap();
@@ -370,19 +496,7 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         ),
     ]);
     let metadata = airdrop::transfer::plist_bytes(&offer).unwrap();
-    stream
-        .write_all(
-            format!(
-                "POST /Ask HTTP/1.1\r\nHost: AirDrop\r\nContent-Length: {}\r\n\r\n",
-                metadata.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    stream.write_all(&metadata).await.unwrap();
-    stream.flush().await.unwrap();
-    assert!(reply(&mut stream).await.starts_with("HTTP/1.1 200"));
+    ask(&mut stream, &metadata).await;
     let data = std::fs::read(prepared.file.path()).unwrap();
     stream.write_all(format!("POST /Upload HTTP/1.1\r\nHost: AirDrop\r\nTransferID: {id}\r\nContent-Type: application/x-dvzip\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes()).await.unwrap();
     let chunk_size = format!("{:x}\r\n", data.len());
@@ -417,6 +531,48 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         payload
     );
     drop(stream);
+    for disconnect in [true, false] {
+        let mut stream = connect(&identity, address).await;
+        let failed_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let mut failed_offer = offer.clone();
+        failed_offer
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("TransferID".into(), failed_id.clone().into());
+        let metadata = airdrop::transfer::plist_bytes(&failed_offer).unwrap();
+        ask(&mut stream, &metadata).await;
+        stream.write_all(format!("POST /Upload HTTP/1.1\r\nHost: AirDrop\r\nTransferID: {failed_id}\r\nContent-Type: application/x-dvzip\r\nContent-Length: {}\r\n\r\n", data.len()).as_bytes()).await.unwrap();
+        stream.write_all(&data[..data.len() / 2]).await.unwrap();
+        stream.flush().await.unwrap();
+        let staged = || staging_exists(&dir.path().join("received"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !staged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if !disconnect {
+            let response = tokio::time::timeout(Duration::from_secs(4), reply(&mut stream))
+                .await
+                .unwrap();
+            assert!(!response.starts_with("HTTP/1.1 200"));
+        }
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while staged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !dir.path()
+                .join(format!("received/airdrop-{failed_id}"))
+                .exists()
+        );
+        assert!(dir.path().join(format!("received/airdrop-{id}")).exists());
+    }
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await

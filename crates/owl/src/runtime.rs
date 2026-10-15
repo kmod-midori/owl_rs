@@ -12,7 +12,7 @@ use nix::errno::Errno;
 use pcap::{Capture, Packet, PacketCodec, PacketHeader};
 use std::{
     path::Path,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{mpsc, watch},
@@ -87,6 +87,7 @@ async fn neighbor_worker(net: Netlink, host: String, mut rx: mpsc::Receiver<Even
         let (mac, add) = match event {
             Event::Added(mac) => (mac, true),
             Event::Removed(mac) => (mac, false),
+            Event::AddBaRequest { .. } => continue,
         };
         let result = net.neighbor(&host, mac, add).await;
         if let Err(e) = result {
@@ -144,7 +145,8 @@ pub struct Control {
     pub ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub snapshot: watch::Sender<serde_json::Value>,
     pub(crate) policy: watch::Receiver<bool>,
-    pub(crate) traffic: watch::Receiver<usize>,
+    pub(crate) traffic: watch::Receiver<owl_ipc::TransferState>,
+    pub(crate) channel_ready: watch::Sender<Option<u64>>,
 }
 pub async fn controlled(config: Config, opts: Options, control: Control) -> Result<()> {
     live(config, &opts, Some(control)).await
@@ -251,6 +253,11 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     });
     let mut pending_channel = None;
     let start = Instant::now();
+    if let Ok(epoch) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        let clock_epoch_us =
+            (epoch.as_micros() as u64).saturating_sub(elapsed_us(start).max(0) as u64);
+        info!(clock_epoch_us, "AWDL runtime clock");
+    }
     let advertised_port = config.airdrop_port;
     let mut engine = Engine::new(config, 0);
     let mut clean = time::interval(Duration::from_secs(1));
@@ -329,8 +336,15 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     match engine.receive(&packet.data, elapsed_us(start)) {
                         Ok((frames, events)) => {
                             for event in events {
-                                if tap.is_some() {
-                                    neigh_tx.send(event).await.context("neighbor task stopped")?;
+                                match event {
+                                    Event::AddBaRequest { peer, request } => {
+                                        if !opts.listen_only && draining.is_none() {
+                                            queue.reject_addba(&mut engine, peer, request, elapsed_us(start));
+                                        }
+                                    }
+                                    event => if tap.is_some() {
+                                        neigh_tx.send(event).await.context("neighbor task stopped")?;
+                                    },
                                 }
                             }
                             if let Some(tap) = &tap {
@@ -366,6 +380,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     if let Some(since) = draining
                         && (now - since >= opts.timeouts.radio_drain.as_micros() as i64
                             || (queue.is_idle(now, opts.timeouts.radio_quiet.as_micros() as i64)
+                                && !engine.has_pending_tx(now)
                                 && now - since >= opts.timeouts.radio_quiet.as_micros() as i64
                                 && now - last_traffic >= opts.timeouts.radio_quiet.as_micros() as i64)) {
                         break;
@@ -375,13 +390,17 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     // Only one tune can be in flight. Invalidating immediately prevents
                     // injection on the old channel while the kernel changes frequency.
                     if pending_channel.is_some() { continue; }
+                    // Selection and its readiness reply must use the same revision.
+                    // A concurrent new transfer must not acknowledge discovery tuning.
+                    let transfer_state = control.as_ref()
+                        .map(|c| *c.traffic.borrow()).unwrap_or_default();
                     let desired = if let Some(plan) = &mut plan {
                         let parent = engine.peers.get(&engine.election.sync)
                             .filter(|p| p.valid).and_then(|p| p.sequence.as_ref());
                         // Discover/TLS traffic stays on discovery. An approved
                         // transfer holds its chosen channel, including final TCP
                         // acknowledgements queued after its transport lease ends.
-                        let busy = control.as_ref().is_some_and(|c| *c.traffic.borrow() > 0)
+                        let busy = transfer_state.transfers > 0
                             || (!plan.discovering && (
                                 last_tcp.is_some_and(|t| now - t < opts.timeouts.queued_packet.as_micros() as i64)
                                 || queue.has_tcp()
@@ -406,6 +425,16 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     }
                     let on_channel = desired != 0 && applied_definition.is_some_and(|d| d.channel == desired);
                     if on_channel {
+                        // Acknowledge only after the chosen channel/width is committed.
+                        // Keep this independent of snapshots and peer slot availability.
+                        if let Some(control) = &control
+                            && transfer_state.transfers > 0 {
+                            control.channel_ready.send_if_modified(|ready| {
+                                if *ready == Some(transfer_state.epoch) { return false; }
+                                *ready = Some(transfer_state.epoch);
+                                true
+                            });
+                        }
                         if let Some(control) = &control {
                             engine.config.airdrop_port = (*control.policy.borrow()).then_some(advertised_port).flatten();
                         }
@@ -449,6 +478,12 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
         }
         Ok(())
     }.await;
+    log_stats(&engine);
+    info!(
+        pending_packets = queue.len(),
+        pending_acks = queue.pending_acks(),
+        "AWDL TX queue stopped"
+    );
     // Drop nonpersistent TAP and finish owned tasks on success AND failure.
     drop(neigh_tx);
     drop(channel_tx);
@@ -542,6 +577,23 @@ fn log_stats(engine: &Engine) {
         s.tx_backpressure,
         s.dropped,
     );
+    info!(
+        acked = s.tx_status_acked,
+        failed = s.tx_status_failed,
+        retries = s.tx_status_retries,
+        ignored = s.tx_status_ignored,
+        "AWDL TX delivery"
+    );
+    if s.rx_addba_requests != 0 {
+        info!(
+            received = s.rx_addba_requests,
+            rejected = s.tx_addba_rejections,
+            "ADDBA negotiation"
+        );
+    }
+    if s.tx_ack.injection_attempts != 0 || s.tx_ack.dropped != 0 {
+        info!(timing=?s.tx_ack, "AWDL TCP ACK timing");
+    }
 }
 
 async fn wait_cancel(control: &Option<Control>) {

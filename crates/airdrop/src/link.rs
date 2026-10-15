@@ -12,6 +12,7 @@ pub(crate) struct Link {
     cancel: CancellationToken,
     public: watch::Sender<bool>,
     pub snapshot: watch::Receiver<serde_json::Value>,
+    pub channel_ready: watch::Receiver<Option<u64>>,
     pub mac: owl_ipc::Mac,
     pub address: Ipv6Addr,
     pub scope: u32,
@@ -29,6 +30,7 @@ impl Link {
             cancel: CancellationToken::new(),
             public: watch::channel(false).0,
             snapshot,
+            channel_ready: watch::channel(None).1,
             mac: owl_ipc::Mac([2, 0, 0, 0, 0, 1]),
             address: ip,
             scope: 0,
@@ -40,7 +42,7 @@ impl Link {
         port: u16,
         timeouts: Timeouts,
         policy: watch::Receiver<Policy>,
-        traffic: watch::Receiver<usize>,
+        traffic: watch::Receiver<owl_ipc::TransferState>,
     ) -> Result<Self> {
         Self::connect(socket, port, timeouts, policy, traffic, 0).await
     }
@@ -49,7 +51,7 @@ impl Link {
         port: u16,
         timeouts: Timeouts,
         policy: watch::Receiver<Policy>,
-        traffic: watch::Receiver<usize>,
+        traffic: watch::Receiver<owl_ipc::TransferState>,
         server_uid: u32,
     ) -> Result<Self> {
         let (mut reader, mut writer, info) = tokio::time::timeout(timeouts.link_startup, async {
@@ -90,6 +92,7 @@ impl Link {
         let cancel = CancellationToken::new();
         let (public, mut announced) = watch::channel(false);
         let (snapshots, snapshot) = watch::channel(serde_json::json!({}));
+        let (ready, channel_ready) = watch::channel(None);
         let task = tokio::spawn({
             let cancel = cancel.clone();
             let generation = info.generation.clone();
@@ -110,6 +113,11 @@ impl Link {
                         event = owl_ipc::read(&mut reader) => {
                             match event? {
                                 Event::Snapshot { value } => { snapshots.send_replace(value); },
+                                Event::ChannelReady { generation: id, transfer_epoch } => {
+                                    ensure!(id == generation, "stale channel readiness generation");
+                                    ensure!(transfer_epoch <= traffic.borrow().epoch, "unexpected channel readiness revision");
+                                    ready.send_replace(Some(transfer_epoch));
+                                },
                                 Event::Closed { error } => bail!("{}",error.as_deref().unwrap_or("owld closed the link")),
                                 Event::Error { message } => bail!("{message}"),
                                 Event::Ready { .. } => bail!("unexpected link readiness"),
@@ -117,10 +125,12 @@ impl Link {
                             continue;
                         }
                     }
+                    let activity = *traffic.borrow();
                     let state = Request::State {
                         generation: generation.clone(),
                         service_enabled: *announced.borrow() && policy.borrow().mode.enabled(),
-                        transfers: u32::try_from(*traffic.borrow())?,
+                        transfers: activity.transfers,
+                        transfer_epoch: activity.epoch,
                     };
                     tokio::time::timeout(
                         Duration::from_secs_f64(info.lease_timeout),
@@ -129,7 +139,13 @@ impl Link {
                     .await??;
                 }
                 let shutdown = async {
-                    owl_ipc::write(&mut writer, &Request::Release { generation }).await?;
+                    owl_ipc::write(
+                        &mut writer,
+                        &Request::Release {
+                            generation: generation.clone(),
+                        },
+                    )
+                    .await?;
                     loop {
                         match owl_ipc::read(&mut reader).await? {
                             Event::Closed { error } => {
@@ -139,6 +155,9 @@ impl Link {
                                 snapshots.send_replace(value);
                             }
                             Event::Error { message } => bail!("{message}"),
+                            Event::ChannelReady { generation: id, .. } => {
+                                ensure!(id == generation, "stale channel readiness generation");
+                            }
                             _ => bail!("unexpected shutdown event"),
                         }
                     }
@@ -153,6 +172,7 @@ impl Link {
             cancel,
             public,
             snapshot,
+            channel_ready,
             mac: info.mac,
             address: info.address,
             scope: info.scope,
@@ -190,9 +210,11 @@ mod tests {
             .set(crate::visibility::Visibility::Everyone, None)
             .await
             .unwrap();
-        let (traffic, active) = watch::channel(0);
+        let activity = crate::session::Activity::new(Timeouts::default());
+        let active = activity.traffic();
         let (idle, idle_seen) = tokio::sync::oneshot::channel();
         let (transmitting, transmitting_seen) = tokio::sync::oneshot::channel();
+        let (acknowledge, acknowledge_seen) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (rejected, _) = listener.accept().await.unwrap();
             drop(rejected);
@@ -234,6 +256,7 @@ mod tests {
                     generation,
                     service_enabled: true,
                     transfers: 1,
+                    transfer_epoch: 1,
                 } = owl_ipc::read(&mut read).await.unwrap()
                 {
                     assert_eq!(generation, "fixture");
@@ -248,13 +271,43 @@ mod tests {
             )
             .await
             .unwrap();
+            // A snapshot and an older readiness revision cannot release the upload.
+            owl_ipc::write(
+                &mut write,
+                &Event::ChannelReady {
+                    generation: "fixture".into(),
+                    transfer_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
             transmitting.send(()).unwrap();
+            acknowledge_seen.await.unwrap();
+            owl_ipc::write(
+                &mut write,
+                &Event::ChannelReady {
+                    generation: "fixture".into(),
+                    transfer_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
             loop {
                 if let Request::Release { generation } = owl_ipc::read(&mut read).await.unwrap() {
                     assert_eq!(generation, "fixture");
                     break;
                 }
             }
+            // Readiness already in flight must not break release/drain.
+            owl_ipc::write(
+                &mut write,
+                &Event::ChannelReady {
+                    generation: "fixture".into(),
+                    transfer_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
             owl_ipc::write(&mut write, &Event::Closed { error: None })
                 .await
                 .unwrap();
@@ -284,8 +337,20 @@ mod tests {
         .unwrap();
         idle_seen.await.unwrap();
         link.announce();
-        traffic.send_replace(1);
+        activity.set_channel_ready(link.channel_ready.clone());
+        let mut lease = activity.acquire().unwrap();
+        let mut waiting = tokio::spawn(async move {
+            lease.channel_ready().await?;
+            Ok::<_, anyhow::Error>(lease)
+        });
         transmitting_seen.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        acknowledge.send(()).unwrap();
+        let lease = waiting.await.unwrap().unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while link.snapshot.borrow().get("fixture").is_none() {
                 link.snapshot.changed().await.unwrap();
@@ -294,6 +359,7 @@ mod tests {
         .await
         .unwrap();
         link.stop().await.unwrap();
+        drop(lease);
         server.await.unwrap();
     }
 }

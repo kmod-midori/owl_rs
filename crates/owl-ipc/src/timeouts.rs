@@ -66,6 +66,7 @@ deadlines! {
     peer_idle, "peer-idle-timeout", "5", "AWDL neighbor inactivity deadline.";
     queued_packet, "queued-packet-timeout", "2", "Queued AWDL packet expiry.";
     link_startup, "link-startup-timeout", "120", "Wait for owld to prepare a link.";
+    channel_ready, "channel-ready-timeout", "15", "Wait for owld to prepare the transfer channel.";
     link_shutdown, "link-shutdown-timeout", "180", "Wait for owld to drain and restore a link.";
     discovery_cache, "discovery-cache-timeout", "120", "Local mDNS cache lifetime cap.";
     discovery_fallback, "discovery-fallback-timeout", "2", "Transient AWDL fallback discovery candidate lifetime.";
@@ -136,6 +137,7 @@ cli_deadlines! { RadioTimeouts {
 cli_deadlines! { AirDropTimeouts {
     completion_grace, "completion-grace", "5", seconds, "Quiet time after the final transfer and TCP drain.";
     link_startup, "link-startup-timeout", "120", positive, "Wait for owld to prepare a link.";
+    channel_ready, "channel-ready-timeout", "15", positive, "Wait for owld to prepare the transfer channel.";
     link_shutdown, "link-shutdown-timeout", "180", positive, "Wait for owld to drain and restore a link.";
     discovery_cache, "discovery-cache-timeout", "120", positive, "Local mDNS cache lifetime cap.";
     discovery_fallback, "discovery-fallback-timeout", "2", positive, "Transient AWDL fallback discovery candidate lifetime.";

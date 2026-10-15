@@ -5,7 +5,7 @@ use owl::{
     channel::Strategy,
     engine::Config,
     protocol::Mac,
-    rate::Rate,
+    rate::{FecPolicy, Rate},
     runtime::{self, Options},
 };
 use std::path::PathBuf;
@@ -40,12 +40,21 @@ pub struct Arguments {
     /// Data rate: auto, legacy Mbps, mcsN[-sgi], or vhtN-nssS-bwW[-sgi]; VHT is capped at MCS8, actions use 12 Mbps.
     #[arg(long, default_value = "auto")]
     rate: Rate,
+    /// Data coding; BCC is the default, LDPC/auto are opt-in.
+    #[arg(long, value_enum, default_value = "bcc")]
+    fec: FecPolicy,
+    /// Driver profiles for live diagnostics; defaults to the embedded profiles.
+    #[arg(long)]
+    profiles: Option<PathBuf>,
     /// AWDL/TAP MAC; defaults to the monitor MAC or a local MAC for replay.
     #[arg(long)]
     mac: Option<Mac>,
-    /// Keep the physical channel fixed, relax multicast gates, and disable unicast retries.
+    /// Keep the physical channel fixed and relax multicast gates.
     #[arg(long)]
     fixed_radio: bool,
+    /// Unicast ACK policy; auto uses the driver profile for live diagnostics.
+    #[arg(long, value_enum, default_value = "auto")]
+    tx_ack: owl::rate::AckPolicy,
     /// Rank election metric before counter.
     #[arg(long)]
     metric_first: bool,
@@ -64,7 +73,7 @@ pub struct Arguments {
     /// Stop live diagnostics after this many seconds.
     #[arg(long)]
     duration: Option<u64>,
-    /// Save incoming radiotap frames to this PCAP.
+    /// Save received radiotap frames, including available TX-completion reports.
     #[arg(long)]
     save: Option<String>,
     /// Save malformed received frames to this PCAP.
@@ -114,6 +123,22 @@ pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<(
             .into()
     });
     ensure!(name.len() <= 64, "name must be at most 64 bytes");
+    let (tx_ldpc, tx_noack) = if offline {
+        (false, args.tx_ack.noack(false))
+    } else {
+        let driver = owl::radio::driver_name(&input)?;
+        let profile = owl::radio::Profile::load(&driver, args.profiles.as_deref())?;
+        (
+            profile.supports_tx_ldpc,
+            args.tx_ack.noack(profile.tx_noack),
+        )
+    };
+    // Offline replay does not inject frames or require a hardware backend.
+    args.fec.validate_rate(args.rate)?;
+    ensure!(
+        offline || args.fec != FecPolicy::Ldpc || tx_ldpc,
+        "LDPC injection is unsupported by this driver"
+    );
     let capabilities = if offline {
         Default::default()
     } else {
@@ -131,12 +156,15 @@ pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<(
         channel: args.channel,
         strategy: args.strategy,
         fixed_radio: args.fixed_radio,
+        tx_noack,
         metric_first: args.metric_first,
         election_metric: args.election_metric,
         election_counter: args.election_counter,
         widen: args.widen as usize,
         filter_rssi: !args.no_rssi_filter,
         rate: args.rate,
+        fec: args.fec,
+        tx_ldpc,
         capabilities,
         operating_channel: None,
     };
