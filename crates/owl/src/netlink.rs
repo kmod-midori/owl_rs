@@ -372,6 +372,47 @@ impl Netlink {
         .await
         .with_context(|| format!("nl80211 {cmd:?}"))
     }
+    /// Regulatory hints are asynchronous: wait for GET_REG to confirm the domain
+    /// before callers inspect the PHY's permitted channels and widths.
+    pub async fn set_reg_region(&self, region: &str) -> Result<()> {
+        // NL80211_ATTR_REG_ALPHA2 is not typed by wl-nl80211 yet.
+        let alpha2 = DefaultNla::new(33, [region.as_bytes(), &[0]].concat());
+        self.wifi_request(Cmd::ReqSetReg, vec![Attr::Other(alpha2.clone())])
+            .await?;
+        self.bounded(async {
+            loop {
+                let mut handle = self.0.wifi.clone();
+                let mut msg = NetlinkMessage::from(GenlMessage::from_payload(Nl80211Message {
+                    cmd: Cmd::GetReg,
+                    attributes: vec![],
+                }));
+                msg.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+                let mut responses = handle.request(msg).await?;
+                while let Some(response) = responses.next().await {
+                    match response?.payload {
+                        NetlinkPayload::InnerMessage(message)
+                            if message
+                                .payload
+                                .attributes
+                                .iter()
+                                .any(|a| matches!(a, Attr::Other(v) if *v == alpha2)) =>
+                        {
+                            tracing::info!(region, "kernel regulatory region confirmed");
+                            return Ok(());
+                        }
+                        NetlinkPayload::Error(error) if error.code.is_some() => {
+                            return Err(wl_nl80211::Nl80211Error::NetlinkError(error).into());
+                        }
+                        NetlinkPayload::Overrun(_) => bail!("wireless netlink overrun"),
+                        _ => (),
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("wait for regulatory region {region}"))
+    }
     pub async fn interfaces(&self) -> Result<Vec<Interface>> {
         let msgs: Vec<_> = self
             .bounded(async {

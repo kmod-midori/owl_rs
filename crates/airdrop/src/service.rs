@@ -159,10 +159,10 @@ struct State {
     activity: Arc<Activity>,
 }
 impl State {
-    async fn names(
+    async fn probe_receivers(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Vec<(crate::discovery::Peer, Option<String>)> {
+    ) -> impl futures_util::Stream<Item = (crate::discovery::Peer, Option<String>)> + '_ {
         use futures_util::{StreamExt, stream};
         let sender = &self.sender;
         let mut candidates: Vec<_> = self
@@ -199,7 +199,7 @@ impl State {
             }
         }
         stream::iter(candidates)
-            .map(|(peer, fallback)| async move {
+            .map(move |(peer, fallback)| async move {
                 let end =
                     deadline.min(tokio::time::Instant::now() + self.sender.timeouts.name_probe);
                 let Ok(_exchange) = self.activity.acquire() else {
@@ -219,15 +219,16 @@ impl State {
                     Some((peer, name))
                 }
             })
-            .collect()
-            .await
     }
     async fn named_peers(&self, seconds: u64) -> Vec<serde_json::Value> {
+        use futures_util::StreamExt;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds.clamp(1, 86400));
         loop {
-            let peers = self.names(deadline).await;
+            let peers: Vec<_> = self.probe_receivers(deadline).await
+                .map(|(p, name)| serde_json::json!({"id":p.id,"name":name,"address":p.address,"flags":p.flags}))
+                .collect().await;
             if !peers.is_empty() || tokio::time::Instant::now() >= deadline {
-                return peers.into_iter().map(|(p,name)|serde_json::json!({"id":p.id,"name":name,"address":p.address,"flags":p.flags})).collect();
+                return peers;
             }
             tokio::select! {
                 _ = self.cancel.cancelled() => return Vec::new(),
@@ -241,6 +242,7 @@ impl State {
         direct: Option<SocketAddrV6>,
         seconds: u64,
     ) -> Result<SocketAddrV6> {
+        use futures_util::StreamExt;
         if let Some(address) = direct {
             ensure!(
                 address.ip().is_loopback() || address.ip().is_unicast_link_local(),
@@ -255,8 +257,12 @@ impl State {
                     return Ok(peer.address);
                 }
             }
-            for (peer, name) in self.names(deadline).await {
-                if name.is_some_and(|n| n.eq_ignore_ascii_case(to)) {
+            let probes = self.probe_receivers(deadline).await;
+            futures_util::pin_mut!(probes);
+            while let Some((peer, name)) = probes.next().await {
+                if let Some(name) = name
+                    && name.eq_ignore_ascii_case(to)
+                {
                     return Ok(peer.address);
                 }
             }

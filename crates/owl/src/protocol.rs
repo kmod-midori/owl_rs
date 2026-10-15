@@ -11,15 +11,6 @@ pub const MAX_FRAME: usize = 65535;
 pub const MAX_AMSDU: usize = 7935;
 pub const MAX_AMSDU_PACKETS: usize = 64;
 
-pub(crate) fn tcp_frame(ethernet: &[u8]) -> bool {
-    matches!(
-        etherparse::SlicedPacket::from_ethernet(ethernet)
-            .ok()
-            .and_then(|p| p.transport),
-        Some(etherparse::TransportSlice::Tcp(_))
-    )
-}
-
 pub use owl_ipc::Mac;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -39,6 +39,45 @@ pub enum Backend {
     Ibss,
     ActiveMonitor,
 }
+fn default_reg_region() -> String {
+    "US".into()
+}
+fn reg_region(value: &str) -> std::result::Result<String, String> {
+    if value == "00" || (value.len() == 2 && value.bytes().all(|b| b.is_ascii_alphabetic())) {
+        Ok(value.to_ascii_uppercase())
+    } else {
+        Err("regulatory region must be a two-letter country code or 00".into())
+    }
+}
+fn primary_channel(value: &str) -> std::result::Result<u8, String> {
+    match value {
+        "6" => Ok(6),
+        "44" => Ok(44),
+        "149" => Ok(149),
+        _ => Err("primary channel must be 6, 44, or 149".into()),
+    }
+}
+fn legacy_discovery_channel(value: &str) -> std::result::Result<u8, String> {
+    if value == "6" {
+        Ok(6)
+    } else {
+        Err("--discovery-channel is obsolete; only the compatibility value 6 is accepted".into())
+    }
+}
+fn default_max_bandwidth() -> u32 {
+    40
+}
+fn max_bandwidth(value: &str) -> std::result::Result<u32, String> {
+    match value {
+        "20" => Ok(20),
+        "40" => Ok(40),
+        "80" => Ok(80),
+        _ => Err("maximum bandwidth must be 20, 40, or 80 MHz".into()),
+    }
+}
+fn default_tx_ack() -> crate::rate::AckPolicy {
+    crate::rate::AckPolicy::Noack
+}
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadioArgs {
@@ -50,11 +89,19 @@ pub struct RadioArgs {
     /// Explicit exclusive radio model; otherwise use the driver profile.
     #[arg(long, value_enum)]
     pub backend: Option<Backend>,
-    /// Preferred transmit channel (6, 44 or 149); followers maximize usable overlap.
-    #[arg(long, visible_alias = "transmit-channel")]
+    /// Global kernel regulatory region requested when starting a radio session.
+    #[arg(long, default_value = "US", value_parser = reg_region)]
+    #[serde(default = "default_reg_region")]
+    pub reg_region: String,
+    /// Fixed exclusive-mode channel. Shared mode uses the AP channel.
+    #[arg(long = "primary-channel", visible_aliases = ["channel", "transmit-channel"], default_value = "149", value_parser = primary_channel)]
     pub channel: Option<u8>,
-    /// Discovery/negotiation channel; defaults to 6 in exclusive mode, AP in shared mode.
-    #[arg(long)]
+    /// Maximum exclusive-mode channel bandwidth in MHz; shared mode uses the AP width.
+    #[arg(long, default_value_t = 40, value_parser = max_bandwidth)]
+    #[serde(default = "default_max_bandwidth")]
+    pub max_bandwidth: u32,
+    /// Ignored compatibility option; only 6 is accepted.
+    #[arg(long, value_parser = legacy_discovery_channel)]
     #[serde(default)]
     pub discovery_channel: Option<u8>,
     #[arg(long, default_value = "owlmon0")]
@@ -67,8 +114,8 @@ pub struct RadioArgs {
     #[arg(long)]
     pub allow_untested: bool,
     /// Unicast ACK policy; auto follows the driver profile, independent of channel pinning.
-    #[arg(long, value_enum, default_value = "auto")]
-    #[serde(default)]
+    #[arg(long, value_enum, default_value = "noack")]
+    #[serde(default = "default_tx_ack")]
     pub tx_ack: crate::rate::AckPolicy,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,7 +286,13 @@ async fn probe_with(args: &RadioArgs, net: &Netlink) -> Result<Probe> {
     }
     let linked = net.linked_frequency(&station, false).await?;
     let associated = linked.is_some();
-    let ap_channel = linked.and_then(channel);
+    let ap_channel = linked.and_then(|frequency| {
+        iface
+            .channel_definition()
+            .filter(|_| iface.frequency == Some(frequency))
+            .map(|d| d.channel)
+            .or_else(|| channel(frequency))
+    });
     let caps = net.phy_capabilities(iface.phy).await?;
     let allowed: Vec<_> = caps.frequencies.into_iter().filter_map(channel).collect();
     profile.validate_rx_ampdu()?;
@@ -324,6 +377,12 @@ impl Radio {
         let journal = run_dir.join("radio.json");
         recover_file(&journal, None).await?;
         let net = Netlink::with_timeout(timeouts.netlink)?;
+        anyhow::ensure!(
+            matches!(args.max_bandwidth, 20 | 40 | 80),
+            "maximum bandwidth must be 20, 40, or 80 MHz"
+        );
+        let region = reg_region(&args.reg_region).map_err(anyhow::Error::msg)?;
+        net.set_reg_region(&region).await?;
         let probe = probe_with(args, &net).await?;
         if !probe.profile.tested && !args.allow_untested {
             bail!(
@@ -337,55 +396,28 @@ impl Radio {
         {
             bail!("active-monitor requires hardware support and mon_mac=station");
         }
-        let channels = if probe.profile.mode == Mode::Shared {
-            let c = probe
+        let (channels, transmit_channel) = if probe.profile.mode == Mode::Shared {
+            let ap = probe
                 .ap_channel
-                .context("shared mode requires an AP on channel 6, 44 or 149")?;
-            if args.channel.is_some_and(|requested| requested != c)
-                || args
-                    .discovery_channel
-                    .is_some_and(|requested| requested != c)
-            {
-                bail!("shared mode must use the AP's channel {c}");
-            }
-            vec![c]
+                .context("shared mode requires a supported AP channel")?;
+            (vec![ap], ap)
         } else {
-            if let Some(c) = args.channel {
-                freq(c)?;
-            }
-            if let Some(c) = args.discovery_channel {
-                freq(c)?;
-            }
-            let discovery = args.discovery_channel.unwrap_or(6);
-            let mut channels = probe.channels.clone();
-            channels.sort_by_key(|&c| c != discovery);
-            if !channels.contains(&discovery) {
-                tracing::warn!(
-                    discovery,
-                    "discovery channel is not permitted; using an allowed fallback"
-                );
-            }
-            channels
-        };
-        if channels.is_empty() {
-            bail!("no AWDL channel permits transmission");
-        }
-        let preferred = args.channel.unwrap_or_else(|| {
-            if probe.profile.mode == Mode::Shared {
-                channels[0]
-            } else {
-                probe.channels[0]
-            }
-        });
-        let transmit_channel = if channels.contains(&preferred) {
-            preferred
-        } else {
-            tracing::warn!(
-                preferred,
-                "transmit preference is not permitted; using an allowed fallback"
+            let primary = args.channel.unwrap_or(149);
+            anyhow::ensure!(
+                matches!(primary, 6 | 44 | 149),
+                "primary channel must be 6, 44, or 149"
             );
-            channels[0]
+            anyhow::ensure!(
+                args.discovery_channel.is_none_or(|c| c == 6),
+                "--discovery-channel is obsolete; only the compatibility value 6 is accepted"
+            );
+            anyhow::ensure!(
+                probe.channels.contains(&primary),
+                "channel {primary} must permit transmission"
+            );
+            (vec![primary], primary)
         };
+
         let ibss = "owlibss0".to_string();
         for name in [&args.monitor, &args.host_interface, &ibss] {
             if Path::new(&format!("/sys/class/net/{name}")).exists() {

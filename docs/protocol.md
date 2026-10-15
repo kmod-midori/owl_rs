@@ -105,39 +105,21 @@ cleanup. NetworkManager ownership and saved connection restoration use
 context in exclusive mode, which works without an AP. Active-monitor setup
 converts the station to a passive monitor with the same MAC, setting type and
 flags in one netlink request because drivers may reject a separate flags update.
-Discovery defaults to channel 6.
+In exclusive mode, the daemon stays on `--primary-channel 6|44|149` (default 149)
+and advertises that channel in all 16 slots throughout the active session.
+Peer schedules and activity changes do not replace it. Clock synchronization
+still follows the elected sync parent.
 
-An idle session stays on its discovery channel and advertises all 16 slots
-there, so mDNS and HTTPS discovery can reach the receiver. TLS handshakes,
-`/Discover`, and `/Ask` approval waits keep the discovery channel when no file
-transfer is active. Once a file transfer is approved, it selects a fixed transfer
-channel. A local master uses its configured preference; a follower ranks
-channels by the number of slots in its elected sync parent's sequence. Only
-permitted AWDL social channels (6, 44, 149) are considered; ties favor the
-configured preference and then the lower channel number. Failed tunes exclude
-a candidate for the session and select the next one.
-
-The selected transfer channel stays fixed across uploads and final TCP shutdown,
-even if the sync parent changes or disappears.
-There are no periodic discovery visits during an exchange. Once all exchanges
-finish and queued/recent TCP traffic clears, the radio returns to discovery.
-The recent-traffic interval uses `--queued-packet-timeout` (default two seconds).
-Discovery TCP, multicast mDNS and ICMP neighbor-learning keepalives do not
-select the transfer channel. During a concurrent transfer, all traffic shares
-that transfer's selected radio channel. A later exchange ranks the available channels again.
-
-The channel-sequence TLV and synchronization channel fields describe the
-successfully tuned channel, both while idle and during transfers. The schedule
-changes only after successful kernel tuning; injection pauses throughout an
-outstanding tune, then action frames immediately announce the new schedule.
-Ethernet frames are gated on that channel and the destination peer's matching
-slot. No usable transfer candidate, or an unavailable idle discovery channel,
-is an operation error that triggers normal cleanup. IBSS retunes its channel context by
-leaving/rejoining the fixed-BSSID network and polling readiness. Active monitor
-uses an acknowledged kernel channel-setting operation. Shared mode requires a
-connected AP on channel 6, 44 or 149 and advertises the intersection with that
-channel; it does not use separate-channel discovery or adaptive retuning. Driver/regulatory limits
-apply. See [radio profiles](../profiles.toml) and [usage](../README.md).
+The advertised width reflects successful tuning. Synchronization channel fields
+describe the selected physical channel. Injection pauses during an outstanding
+tune; Ethernet frames require the destination peer's matching slot and boundary
+guards. The selected channel must pass driver/regulatory checks before setup;
+a tuning failure triggers cleanup.
+Shared mode stays on the AP's current channel and advertises that channel in all
+16 slots, with the AP's width; it ignores the primary-channel preference.
+IBSS changes channel by leaving/rejoining the fixed-BSSID network; active monitor
+uses acknowledged kernel channel-setting operations.
+See [radio profiles](../profiles.toml) and [radio configuration](radio.md).
 
 ## AWDL action frames
 
@@ -187,10 +169,9 @@ bytes. VHT type 17 wraps standard IE 191: length 12, little-endian capability
 word and the eight-byte RX/TX MCS/NSS set. These layouts
 follow the [Wireshark AWDL dissector](https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-awdl.c).
 Capability flags describe hardware support. Active-monitor transfer tuning tries
-80, 40, then 20 MHz on 5 GHz, constrained by the PHY's HT/VHT capabilities and
-regulatory flags on every constituent 20 MHz channel. Kernel rejection falls
-back to narrower definitions on the same primary before the channel plan tries
-another primary. Channel 6 and idle discovery use 20 MHz; shared mode
+widths up to `--max-bandwidth` (default 40 MHz) on 5 GHz, constrained by the
+PHY's HT/VHT capabilities and regulatory flags on every constituent 20 MHz channel. Kernel rejection falls
+back to narrower definitions on the same primary. Channel 6 uses 20 MHz; shared mode
 preserves the AP's width and center frequency, and IBSS uses HT20.
 
 SetWiphy supplies primary frequency, width and center frequency together. After
@@ -248,11 +229,10 @@ counter; Apple-style election-counter aging is not implemented. A larger local
 rank does not prove that a peer has adopted this master or expanded its channel
 availability. Check the peer's incoming election and channel-sequence TLVs.
 
-The service uses `pin` plus an adaptive fixed transmit channel in exclusive mode, and
-`intersect` in shared mode. Raw mode also exposes `verbatim`, `rotate` and
-`widen`. A fixed physical channel does not remove unicast scheduling: unicast
-waits for a valid peer's matching channel slot, with boundary guards.
-Fixed mode relaxes multicast scheduling. Runtime scheduling requests ticks every
+The service uses fixed `pin` in both modes. Raw diagnostics also expose
+`intersect`, `verbatim`, `rotate`, and `widen`. Unicast waits for a valid
+peer's matching channel slot, with boundary guards. Fixed mode allows
+multicast in every slot, within its guarded airtime budget. Runtime scheduling requests ticks every
 500 microseconds (Tokio/OS timer resolution applies);
 periodic synchronization frames are spaced 110 TU apart and MIFs are scheduled
 around slot midpoints.
@@ -394,7 +374,7 @@ establish agreements because it cannot send acceptance responses.
 
 ### Transmit coding
 
-BCC is the default; `--fec auto|ldpc` explicitly opts in. Coding is resolved
+The daemon defaults to LDPC; raw diagnostics default to BCC. Coding is resolved
 per peer after the concrete rate is selected. HT checks RX LDPC capability bit
 0; VHT checks RX LDPC bit 4. Local TX support is supplied by the selected driver profile
 (`supports_tx_ldpc`, false when omitted), independently of local advertised RX
@@ -425,14 +405,15 @@ Already queued packets with the same source/destination are combined into one
 QoS TID-0 A-MSDU; sparse traffic is sent immediately without a coalescing timer.
 Only validated HT/VHT unicast peers with known capabilities are eligible.
 
-The body is bounded by both peers' HT maximum A-MSDU size (3839/7935), VHT
-maximum MPDU size when applicable, the current monitor MTU, and the remaining
-common-channel window. The local receive-size capability is also used as a
-conservative hardware bound; backend size rejection triggers fallback.
+The body is bounded by the destination's HT maximum A-MSDU size for HT,
+or its VHT maximum MPDU size minus MAC/FCS overhead for VHT. Both also obey
+our 7935-byte encoder limit, the current monitor MTU, and the remaining
+common-channel window. Local receive-size advertisements do not cap TX.
+Backend size rejection triggers fallback.
 The scheduler subtracts its boundary guard and budgets each submitted burst
 using the selected PHY rate and a preamble/ACK allowance. Reservations carry
-across scheduler ticks and keep the radio on its transfer channel while
-submitted frames have estimated airtime remaining. Cleanup waits for that reservation and the configured quiet interval.
+across scheduler ticks. Cleanup waits for submitted frames' estimated airtime
+and the configured quiet interval.
 This estimate excludes driver queue latency. Each subframe contains
 DA/SA, a big-endian length and its own LLC/AWDL payload and sequence number;
 padding aligns subsequent subframes to four bytes. No trailing padding is added.

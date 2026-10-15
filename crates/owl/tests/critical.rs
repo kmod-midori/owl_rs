@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use owl::{
-    channel::{Clock, Encoding, SLOT_US, Sequence, Strategy},
+    channel::{Clock, SLOT_US, Sequence, Strategy},
     engine::{Config, Engine},
     protocol::{self, Advertisement, Body, Election, Mac},
     rate::{Coding, FecPolicy, Rate, TxParameters},
@@ -591,111 +591,78 @@ fn early_syns_wait_for_peer_validation_and_are_bounded_deduplicated_and_expired(
 }
 
 #[test]
-fn discovery_plan_ranks_overlap_and_falls_back_without_publishing_failed_tunes() {
-    use owl::channel::ChannelPlan;
-    let mut peer = Sequence::fixed(149);
-    peer.slots[0] = [6, 0x51];
-    peer.slots[1] = [44, 0x80];
-    peer.slots[2] = [44, 0x80];
-    peer.slots[3] = [36, 0x80]; // Infrastructure channel is unavailable to our radio.
-    peer.slots[4] = [0, 0];
-    assert_eq!(peer.ranked_channels(&[6, 44, 149], 6), [149, 44, 6]);
-    assert_eq!(peer.ranked_channels(&[6, 44], 6), [44, 6]);
-    let mut legacy = peer.clone();
-    legacy.encoding = Encoding::Legacy;
-    for slot in &mut legacy.slots {
-        slot.swap(0, 1);
+fn primary_schedule_survives_peer_changes_tuning_and_cycle_wrap() {
+    use owl::channel::{ChannelDefinition, ChannelPlan};
+    let own = Mac([2, 0, 0, 0, 0, 1]);
+    let peer = Mac([2, 0, 0, 0, 0, 2]);
+    for primary in [6, 44, 149] {
+        let mut cfg = config(own);
+        cfg.channel = primary;
+        cfg.strategy = Strategy::Pin;
+        cfg.fixed_radio = true;
+        let mut engine = Engine::new(cfg, 0);
+        let expected = Sequence::fixed(primary);
+        let mut plan = ChannelPlan::new(primary);
+        engine.receive(&mif(peer, 518, 10, &expected), 0).unwrap();
+        engine.tick(0);
+        engine.clock = Clock::new(0);
+        for slot in 0..32 {
+            let now = slot as i64 * SLOT_US + 10_000;
+            let channel = primary;
+            assert_eq!(plan.desired(), Some(channel));
+            assert_eq!(engine.current_channel(now), channel);
+            engine.set_operating_channel(ChannelDefinition::new(channel, 20).unwrap());
+            assert_eq!(engine.config.channel, primary);
+            assert!(engine.send_ready(peer, now));
+            assert!(engine.send_ready(protocol::BROADCAST, now));
+            for subtype in [0, 3] {
+                let bytes = engine.action_frame_on_channel(subtype, now, channel);
+                let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
+                    panic!("action frame");
+                };
+                assert_eq!(action.sequence, Some(expected.clone()));
+            }
+        }
+        for width in [80, 40, 20]
+            .into_iter()
+            .filter(|w| primary != 6 || *w == 20)
+        {
+            let definition = ChannelDefinition::new(primary, width).unwrap();
+            engine.set_operating_channel(definition);
+            engine
+                .receive(&mif(peer, 518, 11, &Sequence::fixed(6)), 0)
+                .unwrap();
+            engine.tick(0);
+            assert_eq!(engine.sequence, expected.with_definition(definition));
+            assert_eq!(engine.send_ready(peer, 10_000), primary == 6);
+        }
+        plan.failed(primary);
+        assert_eq!(plan.desired(), None);
     }
-    assert_eq!(Sequence::parse(&legacy.encode()).unwrap(), legacy);
-    assert_eq!(legacy.ranked_channels(&[6, 44, 149], 6), [149, 44, 6]);
-    assert_eq!(
-        Sequence::fixed(0).ranked_channels(&[149, 44, 6, 6, 0], 149),
-        [149, 6, 44]
-    );
-    let mut plan = ChannelPlan::new(6, 6, vec![6, 44, 149]);
-    assert_eq!(plan.desired(Some(&peer), false), Some(6));
-    assert!(plan.discovering);
-    assert!(!plan.applied(6));
-    assert_eq!(plan.desired(Some(&peer), true), Some(149));
-    assert!(!plan.discovering);
-    // A request alone, including a failed request, cannot alter the schedule.
-    assert_eq!(plan.transmit_channel, 6);
-    plan.failed(149);
-    assert_eq!(plan.desired(Some(&peer), true), Some(44));
-    assert!(plan.applied(44));
-    assert_eq!(plan.transmit_channel, 44);
-    // A paused exchange or a changed sync parent must not trigger discovery
-    // visits or channel hopping. The next exchange re-evaluates the schedule.
-    assert_eq!(plan.desired(Some(&Sequence::fixed(6)), true), Some(44));
-    assert_eq!(plan.desired(None, true), Some(44));
-    assert_eq!(plan.desired(Some(&peer), false), Some(6));
-    assert!(plan.discovering);
-    assert!(!plan.applied(6));
-    assert_eq!(plan.transmit_channel, 44);
-    assert_eq!(plan.desired(Some(&Sequence::fixed(6)), true), Some(6));
-    assert!(!plan.discovering); // Channel 6 can itself be the best transfer channel.
-    assert!(plan.applied(6));
-    plan.failed(44);
-    plan.failed(6);
-    assert_eq!(plan.desired(Some(&peer), true), None);
-    assert_eq!(plan.desired(Some(&peer), false), None);
 }
 
 #[test]
-fn discovery_and_transfer_advertise_committed_channels_and_wait_for_overlap() {
+fn shared_schedule_pins_every_slot_to_the_ap() {
+    use owl::channel::ChannelDefinition;
     let own = Mac([2, 0, 0, 0, 0, 1]);
     let peer = Mac([2, 0, 0, 0, 0, 2]);
-    let mut cfg = config(own);
-    cfg.channel = 6;
-    cfg.strategy = Strategy::Pin;
-    let mut engine = Engine::new(cfg, 0);
-    let mut sequence = Sequence::fixed(149);
-    sequence.slots[0] = [6, 0x51];
-    engine.receive(&mif(peer, 518, 10, &sequence), 0).unwrap();
-    engine.tick(0);
-    assert!(engine.send_ready(peer, 10_000));
-    assert!(!engine.send_ready(peer, SLOT_US + 10_000));
-    let bytes = engine.action_frame_on_channel(3, 10_000, 6);
-    let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
-        panic!("action frame");
-    };
-    assert_eq!(action.sequence, Some(Sequence::fixed(6)));
-    engine.set_operating_channel(owl::channel::ChannelDefinition::new(149, 20).unwrap());
-    assert!(!engine.send_ready(peer, 10_000));
-    assert!(engine.send_ready(peer, SLOT_US + 10_000));
-    let bytes = engine.action_frame_on_channel(3, 10_000, 149);
-    let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
-        panic!("action frame");
-    };
-    assert_eq!(action.sequence, Some(Sequence::fixed(149)));
-    engine.set_operating_channel(owl::channel::ChannelDefinition::new(6, 20).unwrap());
-    assert!(engine.send_ready(peer, 10_000));
-    assert!(!engine.send_ready(peer, SLOT_US + 10_000));
-    for (width, class) in [(80, 128), (40, 126), (20, 124)] {
-        let definition = owl::channel::ChannelDefinition::new(149, width).unwrap();
-        engine.set_operating_channel(definition);
-        engine.tick(10_000); // Following a parent must not erase the confirmed width.
-        for subtype in [0, 3] {
-            let bytes = engine.action_frame_on_channel(subtype, 10_000, 149);
-            let Body::Action(action) = protocol::parse(&bytes).unwrap().unwrap().body else {
-                panic!("action frame")
-            };
-            assert_eq!(action.sequence.unwrap().slots, [[149, class]; 16]);
+    for (channel, width) in [(6, 20), (36, 80), (44, 40), (149, 80)] {
+        let definition = ChannelDefinition::new(channel, width).unwrap();
+        let mut cfg = config(own);
+        cfg.channel = channel;
+        cfg.operating_channel = Some(definition);
+        cfg.strategy = Strategy::Pin;
+        cfg.fixed_radio = true;
+        let mut engine = Engine::new(cfg, 0);
+        for advertised in [Sequence::fixed(6), Sequence::fixed(149)] {
+            engine.receive(&mif(peer, 518, 10, &advertised), 0).unwrap();
+            engine.tick(0);
+            assert_eq!(engine.sequence, Sequence::fixed_definition(definition));
+            for slot in 0..16 {
+                assert_eq!(engine.current_channel(slot * SLOT_US + 10_000), channel);
+            }
         }
     }
-    let mut sparse =
-        Sequence::fixed_definition(owl::channel::ChannelDefinition::new(149, 80).unwrap());
-    sparse.slots[1] = [0, 0];
-    let mut cfg = config(own);
-    cfg.channel = 149;
-    cfg.fixed_radio = false;
-    cfg.operating_channel = Some(owl::channel::ChannelDefinition::new(149, 20).unwrap());
-    let mut shared = Engine::new(cfg, 0);
-    shared.receive(&mif(peer, 518, 10, &sparse), 0).unwrap();
-    shared.tick(0);
-    // A wider parent must not overwrite our AP's width or unavailable slots.
-    assert_eq!(shared.sequence.slots[0], [149, 124]);
-    assert_eq!(shared.sequence.slots[1], [0, 0]);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use crate::{
     channel::{ChannelDefinition, ChannelPlan},
     engine::{Config, Engine, Event},
     netlink::Netlink,
-    protocol::{MAX_FRAME, tcp_frame},
+    protocol::MAX_FRAME,
     tx,
 };
 use anyhow::{Context, Result, bail};
@@ -34,6 +34,7 @@ pub struct Options {
     pub summary: Option<String>,
     pub channel_plan: Option<ChannelPlan>,
     pub ibss_interface: Option<String>,
+    pub max_bandwidth: u32,
     /// Shared AP contexts must never be retuned.
     pub retune: bool,
 }
@@ -270,7 +271,6 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     let mut psf_at = 110 * 1024;
     let mut mif_at = 0;
     let mut keepalive_at = 0;
-    let mut last_tcp = None;
     let mut draining = None;
     let mut last_traffic = 0;
     info!("WLAN device: {} (addr {})", opts.input, engine.config.mac);
@@ -356,7 +356,6 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             }
                             if let Some(tap) = &tap {
                                 for frame in frames {
-                                    if tcp_frame(&frame) { last_tcp = Some(elapsed_us(start)); }
                                     send_tap(tap, &frame).await.context("deliver AWDL Ethernet frame to TAP")?;
                                 }
                             }
@@ -383,7 +382,6 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     let released = engine.reorder.poll(now);
                     if let Some(tap) = &tap {
                         for frame in released {
-                            if tcp_frame(&frame) { last_tcp = Some(now); }
                             send_tap(tap, &frame).await.context("deliver reordered AWDL frame")?;
                         }
                     }
@@ -409,34 +407,18 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                     // A concurrent new transfer must not acknowledge discovery tuning.
                     let transfer_state = control.as_ref()
                         .map(|c| *c.traffic.borrow()).unwrap_or_default();
-                    let desired = if let Some(plan) = &mut plan {
-                        let parent = engine.peers.get(&engine.election.sync)
-                            .filter(|p| p.valid).and_then(|p| p.sequence.as_ref());
-                        // Discover/TLS traffic stays on discovery. An approved
-                        // transfer holds its chosen channel, including final TCP
-                        // acknowledgements queued after its transport lease ends.
-                        let busy = transfer_state.transfers > 0
-                            || (!plan.discovering && (
-                                last_tcp.is_some_and(|t| now - t < opts.timeouts.queued_packet.as_micros() as i64)
-                                || queue.has_tcp()
-                                || queue.has_pending_airtime(now)
-                            ));
-                        plan.desired(parent, busy).context("no usable AWDL channel remains")?
+                    let desired = if let Some(plan) = &plan {
+                        plan.desired().context("scheduled AWDL channel is unavailable")?
                     } else { engine.current_channel(now) };
                     let request = TuneRequest {
                         channel: desired,
-                        max_width: if desired == 6 || opts.ibss_interface.is_some()
-                            || plan.as_ref().is_some_and(|p| p.discovering) { 20 } else { 80 },
+                        max_width: if desired == 6 || opts.ibss_interface.is_some() { 20 } else { opts.max_bandwidth },
                     };
                     if desired != 0 && opts.retune && applied_request != Some(request) {
                         applied_definition = None;
                         pending_channel = Some(request);
                         channel_tx.send(request).await.context("channel worker stopped")?;
                         continue;
-                    }
-                    if let Some(plan) = &mut plan
-                        && applied_definition.is_some_and(|d| d.channel == desired) {
-                        plan.applied(desired);
                     }
                     let on_channel = desired != 0 && applied_definition.is_some_and(|d| d.channel == desired);
                     if on_channel {
@@ -490,7 +472,6 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
                             |bytes| inject_packet(stream.capture_mut(), bytes),
                         )?;
                         if let Some(time) = report.last_sent_us { last_traffic = time; }
-                        if let Some(time) = report.last_tcp_us { last_tcp = Some(time); }
                     }
                 },
             }

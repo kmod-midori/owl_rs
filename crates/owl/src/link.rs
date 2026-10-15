@@ -118,13 +118,9 @@ impl Link {
             airdrop_port: Some(opts.service_port),
             mac,
             name: mac.0.iter().map(|b| format!("{b:02x}")).collect(),
-            channel: radio.channel,
-            strategy: if radio.probe.profile.mode == Mode::Exclusive {
-                Strategy::Pin
-            } else {
-                Strategy::Intersect
-            },
-            fixed_radio: radio.probe.profile.mode == Mode::Exclusive,
+            channel: radio.transmit_channel,
+            strategy: Strategy::Pin,
+            fixed_radio: true,
             tx_noack: opts.radio.tx_ack.noack(radio.probe.profile.tx_noack),
             rx_ampdu: radio.probe.profile.rx_ampdu,
             metric_first: radio.probe.profile.mode == Mode::Exclusive,
@@ -146,14 +142,10 @@ impl Link {
             save: opts.save.clone(),
             save_invalid: None,
             summary: None,
-            channel_plan: (radio.probe.profile.mode == Mode::Exclusive).then(|| {
-                ChannelPlan::new(
-                    radio.channel,
-                    radio.transmit_channel,
-                    radio.probe.channels.clone(),
-                )
-            }),
+            channel_plan: (radio.probe.profile.mode == Mode::Exclusive)
+                .then(|| ChannelPlan::new(radio.transmit_channel)),
             ibss_interface: radio.ibss_interface(),
+            max_bandwidth: opts.radio.max_bandwidth,
             retune: radio.probe.profile.mode == Mode::Exclusive,
             timeouts: opts.timeouts,
         };

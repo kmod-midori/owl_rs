@@ -178,18 +178,6 @@ impl Sequence {
             best as u8
         }
     }
-    /// Rank usable channels by full-slot overlap; zero/unsupported channels do not count.
-    pub fn ranked_channels(&self, allowed: &[u8], prefer: u8) -> Vec<u8> {
-        let mut counts = [0u8; 256];
-        for i in 0..SLOTS {
-            counts[self.channel(i) as usize] += 1;
-        }
-        let mut channels: Vec<_> = allowed.iter().copied().filter(|&c| c != 0).collect();
-        channels.sort_unstable();
-        channels.dedup();
-        channels.sort_by_key(|&c| (std::cmp::Reverse(counts[c as usize]), c != prefer, c));
-        channels
-    }
     pub fn rotate(&self, delta: usize) -> Self {
         Self {
             encoding: self.encoding,
@@ -283,64 +271,25 @@ impl Clock {
     }
 }
 
-/// Idle discovery and a fixed, operation-scoped transfer channel.
+/// The daemon's fixed exclusive-mode channel.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChannelPlan {
-    pub discovery_channel: u8,
-    pub transmit_channel: u8,
-    pub preferred_channel: u8,
-    pub allowed_channels: Vec<u8>,
+    pub primary_channel: u8,
     pub failed_channels: Vec<u8>,
-    pub discovering: bool,
-    #[serde(skip)]
-    selected: Option<u8>,
 }
 impl ChannelPlan {
-    pub fn new(discovery: u8, preferred: u8, allowed: Vec<u8>) -> Self {
+    pub fn new(primary_channel: u8) -> Self {
         Self {
-            discovery_channel: discovery,
-            transmit_channel: preferred,
-            preferred_channel: preferred,
-            allowed_channels: allowed,
+            primary_channel,
             failed_channels: Vec::new(),
-            discovering: true,
-            selected: None,
         }
     }
-    /// Choose once per exchange; remain on discovery while no exchange is active.
-    pub fn desired(&mut self, parent: Option<&Sequence>, busy: bool) -> Option<u8> {
-        self.discovering = !busy;
-        if !busy {
-            self.selected = None;
-            return (!self.failed_channels.contains(&self.discovery_channel))
-                .then_some(self.discovery_channel);
-        }
-        if let Some(channel) = self.selected {
-            return Some(channel);
-        }
-        let own = Sequence::fixed(self.preferred_channel);
-        self.selected = parent
-            .unwrap_or(&own)
-            .ranked_channels(&self.allowed_channels, self.preferred_channel)
-            .into_iter()
-            .find(|c| !self.failed_channels.contains(c));
-        self.selected
+    pub fn desired(&self) -> Option<u8> {
+        (!self.failed_channels.contains(&self.primary_channel)).then_some(self.primary_channel)
     }
     pub fn failed(&mut self, channel: u8) {
-        if self.selected == Some(channel) {
-            self.selected = None;
-        }
         if !self.failed_channels.contains(&channel) {
             self.failed_channels.push(channel);
-        }
-    }
-    /// Publish a new fixed schedule only after successful kernel tuning.
-    pub fn applied(&mut self, channel: u8) -> bool {
-        if !self.discovering && self.transmit_channel != channel {
-            self.transmit_channel = channel;
-            true
-        } else {
-            false
         }
     }
 }

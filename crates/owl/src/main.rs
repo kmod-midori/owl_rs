@@ -47,3 +47,78 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn maximum_bandwidth_arguments() {
+        assert_eq!(
+            Cli::try_parse_from(["owld"])
+                .unwrap()
+                .options
+                .radio
+                .max_bandwidth,
+            40
+        );
+        for width in ["20", "40", "80"] {
+            assert_eq!(
+                Cli::try_parse_from(["owld", "--max-bandwidth", width])
+                    .unwrap()
+                    .options
+                    .radio
+                    .max_bandwidth,
+                width.parse::<u32>().unwrap()
+            );
+        }
+        for width in ["0", "10", "160", "40MHz"] {
+            assert!(Cli::try_parse_from(["owld", "--max-bandwidth", width]).is_err());
+        }
+    }
+    #[test]
+    fn regulatory_region_defaults_and_validation() {
+        assert_eq!(
+            Cli::try_parse_from(["owld"])
+                .unwrap()
+                .options
+                .radio
+                .reg_region,
+            "US"
+        );
+        for (input, expected) in [("us", "US"), ("DE", "DE"), ("00", "00")] {
+            assert_eq!(
+                Cli::try_parse_from(["owld", "--reg-region", input])
+                    .unwrap()
+                    .options
+                    .radio
+                    .reg_region,
+                expected
+            );
+        }
+        for input in ["U", "USA", "1A", "é", ""] {
+            assert!(Cli::try_parse_from(["owld", "--reg-region", input]).is_err());
+        }
+    }
+    #[test]
+    fn primary_channel_arguments_accept_supported_channels() {
+        assert_eq!(
+            Cli::try_parse_from(["owld"]).unwrap().options.radio.channel,
+            Some(149)
+        );
+        for flag in ["--primary-channel", "--channel", "--transmit-channel"] {
+            for channel in ["6", "44", "149"] {
+                assert_eq!(
+                    Cli::try_parse_from(["owld", flag, channel])
+                        .unwrap()
+                        .options
+                        .radio
+                        .channel,
+                    Some(channel.parse().unwrap())
+                );
+            }
+            assert!(Cli::try_parse_from(["owld", flag, "36"]).is_err());
+        }
+        assert!(Cli::try_parse_from(["owld", "--discovery-channel", "6"]).is_ok());
+        assert!(Cli::try_parse_from(["owld", "--discovery-channel", "44"]).is_err());
+    }
+}

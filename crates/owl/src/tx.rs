@@ -17,7 +17,6 @@ pub(crate) enum InjectionError<E> {
 #[derive(Default)]
 pub(crate) struct Report {
     pub last_sent_us: Option<i64>,
-    pub last_tcp_us: Option<i64>,
 }
 #[derive(Clone, Copy)]
 enum Block {
@@ -37,33 +36,31 @@ struct Ack {
     airtime_blocked: bool,
     backpressured: bool,
 }
-fn tcp_metadata(ethernet: &[u8]) -> (bool, Option<Ack>) {
+fn tcp_ack(ethernet: &[u8]) -> Option<Ack> {
     let Ok(packet) = etherparse::SlicedPacket::from_ethernet(ethernet) else {
-        return (false, None);
+        return None;
     };
     let Some(etherparse::TransportSlice::Tcp(tcp)) = packet.transport else {
-        return (false, None);
+        return None;
     };
-    let ack = (tcp.ack() && !tcp.syn() && !tcp.fin() && !tcp.rst() && tcp.payload().is_empty())
-        .then(|| Ack {
-            id: 0,
-            source_port: tcp.source_port(),
-            destination_port: tcp.destination_port(),
-            sequence: tcp.sequence_number(),
-            acknowledgment: tcp.acknowledgment_number(),
-            window: tcp.window_size(),
-            timestamp: tcp
-                .options_iterator()
-                .find_map(|option| match option.ok()? {
-                    etherparse::TcpOptionElement::Timestamp(value, _) => Some(value),
-                    _ => None,
-                }),
-            options_crc: crc32fast::hash(tcp.options()),
-            schedule_blocked: false,
-            airtime_blocked: false,
-            backpressured: false,
-        });
-    (true, ack)
+    (tcp.ack() && !tcp.syn() && !tcp.fin() && !tcp.rst() && tcp.payload().is_empty()).then(|| Ack {
+        id: 0,
+        source_port: tcp.source_port(),
+        destination_port: tcp.destination_port(),
+        sequence: tcp.sequence_number(),
+        acknowledgment: tcp.acknowledgment_number(),
+        window: tcp.window_size(),
+        timestamp: tcp
+            .options_iterator()
+            .find_map(|option| match option.ok()? {
+                etherparse::TcpOptionElement::Timestamp(value, _) => Some(value),
+                _ => None,
+            }),
+        options_crc: crc32fast::hash(tcp.options()),
+        schedule_blocked: false,
+        airtime_blocked: false,
+        backpressured: false,
+    })
 }
 impl AckTiming {
     fn finished(&mut self, ack: &Ack) {
@@ -75,7 +72,6 @@ impl AckTiming {
 struct Packet {
     ethernet: Vec<u8>,
     queued_us: i64,
-    tcp: bool,
     ack: Option<Ack>,
 }
 impl Packet {
@@ -261,18 +257,12 @@ impl Queue {
     pub fn is_idle(&self, now: i64, quiet_us: i64) -> bool {
         self.is_empty() && now.saturating_sub(self.reserved_until_us) >= quiet_us
     }
-    pub fn has_pending_airtime(&self, now: i64) -> bool {
-        self.reserved_until_us > now
-    }
-    pub fn has_tcp(&self) -> bool {
-        self.frames.iter().flat_map(|f| &f.packets).any(|p| p.tcp)
-    }
     pub fn push(&mut self, ethernet: Vec<u8>, queued_us: i64) {
         assert!(
             ethernet.len() >= 14 && self.len() < QUEUE_LIMIT,
             "checked bounded Ethernet queue"
         );
-        let (tcp, mut ack) = tcp_metadata(&ethernet);
+        let mut ack = tcp_ack(&ethernet);
         if let Some(ack) = &mut ack {
             ack.id = self.next_ack_id;
             self.next_ack_id = self.next_ack_id.wrapping_add(1);
@@ -280,7 +270,6 @@ impl Queue {
         self.frames.push_back(Frame::single(Packet {
             ethernet,
             queued_us,
-            tcp,
             ack,
         }));
     }
@@ -526,9 +515,6 @@ impl Queue {
                         .max(time)
                         .saturating_add(airtime_us(rate, physical_len).unwrap_or(0));
                     report.last_sent_us = Some(time);
-                    if frame.packets.iter().any(|p| p.tcp) {
-                        report.last_tcp_us = Some(time);
-                    }
                     engine.stats.tx_data += 1;
                     engine.stats.tx_packets += count as u64;
                     if dst.multicast() {
@@ -569,14 +555,12 @@ fn fits_window(rate: Rate, bytes: usize, window: i64) -> bool {
     airtime_us(rate, bytes).is_some_and(|airtime| airtime <= window)
 }
 fn receive_limit(caps: &BandCapabilities, rate: Rate) -> Option<usize> {
-    let ht = caps.ht.as_ref()?;
-    let amsdu = if ht.cap_info & 0x0800 != 0 {
-        protocol::MAX_AMSDU
-    } else {
-        3839
-    };
     match rate {
-        Rate::Mcs { .. } => Some(amsdu),
+        Rate::Mcs { .. } => Some(if caps.ht.as_ref()?.cap_info & 0x0800 != 0 {
+            protocol::MAX_AMSDU
+        } else {
+            3839
+        }),
         Rate::Vht { .. } => {
             let mpdu = match caps.vht.as_ref()?.cap_info & 3 {
                 0 => 3895,
@@ -584,7 +568,7 @@ fn receive_limit(caps: &BandCapabilities, rate: Rate) -> Option<usize> {
                 2 => 11454,
                 _ => return None,
             };
-            Some(amsdu.min(mpdu - 30)) // QoS header and hardware FCS.
+            Some(protocol::MAX_AMSDU.min(mpdu - 30)) // QoS header and hardware FCS.
         }
         _ => None,
     }
@@ -602,22 +586,13 @@ fn aggregate_limit(
     let Some(peer) = engine.peers.get(&dst).filter(|p| p.valid) else {
         return 0;
     };
-    let local = engine
-        .config
-        .capabilities
-        .for_channel(engine.config.channel);
-    let (Some(local), Some(remote)) = (
-        receive_limit(local, rate),
-        receive_limit(&peer.capabilities, rate),
-    ) else {
+    let Some(remote) = receive_limit(&peer.capabilities, rate) else {
         return 0;
     };
     let Ok(radiotap) = protocol::radiotap_tx(parameters, engine.config.tx_noack, false) else {
         return 0;
     };
-    local
-        .min(remote)
-        .min(monitor_limit.saturating_sub(radiotap.len() + 26))
+    remote.min(monitor_limit.saturating_sub(radiotap.len() + 26))
 }
 
 #[cfg(test)]
@@ -1053,10 +1028,10 @@ mod tests {
                 .unwrap();
             packet
         };
-        assert!(tcp_metadata(&ack_packet(1, b"data")).1.is_none());
+        assert!(tcp_ack(&ack_packet(1, b"data")).is_none());
         let mut fin = ack_packet(1, &[]);
         fin[14 + 40 + 13] |= 1;
-        assert!(tcp_metadata(&fin).1.is_none());
+        assert!(tcp_ack(&fin).is_none());
         let mut engine = engine();
         let mut queue = Queue::default();
         queue.push(ack_packet(1, &[]), 0);
@@ -1164,11 +1139,10 @@ mod tests {
             Ok(())
         });
         assert!(queue.is_empty());
-        assert!(queue.has_pending_airtime(time));
         assert!(!queue.is_idle(time, 0));
         assert!(!queue.is_idle(time + 100_000, 100_000));
         assert!(queue.is_idle(time + 200_000, 100_000));
-        assert_eq!(report.last_tcp_us, Some(time));
+        assert_eq!(report.last_sent_us, Some(time));
         assert_eq!(
             (
                 engine.stats.tx_data,
@@ -1305,6 +1279,45 @@ mod tests {
         engine.peers.get_mut(&PEER).unwrap().sequence = Some(Sequence::fixed_definition(channel));
         engine.config.rate = "vht8-nss2-bw80-sgi".parse().unwrap();
         let bcc = engine.data_parameters(PEER).unwrap();
+        // VHT uses the peer's MPDU limit, independent of its HT size bit and
+        // our local RX size. Five full packets fit the negotiated VHT bound.
+        engine
+            .config
+            .capabilities
+            .ghz5
+            .vht
+            .as_mut()
+            .unwrap()
+            .cap_info &= !3;
+        assert_eq!(
+            aggregate_limit(&engine, PEER, bcc, 8192),
+            protocol::MAX_AMSDU
+        );
+        let mut large = Queue::default();
+        for marker in 1..=5 {
+            large.push(packet(PEER, marker), 0);
+        }
+        let sent = send(&mut large, &mut engine, 8192, 10_000);
+        assert_eq!(sent.iter().map(Vec::len).collect::<Vec<_>>(), [5]);
+        engine
+            .peers
+            .get_mut(&PEER)
+            .unwrap()
+            .capabilities
+            .vht
+            .as_mut()
+            .unwrap()
+            .cap_info &= !3;
+        assert_eq!(aggregate_limit(&engine, PEER, bcc, 8192), 3895 - 30);
+        engine
+            .peers
+            .get_mut(&PEER)
+            .unwrap()
+            .capabilities
+            .vht
+            .as_mut()
+            .unwrap()
+            .cap_info |= 1;
         let mut queue = Queue::default();
         queue.push(packet(PEER, 1), 0);
         queue.push(packet(PEER, 2), 0);

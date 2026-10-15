@@ -69,7 +69,7 @@ exclusive_backend = "ibss"
 # Channel changes can cancel the driver's TX-status cleanup worker, causing
 # normal-ACK injection to stall. Use --tx-ack normal after the driver is fixed.
 [profiles.mt76x2u]
-rx_ampdu = false
+rx_ampdu = true
 tx_noack = true
 tested = true
 mode = "exclusive"

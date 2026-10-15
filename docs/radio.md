@@ -21,9 +21,9 @@ selections. There is no automatic fallback between backends.
 
 ## Modes and backends
 
-Shared mode preserves AP association and requires its primary channel to be
-6, 44 or 149. Discovery and transmission stay on that channel, reusing the
-current station address.
+Shared mode preserves AP association, stays on the AP's current channel and
+advertises all 16 slots on that channel with the AP's width. It ignores the
+exclusive-mode primary-channel preference and does not retune the radio.
 
 Exclusive mode disconnects Wi-Fi and journals NetworkManager ownership, station
 MAC/up state and any connected AP's UUID for restoration. Setup waits for
@@ -36,7 +36,7 @@ its exclusive sessions. The backend supplies channel context:
   injects frames.
 - **Active monitor:** active `owlmon0` captures, injects and supplies hardware
   ACKs. The existing station becomes a passive monitor with the same MAC for
-  tuning. Setup establishes the discovery channel before bringing up the active
+  tuning. Setup establishes the primary channel before bringing up the active
   monitor. This requires hardware support and `mon_mac = "station"`, and avoids
   an additional tuning interface on MT7612U.
 
@@ -46,34 +46,40 @@ settings. Existing monitor/TAP names are rejected rather than adopted.
 
 ## Channels
 
-Exclusive mode separates discovery/negotiation from transmission:
+In exclusive mode, `--primary-channel 6|44|149` selects a fixed channel, defaulting
+to 149. The daemon stays on it and advertises it in all 16 slots during discovery,
+approval, transfers, and idle periods. Peer schedules do not change this selection.
 
 ```sh
-just owld --discovery-channel 6 --channel 149
+just owld --primary-channel 149
+# Or: just owld --primary-channel 44
 # In other terminals:
 just daemon --auto-accept
 just discoverable everyone
 ```
 
+`--reg-region US` selects the global kernel regulatory region (default `US`).
+Use a two-letter country code for the operating region, or `00` for the world
+domain. Each radio session requests it through nl80211 and waits for confirmation
+before checking channel availability. The setting persists after the session;
+`probe` only reads the current kernel state. Driver and regulatory restrictions
+still determine which channels and widths are usable.
+
 Radio flags configure `owld`; `catdrop send` and `airdropd` do not change them.
-`--transmit-channel` aliases `--channel`. Discovery defaults to 6; the transmit
-preference defaults to 6 for active monitor and 44 for IBSS, subject to regulatory
-availability. Disabled, radar and no-IR channels are excluded.
+`--channel` and `--transmit-channel` alias `--primary-channel`.
+`--discovery-channel 6` is accepted as an ignored compatibility option; other values
+are rejected. The selected channel must permit transmission. Disabled, radar and no-IR
+channels are excluded; an unavailable primary is an error, not a fallback.
 
-A local master uses its transmit preference; a follower favors overlap with the
-elected parent's schedule. Failed tunes try other candidates. Idle discovery,
-TLS and offer approval use the discovery channel. Approved file transfers hold
-their selected channel through upload and TCP shutdown, then return to discovery
-after queued/recent TCP traffic clears, without discovery detours.
-
-Active-monitor transfers try permitted 80, 40, then 20 MHz widths on each 5 GHz
-primary before trying another channel. Channel 6 and idle discovery use 20 MHz;
-shared mode uses the AP's width. `probe` lists candidates. Advertisements follow
-kernel-acknowledged tuning, with readback checks when available.
-`status` exposes `channel_plan`, `physical_channel` and
-`physical_channel_definition` (primary, width, center frequency).
-See [Radio context and IPv6](protocol.md#radio-context-and-ipv6) for overlap,
-slot gating and tuning details.
+`--max-bandwidth 20|40|80` caps exclusive-mode tuning (default 40 MHz).
+Active monitor tries permitted widths from that cap downward on the primary.
+Shared mode uses the AP width regardless of this option.
+Channel 6 and IBSS use 20 MHz. Injection pauses during tuning; unicast also waits
+for the peer's matching slot. The advertised width reflects successful tuning.
+`probe` lists hardware candidates.
+`status` exposes `channel_plan.primary_channel`, `physical_channel`, and
+`physical_channel_definition` (channel, width, center frequency).
+See [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 
 ## Transmit rates
 
@@ -103,8 +109,9 @@ retries and fallback behavior.
 
 ## Unicast acknowledgments
 
-Channel pinning and hardware ACK policy are independent. `--tx-ack auto`
-(default) follows `tx_noack` in the driver profile, which defaults to false.
+Channel pinning and hardware ACK policy are independent. The daemon defaults to
+`--tx-ack noack`. `--tx-ack auto` follows `tx_noack` in the driver profile, which
+defaults to false.
 The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
 channel changes. The Intel profile uses NOACK as a firmware workaround.
 `--tx-ack normal` or `--tx-ack noack` overrides it.
@@ -124,9 +131,11 @@ behavior needs on-air verification with ACK waiting enabled.
 
 | Override | Selection |
 | --- | --- |
-| `--fec bcc` | BCC for every frame (default). |
+| `--fec bcc` | BCC for every frame. |
 | `--fec auto` | LDPC for HT/VHT unicast when the driver and the peer's corresponding RX capability support it; otherwise BCC. |
-| `--fec ldpc` | Request LDPC for HT/VHT unicast; require driver TX support and the peer's corresponding RX capability. |
+| `--fec ldpc` | Daemon default. Request LDPC for HT/VHT unicast; require driver TX support and the peer's corresponding RX capability. |
+
+The `owld awdl` diagnostic command defaults to `--fec bcc --tx-ack auto`.
 
 The profile's `supports_tx_ldpc` defaults to false; bundled `mt76x2u` enables it
 based on the driver TX descriptor. Local RX bits do not establish TX support.
@@ -137,16 +146,19 @@ on-air encoding. The VHT injection workaround needs hardware validation; see
 
 ## Receive Block Ack
 
-Copy `profiles.toml`, set `rx_ampdu = true` for an exclusive active-monitor
-profile, and pass `--profiles PATH`. Built-in profiles disable it. Hardware must
-generate Block Ack replies; the option installs no driver patches. See
+The MT76x2U profile enables `rx_ampdu`; other bundled profiles disable it.
+Custom profiles can enable it for exclusive active-monitor mode with
+`mon_mac = "station"`. Hardware must generate Block Ack replies; the option
+installs no driver patches. See
 [Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.
 
 Upstream PRs [#58](https://github.com/t4t5/omdrop-owl/pull/58) and
 [#59](https://github.com/t4t5/omdrop-owl/pull/59) report MT7612U support;
 [#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster patched-MT7921
-transfers with Block Ack and wide channels combined. Local tests validate
-synthetic negotiation/reordering, not those hardware or throughput claims.
+transfers with Block Ack and wide channels combined. Local MT7612U receives
+completed with A-MSDU-in-A-MPDU at 40 MHz.
+Two 80 MHz receive attempts suffered severe retries and rate fallback;
+40 MHz is the default cap. These captures do not identify the driver/RF cause.
 
 ## Election experiments
 

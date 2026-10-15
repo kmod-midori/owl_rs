@@ -43,10 +43,12 @@ daemon's random MAC; shared mode uses the AP station's current MAC.
 
 `State { generation, service_enabled, transfers, transfer_epoch }` publishes
 visibility after HTTPS/mDNS binding and reports active transfers. Activity revisions
-increase on transfer start/end. `owld` uses these to hold the transfer channel,
-without access to filenames or authorization policy.
+increase on transfer start/end. `owld` uses them to acknowledge primary-channel
+readiness without access to filenames or authorization policy. The slot schedule
+runs independently of transfer activity.
 
-After tuning, `owld` sends `ChannelReady { generation, transfer_epoch }`. Before
+After tuning to the primary channel (or confirming the AP channel in shared mode),
+`owld` sends `ChannelReady { generation, transfer_epoch }`. Before
 `/Upload`, the sender waits for its revision or a newer active revision; snapshots
 cannot satisfy this wait. `--channel-ready-timeout` (15 seconds) and link closure
 bound it. Readiness confirms local tuning; peer slot gating also applies.

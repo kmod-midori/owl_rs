@@ -181,6 +181,7 @@ pub async fn run(args: Arguments, timeouts: owl::timeouts::Timeouts) -> Result<(
         summary: args.summary,
         channel_plan: None,
         ibss_interface: None,
+        max_bandwidth: 40,
         retune: true,
     };
     if offline {

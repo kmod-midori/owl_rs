@@ -33,8 +33,8 @@ pub struct Options {
     /// Data transmit rate; VHT requests are capped at MCS8.
     #[arg(long, default_value = "auto")]
     pub rate: Rate,
-    /// Data coding: BCC by default; auto/LDPC require a supported injection backend.
-    #[arg(long, value_enum, default_value = "bcc")]
+    /// Data coding; LDPC requires a supported injection backend and peer.
+    #[arg(long, value_enum, default_value = "ldpc")]
     pub fec: FecPolicy,
     #[arg(long, default_value_t = 60)]
     pub election_metric: u32,

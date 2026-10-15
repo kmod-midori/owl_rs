@@ -292,7 +292,8 @@ for their respective command-line options.
   selects an adapter.
 - `--direct '[fe80::200:ff:fe00:1%3]:8770'` bypasses receiver-name discovery;
   substitute the receiver's address, interface scope and port.
-- `--interface`, `--profiles`, `--backend`, `--channel` and `--discovery-channel`
+- `--interface`, `--profiles`, `--backend`, `--primary-channel`,
+  `--max-bandwidth`, and `--reg-region`
   belong to `owld` and are covered in [Radio configuration](radio.md).
 
 The identity directory contains a generated RSA private key and self-signed
