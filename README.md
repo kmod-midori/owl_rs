@@ -27,6 +27,12 @@ Start the radio service in its own terminal:
 just owld
 ```
 
+Start the user daemon in another terminal:
+
+```sh
+just daemon --name 'Example Computer'
+```
+
 Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 **Everyone for 10 Minutes**, then send as your regular user:
 
@@ -34,13 +40,8 @@ Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 just send 'Example Phone' /path/to/photo.png
 ```
 
-To receive, keep `owld` running and start the user daemon in another terminal:
-
-```sh
-just daemon --name 'Example Computer'
-```
-
-In another terminal, enable receiving and wait to accept the next offer:
+To receive, keep both daemons running. In another terminal, enable receiving
+and wait to accept the next offer:
 
 ```sh
 just discoverable everyone
@@ -58,8 +59,8 @@ inactivity. `accept TRANSFER_ID` and `reject TRANSFER_ID` select specific offers
 `airdropd --auto-accept` skips manual approval. Received files go to
 `~/Downloads/AirDrop/` by default.
 
-Discoverability starts **off** and applies until the daemon stops. `send` works
-standalone or through `airdropd`; both require `owld`. Incoming and outgoing
+Discoverability starts **off** and applies until the daemon stops. `send` requires
+both `airdropd` and `owld`. Incoming and outgoing
 transfers share one active session. See [Usage](docs/usage.md) for runtime controls
 and Contacts Only receiving.
 

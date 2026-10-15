@@ -12,6 +12,24 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub const MAX_MESSAGE: usize = 1024 * 1024;
+/// Remove an orphaned socket after acquiring the daemon's exclusive lock.
+/// Refuse other file types, including symlinks, to preserve unrelated data.
+pub fn remove_stale_socket(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_socket(),
+                "refusing to remove non-socket {}",
+                path.display()
+            );
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
 pub fn generation() -> String {
     uuid::Uuid::new_v4().to_string()
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use openssl::{
     asn1::{Asn1Integer, Asn1Time},
     bn::BigNum,
@@ -21,14 +22,12 @@ pub struct Identity {
     pub record: Option<Vec<u8>>,
     pub hashes: [u8; 8],
 }
+
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().context("file has no parent")?)?;
     file.write_all(data)?;
-    file.sync_all()?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(path)?;
     Ok(())
 }
 /// Create private directories without changing ownership of existing parents.
@@ -51,10 +50,19 @@ pub fn private_directory(path: &Path) -> Result<()> {
 }
 impl Identity {
     pub fn load(dir: &Path, name: &str) -> Result<Self> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+        private_directory(dir)?;
+        // Different run directories may share an identity. Serialize creation so
+        // no loader observes a partially published certificate/key pair.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(dir.join("identity.lock"))?;
+        anyhow::ensure!(lock.metadata()?.is_file(), "invalid identity lock file");
+        lock.lock_exclusive()?;
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
         if !cert.exists() && !key.exists() {
@@ -132,5 +140,43 @@ impl Identity {
         builder.set_verify(SslVerifyMode::NONE);
         builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         Ok(builder.build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, sync::Barrier};
+
+    #[test]
+    fn concurrent_loads_share_a_complete_private_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("nested/keys");
+        let barrier = Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let identity = Identity::load(&dir, "fixture").unwrap();
+                        identity.acceptor().unwrap();
+                        std::fs::read(dir.join("cert.pem")).unwrap()
+                    })
+                })
+                .collect();
+            let certificates: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(certificates.windows(2).all(|pair| pair[0] == pair[1]));
+        });
+        for name in ["cert.pem", "key.pem", "identity.lock"] {
+            let path = dir.join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let original = std::fs::read(&path).unwrap();
+            assert!(write_private(&path, b"replacement").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
     }
 }

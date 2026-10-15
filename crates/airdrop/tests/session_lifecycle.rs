@@ -53,6 +53,27 @@ async fn runtime_visibility_idle_control_and_killed_daemon_restart() {
             .spawn()
             .unwrap()
     };
+    // Startup must preserve unrelated files and links at the socket path.
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("control.sock");
+    let target = temp.path().join("unrelated");
+    std::fs::write(&target, b"keep me").unwrap();
+    for symlink in [false, true] {
+        if symlink {
+            std::os::unix::fs::symlink(&target, &socket).unwrap();
+        } else {
+            std::fs::write(&socket, b"keep me").unwrap();
+        }
+        let output = tokio::time::timeout(Duration::from_secs(5), start().wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to remove non-socket"));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"keep me");
+        assert_eq!(socket.is_symlink(), symlink);
+        std::fs::remove_file(&socket).unwrap();
+    }
     let mut daemon = start();
     ready(&dir).await;
     assert_eq!(

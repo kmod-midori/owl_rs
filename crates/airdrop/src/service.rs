@@ -1044,7 +1044,7 @@ impl Daemon {
         Ok(())
     }
 }
-pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
+pub async fn run(opts: Options) -> Result<()> {
     opts.validate()?;
     ensure!(
         !nix::unistd::geteuid().is_root(),
@@ -1066,9 +1066,7 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
         .open(opts.run_dir.join("daemon.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock).context("another daemon is running")?;
     let socket_path = opts.run_dir.join("control.sock");
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
+    owl_ipc::remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     let cancel = CancellationToken::new();
@@ -1082,7 +1080,7 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
         visibility: visibility::Control::new(crate::contact_book::default_path(&home)),
         ble,
     };
-    let bluetooth = if initial.is_none() && !opts.no_bluetooth && !opts.no_radio {
+    let bluetooth = if !opts.no_bluetooth && !opts.no_radio {
         Some(tokio::spawn({
             let daemon = daemon.clone();
             async move {
@@ -1096,35 +1094,12 @@ pub async fn run(opts: Options, initial: Option<Request>) -> Result<()> {
         let daemon = daemon.clone();
         async move { daemon.serve_control(listener, uid).await }
     });
-    let signal = tokio::spawn(signals(
-        cancel.clone(),
-        if initial.is_none() {
-            opts.duration
-        } else {
-            None
-        },
-    ));
+    let signal = tokio::spawn(signals(cancel.clone(), opts.duration));
     tracing::info!(control=%socket_path.display(), "AirDrop control ready; radio and HTTPS inactive");
-    let initial_is_send = initial.is_some();
-    let mut result = if let Some(request) = initial {
-        daemon
-            .command(request.0, request.1, cancel.child_token())
-            .await
-            .map(|value| {
-                println!("{value:#}");
-            })
-    } else {
-        tokio::select! {
-            _ = cancel.cancelled() => Ok(()),
-            _ = async { loop { if server.is_finished() {break;} tokio::time::sleep(Duration::from_millis(100)).await;} } => Err(anyhow::anyhow!("control server stopped")),
-        }
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        _ = async { loop { if server.is_finished() {break;} tokio::time::sleep(Duration::from_millis(100)).await;} } => Err(anyhow::anyhow!("control server stopped")),
     };
-    if initial_is_send && result.is_ok() {
-        let active = daemon.active.lock().await.clone();
-        if let Some(active) = active {
-            result = result.and(active.stopped().await);
-        }
-    }
     cancel.cancel();
     daemon.sessions.close();
     daemon.sessions.wait().await;

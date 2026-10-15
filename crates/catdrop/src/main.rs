@@ -91,7 +91,7 @@ enum Action {
         #[arg(long)]
         contacts_file: Option<PathBuf>,
     },
-    /// Send files, folders, or links; use a running daemon or start a temporary session.
+    /// Send files, folders, or links through the running user daemon.
     Send {
         #[command(flatten)]
         options: Box<Options>,
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches)?;
     ensure!(
         matches!(&cli.command, Action::Send { .. }) || !Timeouts::explicit(&matches),
-        "timeout flags configure standalone sends; configure airdropd at startup for daemon operations"
+        "timeout overrides apply to sends; configure airdropd at startup for other operations"
     );
     let session_matches = matches.subcommand().map(|(_, args)| args);
     tracing_subscriber::fmt()
@@ -198,6 +198,10 @@ fn main() -> Result<()> {
                         !files.is_empty() || !url.is_empty(),
                         "choose files or --url"
                     );
+                    ensure!(
+                        service::control_available(&options.run_dir).await?,
+                        "airdropd is not running (start `just daemon` first)"
+                    );
                     let prepared = if files.is_empty() {
                         None
                     } else {
@@ -222,10 +226,6 @@ fn main() -> Result<()> {
                         timeout,
                         options: overrides(&options, session_matches.unwrap())?,
                     };
-                    if !service::control_available(&options.run_dir).await? {
-                        return service::run(*options, Some((command, prepared.map(|p| p.file))))
-                            .await;
-                    }
                     let value = foreground_client(
                         &options.run_dir,
                         command,

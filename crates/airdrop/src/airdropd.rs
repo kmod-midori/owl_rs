@@ -27,5 +27,5 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| if cli.verbose > 0 { "debug" } else { "info" }.into()),
         )
         .init();
-    airdrop::service::run(cli.options, None).await
+    airdrop::service::run(cli.options).await
 }

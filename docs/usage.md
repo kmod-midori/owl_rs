@@ -6,7 +6,12 @@
 
 Start `just owld` in a dedicated terminal first. This is the privileged radio
 service; it stays idle until a user session acquires the link. All following
-AirDrop commands run as your regular user.
+AirDrop commands run as your regular user. Start the user daemon in another
+terminal before sending or receiving:
+
+```sh
+just daemon --name 'Example Computer'
+```
 
 Keep the phone unlocked with AirDrop set to Everyone for 10 Minutes. To send:
 
@@ -22,13 +27,8 @@ Incoming files stream into a private temporary directory inside the destination;
 the completed directory is renamed to `airdrop-TRANSFER_ID`. Failed or cancelled
 uploads discard their temporary files; partial transfers are never published.
 
-To receive, keep the foreground daemon running:
-
-```sh
-just daemon --name 'Example Computer'
-```
-
-In another terminal, enable receiving and accept the next incoming offer:
+To receive, keep both daemons running. In another terminal, enable receiving
+and accept the next incoming offer:
 
 ```sh
 just discoverable everyone
@@ -187,7 +187,7 @@ Timeouts are command-line options; no timeout configuration file is used.
 Set daemon defaults at startup, or override them when `send` starts a session.
 Configure radio timeouts on `owld`; they also apply to its `probe`, `recover`
 and `awdl` subcommands. AirDrop and link-client timeouts belong to `airdropd`
-or standalone `catdrop send`. An existing active
+with per-session overrides from `catdrop send`. An existing active
 session retains its settings: explicit conflicting overrides are rejected.
 Control-only commands use the running daemon's settings; they cannot change
 these flags. `status.timeouts` shows effective user-session values in seconds;
@@ -283,7 +283,7 @@ just stop --run-dir "$XDG_RUNTIME_DIR/owl_rs-example"
 ```
 
 A stale socket left by a killed daemon is replaced under the daemon lock when
-a standalone transfer starts. Interrupted radio state can require
+`airdropd` restarts. Interrupted radio state can require
 [journal recovery](radio.md#recovery).
 
 ## Other options

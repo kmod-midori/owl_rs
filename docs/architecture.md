@@ -34,7 +34,9 @@ the user client verifies the server UID is root.
 The user daemon decides whether a BLE wake matches the current discoverability
 policy. Only eligible wakes acquire or refresh the user session. Outgoing work
 also acquires the same session. Identity keys, known contacts, transfer metadata
-and source/output paths remain in the user process.
+and output paths remain in `airdropd`. The CLI prepares source archives and
+sends requests over the user control socket; it never loads identity keys or
+runs the transport service. Sending requires both daemons to be running.
 
 The first radio request is `Acquire { port }`; the service uses its own CLI radio
 configuration and returns a generation ID, actual MAC, link-local address,

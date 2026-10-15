@@ -26,6 +26,9 @@ session teardown. Two contact-policy regressions use a synthetic root and
 intermediate, real CMS signatures and TLS metadata requests to test trust,
 signer role, replay, expiry and consent without sending files. Contact-list tests cover normalized matching, batch rejection,
 private file permissions and concurrent updates. Avoid tests that duplicate other scenarios or library behavior.
+Identity tests cover concurrent first-time creation, private permissions and
+preservation of existing keys. Daemon startup tests ensure stale sockets can be
+replaced without removing ordinary files or symlinks at the socket path.
 
 Builds and captures belong in ignored `build/` and `target/`. Machine-specific
 helpers belong in ignored `dev/`; the justfile optionally imports

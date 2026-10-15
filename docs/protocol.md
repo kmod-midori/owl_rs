@@ -879,8 +879,9 @@ radio. Raw AWDL neighbors remain available in `status.awdl.peers`, independently
 of AirDrop service discovery. Errors use `{"error":"message"}`.
 
 Before starting an outgoing operation, the CLI probes the control socket.
-A missing socket or connection refusal starts a standalone control service;
-other connection errors are reported. Startup takes an exclusive daemon lock
+A missing socket or connection refusal asks the user to start `airdropd`;
+the CLI never runs the service or loads identity keys. Other connection errors
+are reported. Startup takes an exclusive daemon lock
 before replacing an orphaned user socket. Radio recovery belongs to owld and
 uses its separate root-owned run directory, not the user control directory.
 

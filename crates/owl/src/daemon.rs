@@ -246,9 +246,7 @@ pub async fn run(opts: Options, timeouts: Timeouts) -> Result<()> {
         crate::radio::recover(&opts.run_dir, &timeouts).await?;
     }
     let path = opts.run_dir.join("control.sock");
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
+    owl_ipc::remove_stale_socket(&path)?;
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     if nix::unistd::geteuid().is_root() {
