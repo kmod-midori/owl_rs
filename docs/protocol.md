@@ -340,9 +340,9 @@ FCS presence and radiotap padding are handled explicitly.
 
 With `rx_ampdu` disabled, `owld` declines IEEE 802.11 ADDBA requests addressed
 to its MAC by validated AWDL peers with status 37. The profile option
-`rx_ampdu = true` enables acceptance on exclusive active-monitor backends with
-`mon_mac = "station"`. It requires hardware/firmware that generates Block Ack
-responses in this mode; userspace does not send these time-critical replies.
+`rx_ampdu = true` enables acceptance in shared mode or on exclusive active-monitor
+backends with `mon_mac = "station"`. It requires hardware/firmware that generates
+Block Ack responses in the selected mode; userspace handles negotiation and reordering.
 
 Acceptance negotiates immediate Block Ack, a window of at most 64 MPDUs,
 A-MSDU-in-A-MPDU support, and an inactivity timeout of zero (disabled). There are at
@@ -875,9 +875,9 @@ archive bytes follow the newline for a file transfer. The daemon receives the ar
 
 ## Compatibility and limitations
 
-MT7612U/mt76x2u active-monitor operation has been validated with Apple devices
-for sending and Everyone/Contacts Only receiving. Native IBSS/shared-mode
-AirDrop and broad Apple OS-version compatibility are not validated.
+MT7612U/mt76x2u active-monitor tests cover sending and Everyone/Contacts Only
+receiving with Apple devices. Shared-mode tests cover AWDL discovery and
+bidirectional IPv6 traffic while associated with an AP.
 Contacts Only sending, Apple identity acquisition and general media conversion
 are not implemented.
 

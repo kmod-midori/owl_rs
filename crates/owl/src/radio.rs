@@ -88,7 +88,7 @@ pub struct RadioArgs {
     /// Explicit exclusive radio model; otherwise use the driver profile.
     #[arg(long, value_enum)]
     pub backend: Option<Backend>,
-    /// Global kernel regulatory region requested when starting a radio session.
+    /// Kernel regulatory region requested in exclusive mode; shared mode uses the AP context.
     #[arg(long, default_value = "US", value_parser = reg_region)]
     #[serde(default = "default_reg_region")]
     pub reg_region: String,
@@ -177,10 +177,11 @@ impl Profile {
     fn validate_rx_ampdu(&self) -> Result<()> {
         anyhow::ensure!(
             !self.rx_ampdu
+                || self.mode == Mode::Shared
                 || (self.mode == Mode::Exclusive
                     && self.exclusive_backend == Backend::ActiveMonitor
                     && self.mon_mac == MonMac::Station),
-            "rx_ampdu requires exclusive active-monitor with mon_mac=station and hardware Block Ack support"
+            "rx_ampdu requires shared mode or exclusive active-monitor with mon_mac=station; hardware Block Ack support is required"
         );
         Ok(())
     }
@@ -365,8 +366,11 @@ impl Radio {
             "maximum bandwidth must be 20, 40, or 80 MHz"
         );
         let region = reg_region(&args.reg_region).map_err(anyhow::Error::msg)?;
-        net.set_reg_region(&region).await?;
-        let probe = probe_with(args, &net).await?;
+        let mut probe = probe_with(args, &net).await?;
+        if probe.profile.mode == Mode::Exclusive {
+            net.set_reg_region(&region).await?;
+            probe = probe_with(args, &net).await?;
+        }
         if !probe.profile.tested && !args.allow_untested {
             bail!(
                 "untested driver {}; use --allow-untested after choosing a profile",

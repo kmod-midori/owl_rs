@@ -59,9 +59,10 @@ just daemon --auto-accept
 just discoverable everyone
 ```
 
-`--reg-region US` selects the global kernel regulatory region (default `US`).
+`--reg-region US` selects the global kernel regulatory region in exclusive mode
+(default `US`). Shared mode uses the AP's regulatory context.
 Use a two-letter country code for the operating region, or `00` for the world
-domain. Each radio session requests it through nl80211 and waits for confirmation
+domain. Each exclusive radio session requests it through nl80211 and waits for confirmation
 before checking channel availability. The setting persists after the session;
 `probe` only reads the current kernel state. Driver and regulatory restrictions
 still determine which channels and widths are usable.
@@ -148,9 +149,9 @@ on-air encoding. The VHT injection workaround needs hardware validation; see
 ## Receive Block Ack
 
 The MT76x2U profile enables `rx_ampdu`; other bundled profiles disable it.
-Custom profiles can enable it for exclusive active-monitor mode with
-`mon_mac = "station"`. Hardware must generate Block Ack replies; the option
-installs no driver patches. See
+Custom profiles can enable it in shared mode or exclusive active-monitor mode
+with `mon_mac = "station"`. Hardware generates Block Ack replies; userspace
+handles negotiation and reordering. See
 [Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.
 
 ## Election experiments

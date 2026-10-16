@@ -27,9 +27,8 @@
 #   Defaults to false. Keep true only for a driver workaround; --tx-ack normal
 #   overrides it. This is independent of shared/exclusive mode and channel pinning.
 # rx_ampdu: experimental receive Block Ack acceptance; defaults to false.
-#   Requires exclusive active-monitor, mon_mac=station, and a driver/firmware
-#   known to generate hardware Block Ack replies in that mode. Userspace only
-#   negotiates and reorders; it cannot generate the hardware replies itself.
+#   Supports shared mode or exclusive active-monitor with mon_mac=station.
+#   Hardware generates Block Ack replies; userspace negotiates and reorders.
 # exclusive_backend:
 #   ibss: join AWDL's BSSID on owlibss0 and inject through a passive monitor.
 #   active-monitor: an active monitor ACKs unicast; the existing station becomes
