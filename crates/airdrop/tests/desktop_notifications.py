@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Optional desktop integration test (no physical radio or graphical display).
+"""Optional KSNI tray and separate D-Bus notification test (no radio or graphical display).
 
 cargo build --workspace --locked
 dbus-run-session -- python3 crates/airdrop/tests/desktop_notifications.py
-Requires Python PyGObject/Gio and a default-feature debug build.
+Requires Python PyGObject/Gio and a default tray-ksni debug build.
 """
 import concurrent.futures
 import json
@@ -113,7 +113,35 @@ with tempfile.TemporaryDirectory(prefix='owl-notifications-') as tmp:
         return cli('send', 'fixture', '--direct', f'[::1]:{port}', '--url', f'https://example.com/{label}')
     try:
         wait(lambda: (run / 'control.sock').exists())
+        # Exercise the default tray over D-Bus without GTK or a display server.
+        def tray_name():
+            names = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', 'ListNames', None, None,
+                Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+            return next((n for n in names if n.startswith(f'org.kde.StatusNotifierItem-{daemon.pid}-')), None)
+        tray = wait(tray_name)
+        def menu_call(method, args):
+            return bus.call_sync(tray, '/MenuBar', 'com.canonical.dbusmenu',
+                method, args, None, Gio.DBusCallFlags.NONE, 3000, None)
+        def menu():
+            _, layout = menu_call('GetLayout', GLib.Variant('(iias)', (0, -1, []))).unpack()
+            return {props.get('label'): (id, props) for id, props, children in layout[2]}
+        def tray_click(label):
+            id, _ = menu()[label]
+            menu_call('Event', GLib.Variant('(isvu)', (id, 'clicked', GLib.Variant('i', 0), 0)))
+        def selected(label):
+            items = menu()
+            return all(items.get(name, (0, {}))[1].get('toggle-state') == int(name == label)
+                for name in ['Receiving off', 'Contacts only', 'Everyone'])
+        wait(lambda: selected('Receiving off'))
         control({'command': 'discoverable', 'mode': 'everyone'})
+        wait(lambda: selected('Everyone'))
+        tray_click('Receiving off')
+        wait(lambda: control({'command': 'status'})['visibility'] == 'off')
+        wait(lambda: selected('Receiving off'))
+        tray_click('Everyone')
+        wait(lambda: control({'command': 'status'})['visibility'] == 'everyone')
+        wait(lambda: selected('Everyone'))
         for label, action, success in [('approved', 'accept', True), ('declined', 'decline', False), ('cli-race', 'accept', True), ('out-cancel', 'cancel', False)]:
             client = send(label)
             incoming = wait(lambda: popup(label, 'accept'))
@@ -218,12 +246,12 @@ with tempfile.TemporaryDirectory(prefix='owl-notifications-') as tmp:
                 if not cancel:
                     wait(lambda: any(n['summary'] == 'AirDrop received' and 'complete&lt;&amp;&gt;.bin' in n['body'] and n['hints'].get('value') == 100 for n in notices.values()))
                 assert control({'command': 'status'})['session']['id'] == session_id
-        control({'command': 'stop'})
+        tray_click('Quit AirDrop')
         wait(lambda: daemon.poll() is not None)
         assert daemon.returncode == 0
         wait(lambda: not notices)
         passed = True
-        print('PASS: notification approvals, decline, stale action/CLI race, outgoing cancel, CLI cancel, incoming progress/cancel, escaped text, dismissal, completion, shutdown')
+        print('PASS: KSNI menu/CLI synchronization and Quit, notification approvals, decline, stale action/CLI race, outgoing cancel, CLI cancel, incoming progress/cancel, escaped text, dismissal, completion, shutdown')
     finally:
         for client in clients:
             if client.poll() is None:

@@ -1,5 +1,16 @@
 //! User-owned AirDrop transport, discovery, contacts and control service.
 #![forbid(unsafe_code)]
+
+#[cfg(all(feature = "tray-ksni", feature = "tray-gtk"))]
+compile_error!(
+    "tray backends `tray-ksni` and `tray-gtk` are mutually exclusive; use --no-default-features --features tray-gtk for GTK"
+);
+#[cfg(all(
+    feature = "tray",
+    not(any(feature = "tray-ksni", feature = "tray-gtk"))
+))]
+compile_error!("select a tray backend with --features tray-ksni or --features tray-gtk");
+
 pub mod archive;
 pub mod ble;
 pub mod contact_book;

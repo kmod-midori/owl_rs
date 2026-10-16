@@ -7,11 +7,17 @@ sending to Contacts Only recipients is not implemented.
 ## Build
 
 Requires Rust 1.88+, Cargo, `just`, and libpcap, OpenSSL and D-Bus development
-libraries. The default `tray` feature also requires GTK 3 development libraries
-and libayatana-appindicator (or libappindicator) at runtime. Build without the
-tray and its GUI dependencies with:
+libraries. `tray-ksni` is the default tray backend and needs no GTK or
+libappindicator. The alternative `tray-gtk` backend requires GTK 3 development
+libraries and libayatana-appindicator (or libappindicator) at runtime. Select one
+backend; both also enable the separate D-Bus notification client.
 
 ```sh
+# Default: KSNI tray; D-Bus notifications
+cargo build --workspace --release --locked
+# GTK/AppIndicator tray; D-Bus notifications
+cargo build --workspace --release --locked --no-default-features --features airdrop/tray-gtk
+# No tray or desktop notifications
 cargo build --workspace --release --locked --no-default-features
 ```
 
@@ -57,10 +63,12 @@ Start the user daemon in another terminal:
 just daemon --name 'Example Computer'
 ```
 
-The default `tray` feature provides receiving-mode controls, Quit, and transfer
-notifications with accept, decline, cancel and progress actions. Receiving starts
-**off**. CLI commands use the same state and work without desktop integration;
-see [Usage](docs/usage.md#transfers). The tray requires AppIndicator support.
+The tray provides receiving-mode controls and Quit. Transfer notifications offer
+accept, decline, cancel and progress through the desktop’s notification service.
+Receiving starts **off**. CLI commands use the same state and work without desktop
+integration; see [Usage](docs/usage.md#transfers). The tray requires a
+StatusNotifierItem host, such as KDE Plasma, Waybar’s `tray` module, or GNOME’s
+AppIndicator extension. Notifications require a desktop notification service.
 
 Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 **Everyone for 10 Minutes**, then send as your regular user:

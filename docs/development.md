@@ -46,11 +46,12 @@ direct loopback HTTPS receivers through the library API.
 
 The lifecycle test uses Cargo's daemon binary path and needs no prior CLI build.
 
-The optional desktop regression runs a fake notification server on a private
-D-Bus session and real loopback HTTPS transfers. It checks notification actions,
-CLI approval races, per-transfer cancellation, progress, dismissal and notification
-cleanup. Archive integrity and staging cleanup stay in the Rust transfer tests.
-It requires Python PyGObject/Gio and `dbus-run-session`, with no display or radio:
+The optional desktop regression checks the KSNI tray menu and a separate fake
+notification server on a private D-Bus session, with real loopback HTTPS transfers.
+It checks tray/CLI synchronization, Quit, notification actions, CLI approval races,
+per-transfer cancellation, progress, dismissal and notification cleanup.
+It requires the default `tray-ksni` build, Python PyGObject/Gio and
+`dbus-run-session`, with no display or radio:
 
 ```sh
 cargo build --workspace --locked

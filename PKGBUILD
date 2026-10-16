@@ -6,7 +6,7 @@ pkgdesc='Linux AirDrop client and daemons with a native AWDL implementation'
 arch=('x86_64' 'aarch64')
 url='https://github.com/kmod-midori/owl_rs'
 license=('GPL-3.0-or-later' 'MIT')
-depends=('glibc' 'gcc-libs' 'dbus' 'libpcap' 'openssl' 'gtk3' 'libayatana-appindicator' 'bluez' 'networkmanager')
+depends=('glibc' 'gcc-libs' 'dbus' 'libpcap' 'openssl' 'bluez' 'networkmanager')
 makedepends=('cargo' 'git' 'pkgconf')
 optdepends=('gnome-shell-extension-appindicator: tray support in GNOME')
 provides=("owl_rs=${pkgver}")

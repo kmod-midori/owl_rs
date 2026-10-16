@@ -23,6 +23,11 @@ flowchart LR
     AD <-->|bluer / D-Bus|B[BlueZ]
 ```
 
+`airdropd` exposes its tray icon and menu through `tray-icon`, using the default
+`tray-ksni` or optional `tray-gtk` backend. Both enable the shared `tray` feature,
+which also enables a separate `zbus` client for `org.freedesktop.Notifications`.
+The tray worker and notification task independently apply actions to daemon state.
+
 ## Link ownership
 
 `owld` starts with WLAN inactive and permits one authorized user connection to

@@ -50,9 +50,14 @@ just reject TRANSFER_ID
 Run `airdropd --auto-accept` to approve offers automatically after the receiving
 policy passes. There is no separate `receive` command or receive visibility flag.
 
-With the default `tray` Cargo feature, desktop notifications offer **Accept** and
-**Decline**, then show transfer progress and **Cancel**. These use the same
-approval state as the CLI: acting in either place resolves the offer once.
+Both tray backends enable desktop notifications through a separate D-Bus client.
+The desktop notification service displays them and delivers action clicks;
+notifications work independently of the tray host. See [Build](../README.md#build)
+for backend selection.
+
+Notifications offer **Accept** and **Decline**, then show transfer progress and
+**Cancel**. These use the same approval state as the CLI: acting in either place
+resolves the offer once.
 Dismissing a notification does not accept, decline or cancel a transfer.
 `--auto-accept` skips approval, and CLI commands work when desktop notifications
 are unavailable.

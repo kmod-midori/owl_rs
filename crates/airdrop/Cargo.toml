@@ -10,8 +10,11 @@ name = "airdropd"
 path = "src/airdropd.rs"
 
 [features]
-default = ["tray"]
-tray = ["dep:gtk", "dep:tray-icon", "dep:zbus"]
+default = ["tray-ksni"]
+# Shared gate for tray controls and the separate zbus notification client.
+tray = ["dep:tray-icon", "dep:zbus"]
+tray-ksni = ["tray", "tray-icon/ksni"]
+tray-gtk = ["tray", "dep:gtk", "tray-icon/libappindicator"]
 
 [dependencies]
 anyhow.workspace = true

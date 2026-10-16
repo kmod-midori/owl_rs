@@ -43,7 +43,7 @@ tokio-util = { version = "0.7", features = ["rt", "io", "codec"] }
 toml = "0.9"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
+tray-icon = { version = "0.26.1", default-features = false }
 tun-rs = { version = "2", features = ["async_tokio"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"

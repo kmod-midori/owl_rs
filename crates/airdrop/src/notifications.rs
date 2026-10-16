@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Freedesktop notifications are an optional view of the daemon's transfer state.
+//! Transfer notifications via zbus and org.freedesktop.Notifications.
+//! The desktop notification service displays them and returns action clicks.
+//! Enabled by the shared `tray` feature; independent of the KSNI/GTK tray backend.
 use super::Daemon;
 use crate::{
     progress::{self, Progress},

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Optional desktop controls; GTK and the tray stay on their own OS thread.
+//! Tray icon and menu controls via KSNI or GTK on a dedicated worker.
+//! Transfer notifications use a separate D-Bus client in notifications.rs.
 use crate::visibility::{Control, Visibility};
-use anyhow::{Context, Result};
+#[cfg(feature = "tray-gtk")]
+use anyhow::Context;
+use anyhow::Result;
 use std::{path::Path, sync::Arc, thread, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tray_icon::{
@@ -45,9 +48,9 @@ pub(crate) fn start(
 
 impl Drop for Tray {
     fn drop(&mut self) {
-        // Also covers early returns: no detached GTK loop survives the daemon.
+        // Also covers early returns: no detached tray loop survives the daemon.
         self.stop.cancel();
-        // The GUI never waits on Tokio, so joining cannot depend on this worker.
+        // The tray worker never waits on Tokio, so joining cannot block its progress.
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -58,12 +61,13 @@ impl Drop for Tray {
 
 fn run(
     name: &str,
-    run_dir: &Path,
+    _run_dir: &Path,
     visibility: Arc<Control>,
     cancel: CancellationToken,
     stop: CancellationToken,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    #[cfg(feature = "tray-gtk")]
     gtk::init().context("initialize GTK (a graphical display is required)")?;
     let title = MenuItem::new(format!("AirDrop — {name}"), false, None);
     let modes = [
@@ -92,21 +96,22 @@ fn run(
         &status,
         &quit,
     ])?;
-    // Private to this daemon, including custom --run-dir instances.
-    let icons = tempfile::Builder::new()
-        .prefix("tray-")
-        .tempdir_in(run_dir)?;
-    let _icon = TrayIconBuilder::new()
+    let builder = TrayIconBuilder::new()
         .with_tooltip(format!("AirDrop — {name}"))
         .with_icon(icon()?)
-        .with_menu(Box::new(menu))
-        .with_temp_dir_path(icons.path())
-        .build()?;
+        .with_menu(Box::new(menu));
+    // AppIndicator writes an icon file; KSNI sends its pixels over D-Bus.
+    #[cfg(feature = "tray-gtk")]
+    let icons = tempfile::Builder::new()
+        .prefix("tray-")
+        .tempdir_in(_run_dir)?;
+    #[cfg(feature = "tray-gtk")]
+    let builder = builder.with_temp_dir_path(icons.path());
+    let _icon = builder.build()?;
     let (completed, results) = std::sync::mpsc::channel();
-    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+    let tick = move || {
         if stop.is_cancelled() {
-            gtk::main_quit();
-            return gtk::glib::ControlFlow::Break;
+            return false;
         }
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == *quit.id() {
@@ -131,11 +136,28 @@ fn run(
         for (mode, item) in &modes {
             // The policy is authoritative, including changes made through the CLI
             // and failed contacts-file loads. Do not leave a speculative checkmark.
-            item.set_checked(*mode == current);
+            if item.is_checked() != (*mode == current) {
+                item.set_checked(*mode == current);
+            }
         }
-        gtk::glib::ControlFlow::Continue
-    });
-    gtk::main();
+        true
+    };
+    #[cfg(feature = "tray-gtk")]
+    {
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            if tick() {
+                gtk::glib::ControlFlow::Continue
+            } else {
+                gtk::main_quit();
+                gtk::glib::ControlFlow::Break
+            }
+        });
+        gtk::main();
+    }
+    #[cfg(not(feature = "tray-gtk"))]
+    while tick() {
+        thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
 
