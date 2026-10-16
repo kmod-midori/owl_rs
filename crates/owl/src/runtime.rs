@@ -171,6 +171,7 @@ async fn live(mut config: Config, opts: &Options, mut control: Option<Control>) 
     }
     let mut cap = Capture::from_device(opts.input.as_str())?
         .snaplen(MAX_FRAME as i32)
+        .buffer_size(8 * 1024 * 1024)
         .promisc(true)
         .immediate_mode(true)
         .tstamp_type(pcap::TimestampType::Host)

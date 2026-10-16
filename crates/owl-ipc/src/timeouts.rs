@@ -35,25 +35,21 @@ macro_rules! deadlines {
         #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct Timeouts {
-            /// Quiet time after the final successful transfer and TCP drain.
-            #[serde(with="duration")]
-            pub completion_grace: Duration,
             $(#[doc=$help]
             #[serde(with="duration")]
             pub $field: Duration,)+
         }
         impl Default for Timeouts {
-            fn default() -> Self { Self { completion_grace: Duration::from_secs(5), $($field: positive($default).unwrap(),)+ } }
+            fn default() -> Self { Self { $($field: positive($default).unwrap(),)+ } }
         }
         impl Timeouts {
             pub fn explicit(matches: &clap::ArgMatches) -> bool {
                 let explicit = |id| matches.try_contains_id(id).unwrap_or(false)
                     && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
-                explicit("completion_grace") $(|| explicit(stringify!($field)))+
+                false $(|| explicit(stringify!($field)))+
             }
             pub fn validate(&self) -> anyhow::Result<()> {
                 $(anyhow::ensure!(!self.$field.is_zero() && self.$field <= Duration::from_secs(86400), concat!("invalid ", $flag));)+
-                anyhow::ensure!(self.completion_grace <= Duration::from_secs(86400), "invalid completion grace");
                 anyhow::ensure!(self.radio_quiet <= self.radio_drain, "radio quiet period must not exceed radio drain timeout");
                 Ok(())
             }
@@ -70,7 +66,7 @@ deadlines! {
     link_shutdown, "link-shutdown-timeout", "180", "Wait for owld to drain and restore a link.";
     discovery_cache, "discovery-cache-timeout", "120", "Local mDNS cache lifetime cap.";
     discovery_fallback, "discovery-fallback-timeout", "2", "Transient AWDL fallback discovery candidate lifetime.";
-    ble_idle, "ble-idle-timeout", "120", "Idle session lifetime after an eligible BLE wake.";
+    ble_idle, "ble-idle-timeout", "120", "Receive session idle lifetime after activity or an eligible BLE wake.";
     tcp_connect, "tcp-connect-timeout", "15", "Outgoing TCP connection deadline.";
     tls_handshake, "tls-handshake-timeout", "10", "Incoming TLS handshake deadline.";
     tls_connect, "tls-connect-timeout", "15", "Outgoing TLS handshake deadline.";
@@ -135,13 +131,12 @@ cli_deadlines! { RadioTimeouts {
     radio_quiet, "radio-quiet-period", "0.1", positive, "Quiet period before ending AWDL queue drain.";
 } }
 cli_deadlines! { AirDropTimeouts {
-    completion_grace, "completion-grace", "5", seconds, "Quiet time after the final transfer and TCP drain.";
     link_startup, "link-startup-timeout", "120", positive, "Wait for owld to prepare a link.";
     channel_ready, "channel-ready-timeout", "15", positive, "Wait for owld to prepare the transfer channel.";
     link_shutdown, "link-shutdown-timeout", "180", positive, "Wait for owld to drain and restore a link.";
     discovery_cache, "discovery-cache-timeout", "120", positive, "Local mDNS cache lifetime cap.";
     discovery_fallback, "discovery-fallback-timeout", "2", positive, "Transient AWDL fallback discovery candidate lifetime.";
-    ble_idle, "ble-idle-timeout", "120", positive, "Idle session lifetime after an eligible BLE wake.";
+    ble_idle, "ble-idle-timeout", "120", positive, "Receive session idle lifetime after activity or an eligible BLE wake.";
     tcp_connect, "tcp-connect-timeout", "15", positive, "Outgoing TCP connection deadline.";
     tls_handshake, "tls-handshake-timeout", "10", positive, "Incoming TLS handshake deadline.";
     tls_connect, "tls-connect-timeout", "15", positive, "Outgoing TLS handshake deadline.";

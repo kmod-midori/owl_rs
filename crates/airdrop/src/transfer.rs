@@ -78,7 +78,7 @@ pub struct Offer {
     pub urls: Vec<String>,
 }
 impl Offer {
-    fn parse(value: plist::Value) -> Result<Self> {
+    fn parse(value: plist::Value) -> Result<(Self, Option<u64>)> {
         let d = value.as_dictionary().context("Ask must be a dictionary")?;
         let id = d
             .get("TransferID")
@@ -94,6 +94,7 @@ impl Offer {
             .unwrap_or("Unknown")
             .to_owned();
         ensure!(sender.len() <= 256, "sender name is too long");
+        let mut total_bytes = Some(0u64);
         let mut items = Vec::new();
         let mut urls = Vec::new();
         if let Some(files) = d.get("Files").and_then(plist::Value::as_array) {
@@ -109,12 +110,15 @@ impl Offer {
                     archive::safe_path(&name)?.components().count() == 1,
                     "FileName must be a basename"
                 );
+                let size = f
+                    .get("FileSize")
+                    .and_then(plist::Value::as_unsigned_integer);
+                total_bytes = total_bytes
+                    .zip(size)
+                    .and_then(|(total, size)| total.checked_add(size));
                 items.push(Item {
                     name,
-                    size: f
-                        .get("FileSize")
-                        .and_then(plist::Value::as_unsigned_integer)
-                        .unwrap_or(0),
+                    size: size.unwrap_or(0),
                     directory: f
                         .get("FileIsDirectory")
                         .and_then(plist::Value::as_boolean)
@@ -139,20 +143,27 @@ impl Offer {
             items.is_empty() || urls.is_empty(),
             "mixed file and link transfer"
         );
-        Ok(Self {
-            id,
-            sender,
-            items,
-            urls,
-        })
+        if items.is_empty() {
+            total_bytes = None;
+        }
+        Ok((
+            Self {
+                id,
+                sender,
+                items,
+                urls,
+            },
+            total_bytes,
+        ))
     }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Transfer {
     pub offer: Offer,
     pub state: String,
+    /// Decoded file contents written, excluding AppleDouble metadata.
     pub bytes: u64,
-    /// Wire length, when provided by HTTP; offered sizes describe decoded files.
+    /// Sum of offered decoded file sizes, when every item supplies a size.
     pub total_bytes: Option<u64>,
     pub output: Option<PathBuf>,
     pub error: Option<String>,
@@ -381,9 +392,6 @@ impl Receiver {
         let final_socket = socket2::SockRef::from(&socket).try_clone()?;
         let lifetime = Arc::new(Mutex::new(lease));
         let completed = self.serve_https(socket, ssl, lifetime.clone()).await?;
-        if completed && let Some(lease) = lifetime.lock().await.as_ref() {
-            lease.complete();
-        }
         if completed {
             let socket = final_socket;
             let linger = self.timeouts.tcp_linger;
@@ -575,7 +583,7 @@ impl Receiver {
                 if self.policy.borrow().revision != policy.revision {
                     return Ok(response(StatusCode::FORBIDDEN, vec![]));
                 }
-                let offer = Offer::parse(value)?;
+                let (offer, total_bytes) = Offer::parse(value)?;
                 let bytes = offer
                     .items
                     .iter()
@@ -610,7 +618,7 @@ impl Receiver {
                                 offer: offer.clone(),
                                 state: "pending".into(),
                                 bytes: 0,
-                                total_bytes: None,
+                                total_bytes,
                                 output: None,
                                 error: None,
                             },
@@ -788,10 +796,11 @@ impl Receiver {
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let parse_appledouble = self.parse_appledouble;
+        let (decoded_progress, mut received_progress) = watch::channel(0u64);
         let mut decoded = tokio::task::spawn_blocking(move || {
             // A cancelled HTTP task must not free a slot while its decoder runs.
             let _permit = permit;
-            archive::receive_with_appledouble(
+            archive::receive_with_progress(
                 UploadReader {
                     chunks: reader,
                     cancel,
@@ -801,31 +810,34 @@ impl Receiver {
                 &id,
                 budget,
                 parse_appledouble,
+                |bytes| {
+                    decoded_progress.send_replace(bytes);
+                },
             )
         });
         let mut chunks = Some(chunks);
-        if let Some(entry) = self.entries.lock().await.get_mut(&offer.id) {
-            entry.transfer.total_bytes = req
-                .headers()
-                .get(hyper::header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse().ok());
-        }
         let mut body = req.into_body();
         let mut bytes = 0u64;
         self.update(&offer.id, "receiving", 0, None, None).await;
+        let mut progress_open = true;
+        let mut read_deadline = tokio::time::Instant::now() + self.timeouts.upload_idle;
         let validated = loop {
             tokio::select! {
                 result = &mut decoded => break result??,
-                frame = tokio::time::timeout(self.timeouts.upload_idle, body.frame()), if chunks.is_some() => {
+                changed = received_progress.changed(), if progress_open => {
+                    progress_open = changed.is_ok();
+                    let bytes = *received_progress.borrow_and_update();
+                    self.update(&offer.id, "receiving", bytes, None, None).await;
+                }
+                frame = tokio::time::timeout_at(read_deadline, body.frame()), if chunks.is_some() => {
                     match frame.context("upload stalled before a complete archive arrived")? {
                         Some(frame) => if let Ok(data) = frame?.into_data() {
                             bytes = bytes.checked_add(data.len() as u64).context("size overflow")?;
                             ensure!(bytes <= budget, "upload exceeds receive budget");
-                            self.update(&offer.id, "receiving", bytes, None, None).await;
                             if chunks.as_ref().expect("HTTP body still open").send(data).await.is_err() {
                                 break decoded.await??;
                             }
+                            read_deadline = tokio::time::Instant::now() + self.timeouts.upload_idle;
                         },
                         None => { chunks.take(); }
                     }
@@ -839,7 +851,7 @@ impl Receiver {
         ensure!(!entry.cancel.is_cancelled(), "transfer cancelled");
         let out = validated.commit()?;
         entry.transfer.state = "completed".into();
-        entry.transfer.bytes = bytes;
+        entry.transfer.bytes = *received_progress.borrow();
         entry.transfer.output = Some(out);
         drop(entries);
         tracing::info!(id=%offer.id, bytes, "validated complete archive while receiving");
@@ -1174,6 +1186,35 @@ pub async fn listener(address: SocketAddr, interface: Option<&str>) -> Result<Tc
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offered_progress_total_requires_every_file_size() {
+        for (sizes, expected) in [
+            (vec![Some(12), Some(30)], Some(42)),
+            (vec![Some(0), Some(30)], Some(30)),
+            (vec![Some(12), None], None),
+        ] {
+            let files = sizes
+                .into_iter()
+                .enumerate()
+                .map(|(i, size)| {
+                    let mut fields = plist::Dictionary::new();
+                    fields.insert("FileName".into(), format!("file-{i}").into());
+                    if let Some(size) = size {
+                        fields.insert(
+                            "FileSize".into(),
+                            plist::Value::Integer((size as u64).into()),
+                        );
+                    }
+                    plist::Value::Dictionary(fields)
+                })
+                .collect();
+            let value = dict([
+                ("TransferID".into(), uuid::Uuid::new_v4().to_string().into()),
+                ("Files".into(), plist::Value::Array(files)),
+            ]);
+            assert_eq!(Offer::parse(value).unwrap().1, expected);
+        }
+    }
     #[tokio::test]
     async fn next_accept_selects_oldest_live_offer_without_reusing_consent() {
         let dir = tempfile::tempdir().unwrap();

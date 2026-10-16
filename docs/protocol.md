@@ -50,15 +50,16 @@ session leases through reply and TCP drain. Idle discovery sockets release their
 leases after answering. CLI disconnect cancels only its send; session cancellation,
 stop and signals interrupt all work.
 
-Eligible BLE wakes reset the idle deadline (default 120 seconds), including during
-completion grace. After successful work and the last lease release, the session
-holds the link and advertisements for `--completion-grace` (default five seconds).
-New work can join then; acquisition during shutdown waits for restoration.
-See [Bluetooth wake-up](#bluetooth-wake-up) for wake admission.
+Eligible BLE wakes and the release of the last active operation reset the receive
+session idle deadline (default 120 seconds). Transfers retain their leases through
+TCP drain. Receiving sessions keep the link and advertisements until the idle
+deadline expires; new work can join during that interval. Acquisition during
+shutdown waits for restoration. See [Bluetooth wake-up](#bluetooth-wake-up) for
+wake admission.
 
 Successful file/link connections flush their reply and close a final TCP descriptor
 in a blocking worker with a ten-second linger bound. Refusals and failures skip
-this success-only linger. Completion grace starts after TCP drain.
+this success-only linger.
 
 Teardown stops transport, sends mDNS goodbyes and unregisters BLE advertising.
 The radio drains queued replies, FINs and goodbyes until traffic is quiet for
@@ -153,6 +154,10 @@ The implemented TLVs include:
 | 7 | HT capabilities | Hardware HT flags, A-MPDU parameters and RX MCS mask, emitted in PSFs and MIFs |
 | 17 | IEEE 802.11 container | Hardware VHT Capability IE, emitted in MIFs when supported by the current band |
 | 6, 12 | Compatibility fields | Emitted using the inherited OWL shapes; not fully interpreted |
+
+Data Path State advertises the primary channel's band: the dual-band flag is
+set for 5 GHz and cleared for 2.4 GHz. Its social-channel map selects channel
+6, 44 or 149 when that is the primary channel, and is empty for other AP channels.
 
 Before live operation, nl80211 supplies separate 2.4 and 5 GHz capabilities from
 the selected PHY. Split wiphy dump messages are merged by band. Each MIF uses

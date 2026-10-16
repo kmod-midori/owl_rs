@@ -4,6 +4,8 @@ use super::{Target, View};
 use crate::progress;
 use anyhow::Result;
 use futures_util::StreamExt;
+use std::time::Duration;
+use tokio::time::Instant;
 use zbus::Proxy;
 
 // JobViewV2 is created through the original JobViewServer interface. The
@@ -12,6 +14,38 @@ pub(super) struct Job {
     proxy: Proxy<'static>,
     actions: tokio::task::JoinHandle<()>,
     finished: bool,
+    speed: Speed,
+}
+/// Sample over at least one second so the desktop polling rate does not
+/// amplify the archive decoder's bursty writes.
+#[derive(Default)]
+struct Speed {
+    previous: Option<(Instant, u64)>,
+    bytes_per_second: u64,
+}
+impl Speed {
+    fn update(&mut self, now: Instant, bytes: u64, active: bool) -> u64 {
+        if !active {
+            self.previous = None;
+            self.bytes_per_second = 0;
+            return 0;
+        }
+        match self.previous {
+            Some((then, previous_bytes)) if bytes >= previous_bytes => {
+                let elapsed = now.duration_since(then);
+                if elapsed >= Duration::from_secs(1) {
+                    self.bytes_per_second =
+                        ((bytes - previous_bytes) as f64 / elapsed.as_secs_f64()) as u64;
+                    self.previous = Some((now, bytes));
+                }
+            }
+            _ => {
+                self.previous = Some((now, bytes));
+                self.bytes_per_second = 0;
+            }
+        }
+        self.bytes_per_second
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -57,6 +91,7 @@ impl Job {
             proxy,
             actions,
             finished: false,
+            speed: Speed::default(),
         })
     }
     pub(super) async fn update(&mut self, view: &View) -> Result<()> {
@@ -81,6 +116,12 @@ impl Job {
         self.proxy
             .call_noreply("setProcessedAmount", &(view.bytes, "bytes"))
             .await?;
+        let speed = self.speed.update(
+            Instant::now(),
+            view.bytes,
+            matches!(view.state.as_str(), "sending" | "receiving"),
+        );
+        self.proxy.call_noreply("setSpeed", &(speed,)).await?;
         if let Some(percent) = content.percent {
             self.proxy
                 .call_noreply("setPercent", &(percent as u32,))
@@ -103,5 +144,40 @@ impl Job {
             self.finished = true;
             self.actions.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_uses_elapsed_time_and_clears_on_stalls_and_state_changes() {
+        let start = Instant::now();
+        let mut speed = Speed::default();
+        assert_eq!(speed.update(start, 0, false), 0);
+        assert_eq!(speed.update(start + Duration::from_secs(20), 0, true), 0);
+        assert_eq!(
+            speed.update(start + Duration::from_millis(20_250), 1000, true),
+            0
+        );
+        assert_eq!(
+            speed.update(start + Duration::from_secs(22), 4000, true),
+            2000
+        );
+        assert_eq!(speed.update(start + Duration::from_secs(23), 4000, true), 0);
+        assert_eq!(
+            speed.update(start + Duration::from_secs(24), 8000, true),
+            4000
+        );
+        assert_eq!(
+            speed.update(start + Duration::from_secs(24), 8000, false),
+            0
+        );
+        assert_eq!(speed.update(start + Duration::from_secs(30), 8000, true), 0);
+        assert_eq!(
+            speed.update(start + Duration::from_secs(31), 10_000, true),
+            2000
+        );
     }
 }

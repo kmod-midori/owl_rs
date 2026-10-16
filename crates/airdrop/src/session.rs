@@ -15,8 +15,6 @@ use tokio::time::Instant;
 struct Usage {
     users: usize,
     last_activity: Instant,
-    woken: bool,
-    completed: bool,
     closed: bool,
 }
 pub(crate) struct Activity {
@@ -38,8 +36,6 @@ impl Activity {
             usage: Mutex::new(Usage {
                 users: 0,
                 last_activity: Instant::now(),
-                woken: false,
-                completed: false,
                 closed: false,
             }),
             changed: Notify::new(),
@@ -90,8 +86,6 @@ impl Activity {
     pub fn wake(&self) -> Result<()> {
         let mut usage = self.usage.lock().unwrap();
         ensure!(!usage.closed, "AirDrop session is closing");
-        usage.woken = true;
-        usage.completed = false;
         usage.last_activity = Instant::now();
         self.changed.notify_one();
         Ok(())
@@ -107,9 +101,7 @@ impl Activity {
         loop {
             let (finished, deadline) = {
                 let mut usage = self.usage.lock().unwrap();
-                let delay = if usage.completed {
-                    self.timeouts.completion_grace
-                } else if usage.woken && policy.borrow().mode.enabled() {
+                let delay = if policy.borrow().mode.enabled() {
                     self.timeouts.ble_idle
                 } else {
                     Duration::ZERO
@@ -152,9 +144,6 @@ impl Lease {
         self.activity
             .wait_channel_ready(self.transmitting.unwrap())
             .await
-    }
-    pub fn complete(&self) {
-        self.activity.usage.lock().unwrap().completed = true;
     }
 }
 impl Drop for Lease {
@@ -219,12 +208,11 @@ mod tests {
         assert_eq!(activity.traffic.borrow().transfers, 0);
     }
     #[tokio::test(start_paused = true)]
-    async fn repeated_wakes_refresh_idle_and_completion_grace_without_interrupting_users() {
+    async fn activity_and_wakes_refresh_receive_idle_without_interrupting_users() {
         let policy = Control::new(std::path::PathBuf::new());
         policy.set(Visibility::Everyone, None).await.unwrap();
         let activity = Activity::new(Timeouts {
             ble_idle: Duration::from_secs(10),
-            completion_grace: Duration::from_secs(2),
             ..Default::default()
         });
         activity.wake().unwrap();
@@ -250,11 +238,11 @@ mod tests {
         assert_eq!(traffic.borrow().transfers, 1);
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(!idle.is_finished());
-        lease.complete();
         drop(lease);
         assert_eq!(traffic.borrow().transfers, 0);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        activity.wake().unwrap(); // An eligible wake also refreshes completion grace.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!idle.is_finished());
+        activity.wake().unwrap();
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(!idle.is_finished());
         tokio::time::advance(Duration::from_secs(9)).await;

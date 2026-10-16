@@ -687,6 +687,16 @@ pub fn stamp_action_tx(frame: &mut [u8], now_us: i64) -> Result<(), Error> {
     Ok(())
 }
 
+mod data_path_flags {
+    pub const AWDL_ADDRESS: u16 = 0x0004;
+    pub const DUALBAND: u16 = 0x0020;
+    pub const COUNTRY_CODE: u16 = 0x0100;
+    pub const SOCIAL_CHANNEL_MAP: u16 = 0x0200;
+    pub const AIRPLAY_SOLO: u16 = 0x0400;
+    pub const UMI_SUPPORTED: u16 = 0x0800;
+    pub const EXT_FLAGS: u16 = 0x8000;
+}
+
 pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u8> {
     let mut out = radiotap_tx(Rate::DISCOVERY.into(), false, false).expect("valid discovery rate");
     header(&mut out, a.mac, BROADCAST, sequence, 0xd0);
@@ -763,15 +773,27 @@ pub fn encode_action(a: &Advertisement<'_>, subtype: u8, sequence: u16) -> Vec<u
         arpa.extend_from_slice(&[0xc0, 0x0c]);
         tlv(&mut out, 16, &arpa);
     }
-    let mut path = vec![0x24, 0x8f, b'X', b'0', 0];
-    le16(
-        &mut path,
-        match a.master_channel {
-            6 => 1,
-            44 => 2,
-            _ => 4,
-        },
-    );
+    use data_path_flags as flags;
+    let mut path_flags = flags::AWDL_ADDRESS
+        | flags::COUNTRY_CODE
+        | flags::SOCIAL_CHANNEL_MAP
+        | flags::AIRPLAY_SOLO
+        | flags::UMI_SUPPORTED
+        | flags::EXT_FLAGS;
+    if a.master_channel > 14 {
+        path_flags |= flags::DUALBAND;
+    }
+    let social_channels = match a.master_channel {
+        6 => 1,
+        44 => 2,
+        149 => 4,
+        // Shared mode can use an AP channel outside the AWDL social channels.
+        _ => 0,
+    };
+    let mut path = Vec::new();
+    le16(&mut path, path_flags);
+    path.extend_from_slice(b"X0\0");
+    le16(&mut path, social_channels);
     path.extend_from_slice(&a.mac.0);
     le16(&mut path, 0);
     tlv(&mut out, 12, &path);

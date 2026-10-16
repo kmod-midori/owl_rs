@@ -168,7 +168,12 @@ impl<R: Read> Read for Cancellable<'_, R> {
         self.input.read(bytes)
     }
 }
-fn copy_limited(reader: &mut impl Read, writer: &mut impl Write, left: &mut u64) -> Result<u64> {
+fn copy_limited(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    left: &mut u64,
+    mut progress: impl FnMut(u64),
+) -> Result<u64> {
     let mut copied = 0;
     let mut buf = [0; 65536];
     loop {
@@ -180,6 +185,7 @@ fn copy_limited(reader: &mut impl Read, writer: &mut impl Write, left: &mut u64)
         writer.write_all(&buf[..n])?;
         *left -= n as u64;
         copied += n as u64;
+        progress(n as u64);
     }
     Ok(copied)
 }
@@ -340,7 +346,24 @@ pub(crate) fn receive_with_appledouble(
     limit: u64,
     parse_appledouble: bool,
 ) -> Result<Validated> {
-    extract_cpio(decoder(input, limit)?, output, id, limit, parse_appledouble)
+    receive_with_progress(input, output, id, limit, parse_appledouble, |_| {})
+}
+pub(crate) fn receive_with_progress(
+    input: impl Read,
+    output: &Path,
+    id: &str,
+    limit: u64,
+    parse_appledouble: bool,
+    progress: impl FnMut(u64),
+) -> Result<Validated> {
+    extract_cpio(
+        decoder(input, limit)?,
+        output,
+        id,
+        limit,
+        parse_appledouble,
+        progress,
+    )
 }
 /// Bound untrusted sizes before the archive library allocates its name buffer.
 /// Fixed headers and names remain small; member data is consumed separately.
@@ -391,6 +414,7 @@ fn extract_cpio<R: Read>(
     id: &str,
     limit: u64,
     parse_appledouble: bool,
+    mut progress: impl FnMut(u64),
 ) -> Result<Validated> {
     let target = safe_path(&format!("airdrop-{id}"))?;
     ensure!(target.components().count() == 1, "invalid transfer ID");
@@ -404,6 +428,7 @@ fn extract_cpio<R: Read>(
     let mut left = limit;
     let mut offset = 0u64;
     let mut count = 0;
+    let mut decoded_bytes = 0u64;
     let mut format = None;
     loop {
         let (header, align) = checked_header(&mut input, &mut offset, limit)?;
@@ -447,21 +472,26 @@ fn extract_cpio<R: Read>(
                 .write(true)
                 .create_new(true)
                 .open(&dest)?;
+            let metadata_file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("._"));
             ensure!(
                 copy_limited(
                     &mut (&mut input).take(header.file_size()),
                     &mut file,
-                    &mut left
+                    &mut left,
+                    |bytes| {
+                        if !metadata_file {
+                            decoded_bytes += bytes;
+                            progress(decoded_bytes);
+                        }
+                    }
                 )? == header.file_size(),
                 "truncated CPIO member"
             );
             file.sync_all()?;
-            if parse_appledouble
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("._"))
-            {
+            if parse_appledouble && metadata_file {
                 metadata.push(dest);
             }
         }
@@ -496,4 +526,49 @@ fn thumbnail(path: &Path) -> Option<Vec<u8>> {
         .encode_image(&im)
         .ok()?;
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_progress_counts_file_contents_across_compressed_members() {
+        let mut bytes = Vec::new();
+        let mut cpio = cpio_archive::odc::OdcBuilder::new(&mut bytes);
+        for (name, size) in [("first", 100_000), ("._first", 2048), ("second", 30_000)] {
+            let mut header = cpio.next_header();
+            header.name = name.into();
+            header.mode = 0o100644;
+            header.nlink = 1;
+            header.file_size = size;
+            cpio.append_header_with_data(header, vec![42; size as usize].as_slice())
+                .unwrap();
+        }
+        cpio.finish().unwrap();
+        drop(cpio);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&bytes).unwrap();
+        let compressed = gzip.finish().unwrap();
+        assert!(compressed.len() < 130_000);
+        let directory = tempfile::tempdir().unwrap();
+        let mut updates = Vec::new();
+        let archive = receive_with_progress(
+            compressed.as_slice(),
+            directory.path(),
+            "progress",
+            200_000,
+            false,
+            |bytes| updates.push(bytes),
+        )
+        .unwrap();
+        assert_eq!(updates.last(), Some(&130_000));
+        assert!(updates.len() > 2);
+        assert!(updates.windows(2).all(|pair| pair[0] < pair[1]));
+        let output = archive.commit().unwrap();
+        assert_eq!(
+            std::fs::metadata(output.join("._first")).unwrap().len(),
+            2048
+        );
+    }
 }

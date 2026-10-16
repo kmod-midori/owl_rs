@@ -337,8 +337,6 @@ mod tests {
                 "https://example.com/",
                 "--approval-timeout",
                 "0.5",
-                "--completion-grace",
-                "0",
             ])
             .unwrap();
         let parsed = Cli::from_arg_matches(&matches).unwrap();
@@ -349,7 +347,7 @@ mod tests {
         let changed = overrides(&options, matches.subcommand().unwrap().1).unwrap();
         assert_eq!(
             changed["timeouts"],
-            serde_json::json!({"ble_idle":12.5,"approval":0.5,"completion_grace":0.0})
+            serde_json::json!({"ble_idle":12.5,"approval":0.5})
         );
     }
 }

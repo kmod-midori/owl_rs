@@ -76,8 +76,9 @@ notifications work independently of the tray host. See [Build](../README.md#buil
 for backend selection.
 
 Notifications offer **Accept** and **Decline**. When KDE JobView is available,
-outgoing and accepted incoming transfers use its progress view and **Cancel**
-action. Otherwise, progress and cancellation appear in regular notifications.
+outgoing and accepted incoming transfers use its progress view, transfer speed,
+and **Cancel** action. Receive speed measures decompressed file bytes per second.
+Otherwise, progress and cancellation appear in regular notifications.
 Desktop actions use the same approval state as the CLI: acting in either place
 resolves the offer once.
 Dismissing a notification does not accept, decline or cancel a transfer.
@@ -87,8 +88,9 @@ are unavailable.
 Progress updates in place. If a JobView fails, the transfer falls back to a
 regular notification. Sending counts compressed archive bytes
 passed to HTTP and waits for the receiver's response before reporting completion.
-Receiving shows wire bytes and, when HTTP supplies a length, a percentage. Offered
-file sizes describe decoded data and are not used as a compressed-stream total.
+Receiving shows decompressed file bytes, excluding AppleDouble metadata, and a
+percentage when all offered file sizes are available. Archive headers, padding,
+and generated metadata XML do not contribute to the count.
 Desktops that support the `value` hint can show a progress bar; others show text.
 
 ## Runtime discoverability
@@ -184,13 +186,13 @@ the user daemon serves control commands and scans BLE if receiving is enabled;
 Wi-Fi and HTTPS are inactive. Active sends, browsing and incoming requests hold
 the session alive; idle discovery connections do not.
 
-Eligible BLE wakes reset `--ble-idle-timeout` (default 120 seconds), including
-during completion grace. Everyone accepts valid AirDrop wakes; Contacts requires
-a current known-sender hash-prefix match. Unmatched and Off-mode wakes do not
-activate or extend a session. After successful work and all reply/TCP drains,
-`--completion-grace` holds the link for five seconds by default so new work can
-join. Teardown sends discovery goodbyes, drains the radio, restores WLAN and
-returns the daemon to idle; see [Architecture](architecture.md#networking-and-cleanup).
+Eligible BLE wakes and the release of the last active operation reset
+`--ble-idle-timeout` (default 120 seconds) while receiving is enabled. Everyone
+accepts valid AirDrop wakes; Contacts requires a current known-sender hash-prefix
+match. Unmatched and Off-mode wakes do not activate or extend a session.
+Transfers hold the session through reply/TCP drain. After the idle deadline,
+teardown sends discovery goodbyes, drains the radio, restores WLAN and returns
+the daemon to idle; see [Architecture](architecture.md#networking-and-cleanup).
 
 Send settings inherit the active session or daemon defaults. Conflicting overrides
 require ending the active session first; radio settings belong to `owld`.
@@ -222,13 +224,13 @@ Control commands cannot change deadlines. Effective values, in seconds, appear
 in `status.timeouts` and active `status.awdl.timeouts`. No timeout file is used.
 
 ```sh
-just daemon --ble-idle-timeout 180 --completion-grace 5 \
+just daemon --ble-idle-timeout 180 \
     --approval-timeout 90 --upload-idle-timeout 30 --upload-timeout 1800
 ```
 
 The timeout flags below accept fractional seconds, such as `--ble-idle-timeout 0.5`.
-Values must be positive and at most 86400 seconds; `--completion-grace 0` disables
-only that grace period. The radio quiet period must not exceed its drain timeout.
+Values must be positive and at most 86400 seconds. The radio quiet period must
+not exceed its drain timeout.
 `--timeout` separately sets send discovery (default 60 s) or `peers` waiting
 (default 10 s); `--duration` bounds a daemon or outgoing operation to
 1–86400 whole seconds. These two options take integer seconds. AWDL slot timing and advertised DNS TTLs
@@ -236,7 +238,6 @@ are protocol parameters, rather than application timeout options.
 
 | Flag | Default (s) | Applies to |
 | --- | ---: | --- |
-| `--completion-grace` | 5 | Quiet grace after successful work and TCP drain. |
 | `--retry-cache-timeout` | 0.5 | 802.11 retry duplicate-cache lifetime. |
 | `--capture-read-timeout` | 0.001 | Packet capture read timeout (minimum resolution: one millisecond). |
 | `--peer-idle-timeout` | 5 | AWDL neighbor inactivity deadline. |

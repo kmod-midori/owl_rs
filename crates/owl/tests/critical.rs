@@ -52,6 +52,45 @@ fn mif(mac: Mac, metric: u32, counter: u32, seq: &Sequence) -> Vec<u8> {
     )
 }
 #[test]
+fn data_path_advertises_primary_band_and_social_channel() {
+    let mac = Mac([2, 0, 0, 0, 0, 1]);
+    for (channel, expected_flags, social) in [
+        (6, 0x8f04u16, 1u16),
+        (44, 0x8f24, 2),
+        (149, 0x8f24, 4),
+        (1, 0x8f04, 0),
+        (36, 0x8f24, 0),
+    ] {
+        let mut cfg = config(mac);
+        cfg.channel = channel;
+        cfg.strategy = Strategy::Pin;
+        let mut engine = Engine::new(cfg, 0);
+        for subtype in [0, 3] {
+            let frame = engine.action_frame_on_channel(subtype, 0, channel);
+            let radiotap_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+            let mut tlvs = protocol::Reader::new(&frame[radiotap_len + 24 + 16..]);
+            let mut found = false;
+            while !tlvs.rest().is_empty() {
+                let kind = tlvs.u8().unwrap();
+                let length = tlvs.le16().unwrap() as usize;
+                let value = tlvs.take(length).unwrap();
+                if kind == 12 {
+                    let mut path = protocol::Reader::new(value);
+                    assert_eq!(path.le16().unwrap(), expected_flags);
+                    assert_eq!(path.take(3).unwrap(), b"X0\0");
+                    assert_eq!(path.le16().unwrap(), social);
+                    assert_eq!(path.mac().unwrap(), mac);
+                    assert_eq!(path.le16().unwrap(), 0);
+                    assert!(path.rest().is_empty());
+                    found = true;
+                }
+            }
+            assert!(found, "Data Path State missing on channel {channel}");
+        }
+    }
+}
+
+#[test]
 fn malformed_lengths_never_panic_and_cannot_mutate_peers() {
     let peer = Mac([2, 1, 2, 3, 4, 5]);
     let frame = mif(peer, 518, 367, &Sequence::fixed(6));

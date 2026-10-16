@@ -518,6 +518,15 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
         .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
     assert!(response.to_ascii_lowercase().contains("connection: close"));
+    let completed = receiver
+        .transfers()
+        .await
+        .into_iter()
+        .find(|t| t.offer.id == id)
+        .unwrap();
+    assert_eq!(completed.bytes, payload.len() as u64);
+    assert_eq!(completed.total_bytes, Some(payload.len() as u64));
+
     assert_eq!(
         std::fs::read(
             receiver
@@ -564,7 +573,7 @@ async fn complete_archive_without_http_terminator_is_acknowledged_and_closed() {
             .find(|t| t.offer.id == failed_id)
             .unwrap();
         assert!(progress.bytes > 0 && progress.bytes < data.len() as u64);
-        assert_eq!(progress.total_bytes, Some(data.len() as u64));
+        assert_eq!(progress.total_bytes, Some(payload.len() as u64));
         if failure == "cancel" {
             receiver.cancel(&failed_id).await.unwrap();
             assert!(receiver.decide(&failed_id, true).await.is_err());

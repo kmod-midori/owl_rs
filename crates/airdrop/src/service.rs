@@ -409,7 +409,7 @@ impl Active {
     }
 }
 struct Sending {
-    lease: Lease,
+    _lease: Lease,
     ids: watch::Sender<std::collections::BTreeSet<String>>,
     id: String,
 }
@@ -765,7 +765,7 @@ impl Daemon {
             ids.insert(id.clone());
         });
         let sending = Sending {
-            lease: lease.context("missing send lifetime")?,
+            _lease: lease.context("missing send lifetime")?,
             ids: active.sending.clone(),
             id,
         };
@@ -787,9 +787,6 @@ impl Daemon {
         };
         if let Some(wake) = &mut wake {
             wake.stop().await;
-        }
-        if result.is_ok() {
-            sending.lease.complete();
         }
         drop(sending);
         result
@@ -1502,6 +1499,7 @@ mod tests {
                 .iter()
                 .any(|t| t.state == "completed")
         );
+        assert!(!active.activity.closed());
         daemon.visibility.set(Visibility::Off, None).await.unwrap();
         assert_eq!(daemon.active.lock().await.as_ref().unwrap().id, active.id);
         send_cancel.cancel();
@@ -1514,7 +1512,6 @@ mod tests {
             "cancelled"
         );
         assert!(active.sending.borrow().is_empty());
-        assert!(!active.activity.closed());
         tokio::time::timeout(Duration::from_secs(10), active.stopped())
             .await
             .unwrap()

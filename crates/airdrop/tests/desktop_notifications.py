@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='owl-notifications-') as tmp:
     env['GDK_BACKEND'] = 'x11'
     env['NO_AT_BRIDGE'] = '1'
     log = (tmp / 'daemon.log').open('w+')
-    daemon = subprocess.Popen([str(ROOT / 'target/debug/airdropd'), '--no-radio', '--no-bluetooth', '--listen', f'[::1]:{port}', '--run-dir', str(run), '--keys', str(tmp / 'keys'), '--output', str(output), '--duration', '90', '--approval-timeout', '10', '--completion-grace', '30'], env=env, stdout=log, stderr=log)
+    daemon = subprocess.Popen([str(ROOT / 'target/debug/airdropd'), '--no-radio', '--no-bluetooth', '--listen', f'[::1]:{port}', '--run-dir', str(run), '--keys', str(tmp / 'keys'), '--output', str(output), '--duration', '90', '--approval-timeout', '10'], env=env, stdout=log, stderr=log)
     clients = []
     passed = False
     def control(command):
