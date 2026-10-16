@@ -1,0 +1,18 @@
+[package]
+name = "airdrop-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+owl-ipc.workspace = true
+
+[lints]
+workspace = true

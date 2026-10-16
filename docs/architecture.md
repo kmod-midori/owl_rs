@@ -7,6 +7,7 @@
 | `owl` | `owld` | Privileged WLAN setup, AWDL protocol, scheduling, aggregation and restoration. |
 | `airdrop` | `airdropd` | User-owned HTTPS, UDP mDNS, BLE, contact validation, archives and approvals. |
 | `catdrop` | `catdrop` | User-facing send, discoverable, contact, accept/reject and status commands. |
+| `airdrop-client` | Library | AirDrop control protocol, Unix socket client and shared options. |
 | `owl-ipc` | Library | Bounded link messages, link addressing and deadline data. |
 
 The radio crate does not depend on AirDrop, OpenSSL, archive or Bluetooth code.
@@ -37,9 +38,11 @@ service and must not be writable by other users. Peer credentials authorize IPC;
 the user client verifies the server UID is root.
 
 `airdropd` owns wake policy, identities, contacts, transfer metadata and output
-paths. Eligible BLE wakes and outgoing work share one session. `catdrop` prepares
-archives and sends control requests; it neither loads keys nor runs transport.
-Both daemons must be running to send.
+paths. Eligible BLE wakes and outgoing work share one session. `catdrop` uses
+`airdrop-client` to send commands and absolute file paths over the user control
+socket. The daemon prepares archives and manages contact files. Building
+`catdrop` requires no TLS, Bluetooth, archive or GUI dependencies.
+The user daemon must be running for all commands; sending also needs `owld`.
 
 The first radio request is `Acquire { port }`; the service uses its own CLI radio
 configuration and returns a generation ID, actual MAC, link-local address,

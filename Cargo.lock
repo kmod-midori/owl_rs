@@ -21,6 +21,7 @@ dependencies = [
 name = "airdrop"
 version = "0.1.0"
 dependencies = [
+ "airdrop-client",
  "anyhow",
  "bluer",
  "bytes",
@@ -55,6 +56,19 @@ dependencies = [
  "walkdir",
  "x509-cert",
  "zbus",
+]
+
+[[package]]
+name = "airdrop-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix 0.31.3",
+ "owl-ipc",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -437,7 +451,7 @@ dependencies = [
 name = "catdrop"
 version = "0.1.0"
 dependencies = [
- "airdrop",
+ "airdrop-client",
  "anyhow",
  "clap",
  "serde_json",

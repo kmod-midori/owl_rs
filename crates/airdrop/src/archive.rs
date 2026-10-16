@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded streaming DVZip/CPIO extraction into private destination staging.
+pub use airdrop_client::control::Item;
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
@@ -9,12 +9,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use tempfile::NamedTempFile;
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Item {
-    pub name: String,
-    pub size: u64,
-    pub directory: bool,
-}
 pub struct Prepared {
     pub file: NamedTempFile,
     pub items: Vec<Item>,
@@ -38,6 +32,13 @@ pub fn safe_path(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
+    prepare_cancellable(paths, limit, &tokio_util::sync::CancellationToken::new())
+}
+pub(crate) fn prepare_cancellable(
+    paths: &[PathBuf],
+    limit: u64,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Prepared> {
     ensure!(!paths.is_empty(), "choose at least one file or directory");
     let cpio = NamedTempFile::new()?;
     let mut builder = cpio_archive::odc::OdcBuilder::new(cpio.reopen()?);
@@ -46,6 +47,7 @@ pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
     let mut total = 0u64;
     let mut count = 0;
     for path in paths {
+        ensure!(!cancel.is_cancelled(), "archive preparation cancelled");
         let root = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -65,6 +67,7 @@ pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
             .follow_links(false)
             .sort_by_file_name()
         {
+            ensure!(!cancel.is_cancelled(), "archive preparation cancelled");
             let entry = entry?;
             let meta = entry.path().symlink_metadata()?;
             ensure!(
@@ -101,7 +104,10 @@ pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
                 header.nlink = 1;
                 builder.append_header_with_reader(
                     header,
-                    &mut File::open(entry.path())?.take(meta.len()),
+                    &mut Cancellable {
+                        input: File::open(entry.path())?.take(meta.len()),
+                        cancel,
+                    },
                 )?;
             }
         }
@@ -114,7 +120,10 @@ pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
     builder.finish()?;
     drop(builder);
     let wire = NamedTempFile::new()?;
-    let mut input = cpio.reopen()?;
+    let mut input = Cancellable {
+        input: cpio.reopen()?,
+        cancel,
+    };
     let mut output = wire.reopen()?;
     let mut chunk = [0u8; 65536];
     loop {
@@ -146,6 +155,18 @@ pub fn prepare(paths: &[PathBuf], limit: u64) -> Result<Prepared> {
         items,
         bytes,
     })
+}
+struct Cancellable<'a, R> {
+    input: R,
+    cancel: &'a tokio_util::sync::CancellationToken,
+}
+impl<R: Read> Read for Cancellable<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::other("archive preparation cancelled"));
+        }
+        self.input.read(bytes)
+    }
 }
 fn copy_limited(reader: &mut impl Read, writer: &mut impl Write, left: &mut u64) -> Result<u64> {
     let mut copied = 0;

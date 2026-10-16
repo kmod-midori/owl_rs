@@ -1,29 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Native service lifecycle and authenticated Unix control socket.
 use crate::{
-    archive::{self, Item},
+    archive,
     ble::Wake,
     discovery::Discovery,
     identity::Identity,
     link::Link,
     session::{Activity, Lease},
-    timeouts::Timeouts,
     transfer::{Receiver, Sender, Transfer},
     transport::Transport,
-    visibility::{self, Policy, Visibility},
+    visibility::{self, Policy},
 };
 use anyhow::{Context, Result, bail, ensure};
-use clap::Args;
-use serde::{Deserialize, Serialize};
-use std::{
-    net::SocketAddrV6,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddrV6, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{Mutex, watch},
 };
@@ -31,123 +22,10 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tray")]
 #[path = "notifications.rs"]
 mod notifications;
-#[derive(Clone, Debug, Args, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Options {
-    #[arg(skip)]
-    #[serde(default)]
-    pub timeouts: Timeouts,
-    #[arg(long, default_value = "owl-rs")]
-    pub name: String,
-    #[arg(long)]
-    pub keys: Option<PathBuf>,
-    #[arg(long)]
-    pub output: Option<PathBuf>,
-    #[arg(long, default_value_os_t = default_run_dir())]
-    pub run_dir: PathBuf,
-    /// Privileged radio service socket; owld is configured separately.
-    #[arg(long, default_value = "/run/owld/control.sock")]
-    pub owl_socket: PathBuf,
-    /// Skip Wi-Fi setup for local IPv6 loopback HTTPS testing.
-    #[arg(long)]
-    pub no_radio: bool,
-    /// Loopback listener; with radio setup, only its port is used.
-    #[arg(long, default_value = "[::1]:8771")]
-    pub listen: std::net::SocketAddr,
-    #[arg(long)]
-    pub no_bluetooth: bool,
-    #[arg(long)]
-    pub bluetooth_adapter: Option<String>,
-    /// Accept all offers without prompting (default requires accept/reject commands).
-    #[arg(long)]
-    pub auto_accept: bool,
-    #[arg(long,default_value_t=4*1024*1024*1024)]
-    pub max_bytes: u64,
-    /// Limit the daemon lifetime or one outgoing operation in seconds.
-    #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
-    pub duration: Option<u64>,
-}
-impl Options {
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.name.is_empty() && self.name.len() <= 64,
-            "name must be 1..64 bytes"
-        );
-        ensure!(self.max_bytes > 0, "max-bytes must be positive");
-        ensure!(
-            self.duration.is_none_or(|s| (1..=86400).contains(&s)),
-            "duration must be 1..86400 seconds"
-        );
-        self.timeouts.validate()
-    }
-}
-pub fn default_run_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())))
-        .join("owl_rs")
-}
-pub fn current_user() -> Result<(u32, PathBuf)> {
-    let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("user not found")?;
-    Ok((user.uid.as_raw(), user.dir))
-}
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum Command {
-    Status,
-    Discoverable {
-        mode: Visibility,
-        #[serde(default)]
-        contacts_file: Option<PathBuf>,
-    },
-    Peers {
-        timeout: u64,
-    },
-    Transfers,
-    Accept {
-        id: Option<String>,
-    },
-    Reject {
-        id: String,
-    },
-    Cancel {
-        id: String,
-    },
-    Stop,
-    Send {
-        to: String,
-        direct: Option<SocketAddrV6>,
-        items: Vec<Item>,
-        urls: Vec<String>,
-        bytes: u64,
-        #[serde(default)]
-        icon: Option<Vec<u8>>,
-        timeout: u64,
-        #[serde(default)]
-        options: serde_json::Value,
-    },
-}
-async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Vec<u8>> {
-    let mut line = Vec::new();
-    loop {
-        let buf = reader.fill_buf().await?;
-        ensure!(!buf.is_empty(), "control connection closed before request");
-        let n = buf
-            .iter()
-            .position(|b| *b == b'\n')
-            .map(|n| n + 1)
-            .unwrap_or(buf.len());
-        ensure!(
-            line.len() + n <= 1024 * 1024,
-            "control message exceeds 1 MiB"
-        );
-        line.extend_from_slice(&buf[..n]);
-        reader.consume(n);
-        if line.last() == Some(&b'\n') {
-            return Ok(line);
-        }
-    }
-}
+use airdrop_client::control::read_line;
+pub use airdrop_client::control::{
+    Command, ContactAction, Options, client, current_user, default_run_dir,
+};
 #[derive(Clone)]
 struct State {
     receiver: Receiver,
@@ -302,7 +180,9 @@ impl State {
                 self.receiver.decide(&id, false).await?;
                 Ok(serde_json::json!({"rejected":id}))
             }
-            Command::Cancel { .. }
+            Command::SendPaths { .. }
+            | Command::Contact { .. }
+            | Command::Cancel { .. }
             | Command::Stop
             | Command::Discoverable { .. }
             | Command::Accept { id: None } => {
@@ -344,43 +224,6 @@ impl State {
             }
         }
     }
-}
-/// An orphaned Unix socket survives SIGKILL. The daemon lock still guards
-/// replacement, so a concurrent live daemon cannot be overwritten at startup.
-pub async fn control_available(run_dir: &Path) -> Result<bool> {
-    match UnixStream::connect(run_dir.join("control.sock")).await {
-        Ok(_socket) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error).context("connect to airdropd control socket"),
-    }
-}
-pub async fn client(
-    run_dir: &Path,
-    command: Command,
-    archive: Option<&Path>,
-) -> Result<serde_json::Value> {
-    let mut socket = UnixStream::connect(run_dir.join("control.sock"))
-        .await
-        .context("connect to airdropd (start `just daemon` first)")?;
-    socket.write_all(&serde_json::to_vec(&command)?).await?;
-    socket.write_all(b"\n").await?;
-    if let Some(path) = archive {
-        let mut file = tokio::fs::File::open(path).await?;
-        tokio::io::copy(&mut file, &mut socket).await?;
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&read_line(&mut BufReader::new(socket)).await?)?;
-    if let Some(error) = value.get("error") {
-        bail!("{}", error.as_str().unwrap_or("daemon error"));
-    }
-    Ok(value.get("ok").context("invalid daemon response")?.clone())
 }
 async fn signals(cancel: CancellationToken, duration: Option<u64>) {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -941,6 +784,82 @@ impl Daemon {
         client_cancel: CancellationToken,
     ) -> Result<serde_json::Value> {
         match command {
+            Command::Contact {
+                action,
+                contacts_file,
+            } => {
+                let path =
+                    contacts_file.unwrap_or_else(|| self.visibility.tx.borrow().path.clone());
+                ensure!(path.is_absolute(), "contacts path must be absolute");
+                tokio::task::spawn_blocking(move || {
+                    use crate::contact_book::{self, Book};
+                    match action {
+                        ContactAction::List => {
+                            Ok(serde_json::to_value(contact_book::list(&path)?)?)
+                        }
+                        ContactAction::Add { identifiers } => {
+                            Ok(serde_json::to_value(Book::new(path).add(&identifiers)?)?)
+                        }
+                        ContactAction::Remove { identifiers } => {
+                            Ok(serde_json::to_value(Book::new(path).remove(&identifiers)?)?)
+                        }
+                    }
+                })
+                .await?
+            }
+            Command::SendPaths {
+                to,
+                direct,
+                files,
+                urls,
+                timeout,
+                options,
+            } => {
+                ensure!(!files.is_empty() ^ !urls.is_empty(), "choose files or URLs");
+                ensure!(
+                    files.iter().all(|path| path.is_absolute()),
+                    "send paths must be absolute"
+                );
+                let opts = self.options(&options)?;
+                let prepared = if files.is_empty() {
+                    None
+                } else {
+                    let cancel = client_cancel.child_token();
+                    let _guard = cancel.clone().drop_guard();
+                    let prepare = tokio::task::spawn_blocking(move || {
+                        archive::prepare_cancellable(&files, opts.max_bytes, &cancel)
+                    });
+                    Some(tokio::select! {
+                        _ = client_cancel.cancelled() => bail!("send cancelled"),
+                        result = tokio::time::timeout(opts.timeouts.control_archive, prepare) => result.context("archive preparation timed out")???,
+                    })
+                };
+                let (items, bytes, icon, archive) = match prepared {
+                    Some(prepared) => (
+                        prepared.items,
+                        prepared.bytes,
+                        prepared.icon,
+                        Some(prepared.file),
+                    ),
+                    None => (Vec::new(), 0, None, None),
+                };
+                ensure!(bytes <= opts.max_bytes, "archive exceeds size limit");
+                self.send(
+                    Command::Send {
+                        to,
+                        direct,
+                        items,
+                        urls,
+                        bytes,
+                        icon,
+                        timeout,
+                        options,
+                    },
+                    archive,
+                    client_cancel,
+                )
+                .await
+            }
             Command::Send { .. } => self.send(command, archive, client_cancel).await,
             Command::Peers { .. } => {
                 let active = self
@@ -1215,6 +1134,7 @@ pub async fn run(opts: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{timeouts::Timeouts, visibility::Visibility};
     use clap::Parser;
     use owl_ipc::Mac;
     #[derive(Parser)]

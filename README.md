@@ -30,6 +30,10 @@ just build
 just probe
 ```
 
+The CLI alone builds with `cargo build --release --locked -p catdrop` and needs
+no OpenSSL, D-Bus, libpcap or GTK development libraries. It requires a running
+`airdropd` for commands, including contact management.
+
 Commands run the development build without installing a package. Use
 `just check` for formatting, Clippy and automated tests.
 

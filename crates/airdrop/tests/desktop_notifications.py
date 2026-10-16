@@ -113,6 +113,13 @@ with tempfile.TemporaryDirectory(prefix='owl-notifications-') as tmp:
         return cli('send', 'fixture', '--direct', f'[::1]:{port}', '--url', f'https://example.com/{label}')
     try:
         wait(lambda: (run / 'control.sock').exists())
+        contacts = str(tmp / 'contacts')
+        finish(cli('contact', '--contacts-file', contacts, 'add', 'Test@Example.com'), True)
+        def contact_list():
+            return control({'command': 'contact', 'action': {'action': 'list'}, 'contacts_file': contacts})
+        assert contact_list() == ['test@example.com']
+        finish(cli('contact', '--contacts-file', contacts, 'remove', 'test@example.com'), True)
+        assert contact_list() == []
         # Exercise the default tray over D-Bus without GTK or a display server.
         def tray_name():
             names = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',

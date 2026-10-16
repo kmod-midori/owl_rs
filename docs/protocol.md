@@ -985,6 +985,7 @@ service TLVs, NSEC, BLE presence and neighbor learning all affect visibility.
 | Archive encoding, validation and extraction | [archive.rs](../crates/airdrop/src/archive.rs) |
 | Radio/AWDL link lifecycle | [link.rs](../crates/owl/src/link.rs) |
 | Privileged lease server | [daemon.rs](../crates/owl/src/daemon.rs) |
+| AirDrop control protocol and client | [control.rs](../crates/airdrop-client/src/control.rs) |
 | User link lease client | [link.rs](../crates/airdrop/src/link.rs) |
 | Shared bounded link messages | [owl-ipc](../crates/owl-ipc/src/lib.rs) |
 | UDP mDNS socket and receive metadata | [mdns.rs](../crates/airdrop/src/mdns.rs) |

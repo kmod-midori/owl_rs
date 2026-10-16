@@ -84,7 +84,7 @@ deadlines! {
     rejection_drain, "rejection-drain-timeout", "2", "Refusal response close deadline.";
     tcp_linger, "tcp-linger-timeout", "10", "Successful final TCP acknowledgment drain bound.";
     control_request, "control-request-timeout", "10", "Control socket request header deadline.";
-    control_archive, "control-archive-timeout", "600", "Control socket archive receive deadline.";
+    control_archive, "control-archive-timeout", "600", "Daemon archive preparation and control archive receive deadline.";
     transport_shutdown, "transport-shutdown-timeout", "2", "Transport task shutdown deadline.";
     name_probe, "name-probe-timeout", "8", "Per-peer HTTPS name resolution deadline.";
     netlink, "netlink-timeout", "5", "Kernel netlink request deadline.";
@@ -155,7 +155,7 @@ cli_deadlines! { AirDropTimeouts {
     rejection_drain, "rejection-drain-timeout", "2", positive, "Refusal response close deadline.";
     tcp_linger, "tcp-linger-timeout", "10", positive, "Successful final TCP acknowledgment drain bound.";
     control_request, "control-request-timeout", "10", positive, "Control socket request header deadline.";
-    control_archive, "control-archive-timeout", "600", positive, "Control socket archive receive deadline.";
+    control_archive, "control-archive-timeout", "600", positive, "Daemon archive preparation and control archive receive deadline.";
     transport_shutdown, "transport-shutdown-timeout", "2", positive, "Transport task shutdown deadline.";
     name_probe, "name-probe-timeout", "8", positive, "Per-peer HTTPS name resolution deadline.";
     ble_retry, "ble-retry-interval", "30", positive, "BLE scan/advertisement retry interval.";

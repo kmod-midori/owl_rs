@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/owl-ipc", "crates/owl", "crates/airdrop", "crates/catdrop"]
+members = ["crates/airdrop-client", "crates/owl-ipc", "crates/owl", "crates/airdrop", "crates/catdrop"]
 resolver = "3"
 
 [workspace.package]
@@ -52,7 +52,7 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 owl-ipc = { path = "crates/owl-ipc" }
-airdrop = { path = "crates/airdrop", default-features = false }
+airdrop-client = { path = "crates/airdrop-client" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

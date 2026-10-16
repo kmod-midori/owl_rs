@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #![forbid(unsafe_code)]
-use airdrop::{
-    archive, contact_book,
-    service::{self, Command, Options},
+use airdrop_client::{
+    control::{self, Command, ContactAction as ContactCommand, Options},
     timeouts::{AirDropTimeouts, Timeouts},
     visibility::Visibility,
 };
@@ -24,6 +23,8 @@ struct Cli {
 }
 #[derive(Args)]
 struct ContactArgs {
+    #[arg(long, global = true, default_value_os_t = control::default_run_dir())]
+    run_dir: PathBuf,
     /// Use a different Contacts Only receiving list.
     #[arg(long, global = true)]
     contacts_file: Option<PathBuf>,
@@ -49,43 +50,58 @@ enum ContactAction {
     },
 }
 impl ContactArgs {
-    fn run(self) -> Result<()> {
-        let (_, home) = service::current_user()?;
-        let path = self
-            .contacts_file
-            .unwrap_or_else(|| contact_book::default_path(&home));
-        match self.command {
-            ContactAction::List { json } => {
-                let entries = contact_book::list(&path)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&entries)?);
-                } else {
-                    for entry in entries {
-                        println!("{entry}");
-                    }
+    async fn run(self) -> Result<()> {
+        enum Output {
+            Json,
+            Lines,
+            Count(&'static str),
+        }
+        let (action, output) = match self.command {
+            ContactAction::List { json } => (
+                ContactCommand::List,
+                if json { Output::Json } else { Output::Lines },
+            ),
+            ContactAction::Add { identifiers } => {
+                (ContactCommand::Add { identifiers }, Output::Count("Added"))
+            }
+            ContactAction::Remove { identifiers } => (
+                ContactCommand::Remove { identifiers },
+                Output::Count("Removed"),
+            ),
+        };
+        let result = control::client(
+            &self.run_dir,
+            Command::Contact {
+                action,
+                contacts_file: self.contacts_file.map(std::path::absolute).transpose()?,
+            },
+            None,
+        )
+        .await?;
+        match output {
+            Output::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            Output::Lines => {
+                for entry in serde_json::from_value::<Vec<String>>(result)? {
+                    println!("{entry}");
                 }
             }
-            ContactAction::Add { identifiers } => {
-                let count = contact_book::Book::new(path).add(&identifiers)?;
-                println!("Added {count} contact(s).");
-            }
-            ContactAction::Remove { identifiers } => {
-                let count = contact_book::Book::new(path).remove(&identifiers)?;
-                println!("Removed {count} contact(s).");
-            }
+            Output::Count(verb) => println!(
+                "{verb} {} contact(s).",
+                serde_json::from_value::<usize>(result)?
+            ),
         }
         Ok(())
     }
 }
 #[derive(Subcommand)]
 enum Action {
-    /// Manage the local contact list used for Contacts Only receiving.
+    /// Ask the daemon to manage its Contacts Only receiving list.
     Contact(ContactArgs),
     /// Set runtime receiving visibility and BLE wake-up on the running daemon.
     Discoverable {
         #[arg(value_enum)]
         mode: Visibility,
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
         /// Select the list for contacts mode; otherwise reuse the current list.
         #[arg(long)]
@@ -109,41 +125,41 @@ enum Action {
     },
     /// List observed AirDrop receivers during an active session.
     Peers {
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
         #[arg(long, default_value_t = 10, value_parser=clap::value_parser!(u64).range(1..=86400))]
         timeout: u64,
     },
     /// Show AWDL statistics, active sends, and transfer state.
     Status {
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
     /// List incoming transfers and pending approvals.
     Transfers {
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
     /// Accept a specific offer, or wait for and accept the next pending offer.
     Accept {
         id: Option<String>,
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
     Reject {
         id: String,
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
     /// Cancel a session or individual incoming/outgoing transfer ID shown by status.
     Cancel {
         id: String,
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
     /// Stop the daemon and restore the radio.
     Stop {
-        #[arg(long, default_value_os_t = service::default_run_dir())]
+        #[arg(long, default_value_os_t = control::default_run_dir())]
         run_dir: PathBuf,
     },
 }
@@ -198,40 +214,18 @@ fn main() -> Result<()> {
                         !files.is_empty() || !url.is_empty(),
                         "choose files or --url"
                     );
-                    ensure!(
-                        service::control_available(&options.run_dir).await?,
-                        "airdropd is not running (start `just daemon` first)"
-                    );
-                    let prepared = if files.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            tokio::task::spawn_blocking({
-                                let limit = options.max_bytes;
-                                move || archive::prepare(&files, limit)
-                            })
-                            .await??,
-                        )
-                    };
-                    let command = Command::Send {
+                    let command = Command::SendPaths {
                         to,
                         direct,
-                        items: prepared
-                            .as_ref()
-                            .map(|p| p.items.clone())
-                            .unwrap_or_default(),
+                        files: files
+                            .into_iter()
+                            .map(std::path::absolute)
+                            .collect::<std::io::Result<_>>()?,
                         urls: url,
-                        bytes: prepared.as_ref().map(|p| p.bytes).unwrap_or(0),
-                        icon: prepared.as_ref().and_then(|p| p.icon.clone()),
                         timeout,
                         options: overrides(&options, session_matches.unwrap())?,
                     };
-                    let value = foreground_client(
-                        &options.run_dir,
-                        command,
-                        prepared.as_ref().map(|p| p.file.path()),
-                    )
-                    .await?;
+                    let value = foreground_client(&options.run_dir, command).await?;
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok(());
                 }
@@ -243,13 +237,13 @@ fn main() -> Result<()> {
                 Action::Cancel { id, run_dir } => (run_dir, Command::Cancel { id }),
                 Action::Stop { run_dir } => (run_dir, Command::Stop),
                 Action::Contact(args) => {
-                    return tokio::task::spawn_blocking(move || args.run()).await?;
+                    return args.run().await;
                 }
             };
             let value = if matches!(command, Command::Accept { id: None }) {
-                foreground_client(&dir, command, None).await?
+                foreground_client(&dir, command).await?
             } else {
-                service::client(&dir, command, None).await?
+                control::client(&dir, command, None).await?
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -276,14 +270,10 @@ fn overrides(options: &Options, matches: &clap::ArgMatches) -> Result<serde_json
     Ok(value)
 }
 
-async fn foreground_client(
-    dir: &std::path::Path,
-    command: Command,
-    archive: Option<&std::path::Path>,
-) -> Result<serde_json::Value> {
+async fn foreground_client(dir: &std::path::Path, command: Command) -> Result<serde_json::Value> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     {
-        let request = service::client(dir, command, archive);
+        let request = control::client(dir, command, None);
         tokio::pin!(request);
         tokio::select! {
             result = &mut request => return result,

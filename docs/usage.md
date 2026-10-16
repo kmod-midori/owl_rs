@@ -112,11 +112,13 @@ are treated as one contact; removing an identifier removes every matching line.
 An invalid argument rejects the entire batch before any list change.
 `list --json` prints a JSON array; a missing or empty list prints no entries.
 
-The default file is `~/.config/owl_rs/known-senders`, also used by the receiver.
-Use `contact --contacts-file /path/to/known-senders add|list|remove` for a custom
-list, and select it with
-`discoverable contacts --contacts-file /path/to/known-senders`. The
-default belongs to the current user. Run contact commands without sudo.
+Contact commands use the daemon’s selected receiving list, initially
+`~/.config/owl_rs/known-senders`. Use
+`contact --contacts-file /path/to/known-senders add|list|remove` to edit another
+list, and select it for receiving with
+`discoverable contacts --contacts-file /path/to/known-senders`.
+Contact commands require a running user daemon; use `--run-dir DIR` for a
+custom instance. Run them without sudo.
 These commands do not start the daemon or touch Wi-Fi.
 
 You can also edit the file with one identifier per line. Blank lines and lines
@@ -234,7 +236,7 @@ are protocol parameters, rather than application timeout options.
 | `--rejection-drain-timeout` | 2 | Refusal response close deadline. |
 | `--tcp-linger-timeout` | 10 | Successful final TCP acknowledgment drain bound. |
 | `--control-request-timeout` | 10 | User control request deadline; on owld, link request/heartbeat deadline. |
-| `--control-archive-timeout` | 600 | Control socket archive receive deadline. |
+| `--control-archive-timeout` | 600 | Daemon archive preparation and control archive receive deadline. |
 | `--transport-shutdown-timeout` | 2 | Transport task shutdown deadline. |
 | `--name-probe-timeout` | 8 | Per-peer HTTPS name resolution deadline. |
 | `--netlink-timeout` | 5 | Kernel netlink request deadline. |

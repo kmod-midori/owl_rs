@@ -2,24 +2,10 @@
 //! Runtime receiving policy shared by HTTPS, discovery and BLE.
 use crate::contacts::Contacts;
 use anyhow::{Result, ensure};
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, watch};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Visibility {
-    Everyone,
-    Contacts,
-    #[default]
-    Off,
-}
-impl Visibility {
-    pub fn enabled(self) -> bool {
-        self != Self::Off
-    }
-}
+pub use airdrop_client::visibility::Visibility;
 #[derive(Clone)]
 pub(crate) struct Policy {
     pub mode: Visibility,

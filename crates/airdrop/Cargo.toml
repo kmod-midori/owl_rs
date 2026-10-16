@@ -17,6 +17,7 @@ tray-ksni = ["tray", "tray-icon/ksni"]
 tray-gtk = ["tray", "dep:gtk", "tray-icon/libappindicator"]
 
 [dependencies]
+airdrop-client.workspace = true
 anyhow.workspace = true
 bluer.workspace = true
 bytes.workspace = true
