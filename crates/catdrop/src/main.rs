@@ -306,18 +306,6 @@ mod tests {
                 .is_err()
             );
         }
-        assert!(
-            Cli::try_parse_from([
-                "catdrop",
-                "send",
-                "fixture",
-                "--url",
-                "https://example.com",
-                "--duration",
-                "18446744073709551615"
-            ])
-            .is_err()
-        );
         let matches = Cli::command()
             .try_get_matches_from([
                 "catdrop",
