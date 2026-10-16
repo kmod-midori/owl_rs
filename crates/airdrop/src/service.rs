@@ -83,10 +83,18 @@ impl State {
                 let Ok(_exchange) = self.activity.acquire() else {
                     return (peer, None, fallback);
                 };
-                let name = tokio::time::timeout_at(end, sender.discover(peer.address))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let name = match tokio::time::timeout_at(end, sender.discover(peer.address)).await {
+                    Ok(Ok(name)) => Some(name),
+                    result => {
+                        let error = match result {
+                            Ok(Err(error)) => format!("{error:#}"),
+                            Err(_) => "receiver discovery probe timed out".into(),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        tracing::debug!(id = %peer.id, address = %peer.address, fallback, %error, "AirDrop receiver discovery failed");
+                        None
+                    }
+                };
                 (peer, name, fallback)
             })
             .buffer_unordered(8)
@@ -1004,6 +1012,12 @@ impl Daemon {
                     tokio::pin!(probes);
                     let mut seen = BTreeSet::new();
                     while let Some((peer, name)) = probes.next().await {
+                        if name.is_none() {
+                            if targets.remove(&peer.id).is_some() {
+                                write_peers(&mut writer, &targets).await?;
+                            }
+                            continue;
+                        }
                         seen.insert(peer.id.clone());
                         targets.insert(
                             peer.id.clone(),
@@ -1576,7 +1590,10 @@ mod tests {
         .unwrap();
         assert_eq!(update[0].id, target.id);
         assert_eq!(update[0].name.as_deref(), Some("fixture"));
-        live.discovery.peers.write().await.clear();
+        // An advertised endpoint that stops accepting discovery must disappear
+        // even while its mDNS record remains cached.
+        remote_cancel.cancel();
+        remote_task.await.unwrap().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !airdrop_client::control::peer_update(&mut client)
                 .await
@@ -1599,7 +1616,5 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        remote_cancel.cancel();
-        remote_task.await.unwrap().unwrap();
     }
 }

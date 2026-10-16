@@ -864,8 +864,9 @@ The default is the daemon's selected receiving list.
 
 `watch-peers` accepts session `options`, starts outgoing discovery, and streams
 newline-delimited `{"ok":[{"id":"…","name":"…","address":"…"}]}` snapshots.
-Names may be null. Closing the connection releases its discovery lease; other
-session users continue. Errors use `{"error":"…"}` and end the stream.
+Only targets with successful AirDrop discovery responses are included; failed
+probes are retried on subsequent scans. Closing the connection releases its
+discovery lease; other session users continue. Errors use `{"error":"…"}` and end the stream.
 
 For prebuilt archives, `send` declares `to`, optional scoped `direct`, `items`, `urls`,
 `bytes`, optional thumbnail `icon`, and discovery `timeout`. Exactly `bytes` raw
