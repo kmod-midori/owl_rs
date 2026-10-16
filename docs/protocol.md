@@ -785,8 +785,18 @@ absolute/traversing paths, backslashes, NULs,
 duplicate members, symlinks, special files and hard links. It stages privately
 and atomically renames the completed transfer directory. Archive paths, types and
 sizes are independent of the offer's file list; Apple may wrap offered files in
-`NSIRD_AirDrop_*` directories. AppleDouble `._<filename>` companions are extracted
-as ordinary files, without applying their contents as extended attributes.
+`NSIRD_AirDrop_*` directories. AppleDouble `._<filename>` companions are preserved
+and exported to
+`._<filename>.xml` alongside them. The XML plist contains entry IDs and data,
+Finder information, and named extended attributes. Embedded plists decode to
+typed XML values and printable UTF-8 attributes to strings; undocumented binary
+encodings remain base64 data. Raw entry bytes preserve the original encodings.
+Embedded plist decoding is limited to 64 KiB, 128 objects (or XML tags), and
+256 KiB of parser reads; unsupported or more complex values remain data.
+Attributes are not applied to the destination file. Invalid or oversized
+metadata and existing XML paths are skipped; conversion is limited to 16 MiB
+per sidecar and the remaining receive size budget. `airdropd --no-appledouble`
+disables metadata parsing and XML export.
 
 The default receive limit is 4 GiB. At upload start, the effective budget is the
 smaller of that limit and one eighth of available output-disk bytes, reserving

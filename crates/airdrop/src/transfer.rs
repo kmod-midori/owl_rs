@@ -180,6 +180,7 @@ pub struct Receiver {
     pub output: PathBuf,
     pub limit: u64,
     pub auto_accept: bool,
+    parse_appledouble: bool,
     entries: Arc<Mutex<BTreeMap<String, Entry>>>,
     upload: Arc<Semaphore>,
     activity: Option<Arc<crate::session::Activity>>,
@@ -200,12 +201,17 @@ impl Receiver {
             output,
             limit,
             auto_accept,
+            parse_appledouble: true,
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             upload: Arc::new(Semaphore::new(4)),
             activity: None,
             timeouts: Timeouts::default(),
             policy: watch::channel(Policy::everyone()).1,
         }
+    }
+    pub fn with_appledouble(mut self, enabled: bool) -> Self {
+        self.parse_appledouble = enabled;
+        self
     }
     pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
         self.timeouts = timeouts;
@@ -781,10 +787,11 @@ impl Receiver {
         let id = offer.id.clone();
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
+        let parse_appledouble = self.parse_appledouble;
         let mut decoded = tokio::task::spawn_blocking(move || {
             // A cancelled HTTP task must not free a slot while its decoder runs.
             let _permit = permit;
-            archive::receive(
+            archive::receive_with_appledouble(
                 UploadReader {
                     chunks: reader,
                     cancel,
@@ -793,6 +800,7 @@ impl Receiver {
                 &output,
                 &id,
                 budget,
+                parse_appledouble,
             )
         });
         let mut chunks = Some(chunks);

@@ -26,6 +26,13 @@ Received links are saved as inert `.url` files and never opened automatically.
 Incoming files stream into a private temporary directory inside the destination;
 the completed directory is renamed to `airdrop-TRANSFER_ID`. Failed or cancelled
 uploads discard their temporary files; partial transfers are never published.
+AppleDouble metadata files (`._<filename>`) are kept with an additional
+`._<filename>.xml` plist containing their entries and extended attributes.
+Embedded plists and UTF-8 text become readable XML values; unknown binary
+values use base64 data fields. Original entry bytes are also included.
+Conversion skips malformed or oversized metadata and never overwrites a received
+file. Start `airdropd --no-appledouble` to keep the original sidecars without
+parsing them or generating XML.
 
 To receive, keep both daemons running. In another terminal, enable receiving
 and accept the next incoming offer:

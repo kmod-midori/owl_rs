@@ -11,6 +11,7 @@ compile_error!(
 ))]
 compile_error!("select a tray backend with --features tray-ksni or --features tray-gtk");
 
+mod appledouble;
 pub mod archive;
 pub mod ble;
 pub mod contact_book;

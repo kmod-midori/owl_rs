@@ -290,6 +290,7 @@ async fn session(active: &Active) -> Result<()> {
             opts.name.clone(), identity.clone(), output, opts.max_bytes,
             opts.auto_accept,
         )
+        .with_appledouble(!opts.no_appledouble)
         .with_policy(active.policy.clone())
         .with_activity(active.activity.clone()).with_timeouts(opts.timeouts);
         let sender = Sender {

@@ -51,6 +51,10 @@ pub struct Options {
     pub auto_accept: bool,
     #[arg(long,default_value_t=4*1024*1024*1024)]
     pub max_bytes: u64,
+    /// Keep AppleDouble (._) files without parsing or generating XML companions.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_appledouble: bool,
     /// Limit the daemon lifetime or one outgoing operation in seconds.
     #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
     pub duration: Option<u64>,

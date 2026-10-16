@@ -331,7 +331,16 @@ impl Validated {
 /// Validate incoming DVZip blocks and CPIO structure without waiting for HTTP EOF.
 /// Gzip reception completes after its CRC/footer, rather than transport EOF.
 pub fn receive(input: impl Read, output: &Path, id: &str, limit: u64) -> Result<Validated> {
-    extract_cpio(decoder(input, limit)?, output, id, limit)
+    receive_with_appledouble(input, output, id, limit, true)
+}
+pub(crate) fn receive_with_appledouble(
+    input: impl Read,
+    output: &Path,
+    id: &str,
+    limit: u64,
+    parse_appledouble: bool,
+) -> Result<Validated> {
+    extract_cpio(decoder(input, limit)?, output, id, limit, parse_appledouble)
 }
 /// Bound untrusted sizes before the archive library allocates its name buffer.
 /// Fixed headers and names remain small; member data is consumed separately.
@@ -381,6 +390,7 @@ fn extract_cpio<R: Read>(
     output: &Path,
     id: &str,
     limit: u64,
+    parse_appledouble: bool,
 ) -> Result<Validated> {
     let target = safe_path(&format!("airdrop-{id}"))?;
     ensure!(target.components().count() == 1, "invalid transfer ID");
@@ -390,6 +400,7 @@ fn extract_cpio<R: Read>(
         .prefix(".owl-rs-")
         .tempdir_in(output)?;
     let mut names = HashSet::new();
+    let mut metadata = Vec::new();
     let mut left = limit;
     let mut offset = 0u64;
     let mut count = 0;
@@ -445,10 +456,25 @@ fn extract_cpio<R: Read>(
                 "truncated CPIO member"
             );
             file.sync_all()?;
+            if parse_appledouble
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("._"))
+            {
+                metadata.push(dest);
+            }
         }
         let padding = header.file_size().wrapping_neg() % align;
         input.read_exact(&mut [0; 3][..padding as usize])?;
         offset += header.file_size() + padding;
+    }
+    // Wait for all archive members so generated XML cannot claim a path that
+    // the sender also supplied. Metadata conversion never discards originals.
+    for path in metadata {
+        if let Err(error) = crate::appledouble::export(&path, &mut left) {
+            tracing::warn!(%error, "AppleDouble XML export skipped; original preserved");
+        }
     }
     Ok(Validated { staging, target })
 }
