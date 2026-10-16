@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional KSNI tray and separate D-Bus notification test (no radio or graphical display).
+"""Optional KSNI, notification and JobView integration test (no radio or graphical display).
 
 cargo build --workspace --locked
 dbus-run-session -- python3 crates/airdrop/tests/desktop_notifications.py
@@ -253,12 +253,89 @@ with tempfile.TemporaryDirectory(prefix='owl-notifications-') as tmp:
                 if not cancel:
                     wait(lambda: any(n['summary'] == 'AirDrop received' and 'complete&lt;&amp;&gt;.bin' in n['body'] and n['hints'].get('value') == 100 for n in notices.values()))
                 assert control({'command': 'status'})['session']['id'] == session_id
+        # Publish JobView after the notification-only scenarios to exercise
+        # discovery, approval handoff, progress, cancellation and service failure.
+        jobs = {}
+        job_interface = 'org.kde.JobViewV2'
+        job_xml = '<node><interface name="org.kde.JobViewV2">'
+        for method_name, signature in [
+            ('setInfoMessage', 's'), ('setTotalAmount', 'ts'),
+            ('setProcessedAmount', 'ts'), ('setPercent', 'u'), ('terminate', 's'),
+            ('setDescriptionField', 'uss'),
+        ]:
+            job_xml += f'<method name="{method_name}">'
+            job_xml += ''.join(f'<arg type="{t}" direction="in"/>' for t in signature)
+            if method_name == 'setDescriptionField':
+                job_xml += '<arg type="b" direction="out"/>'
+            job_xml += '</method>'
+        job_xml += '<signal name="cancelRequested"/></interface></node>'
+        job_info = Gio.DBusNodeInfo.new_for_xml(job_xml).interfaces[0]
+        def job_method(_conn, _sender, path, _iface, name, args, invocation):
+            job = jobs[path]
+            if job.get('broken'):
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.UnknownObject', 'Job disappeared')
+                return
+            job[name] = args.unpack()
+            invocation.return_value(GLib.Variant('(b)', (True,)) if name == 'setDescriptionField' else None)
+        def request_job(_conn, _sender, _path, _iface, _name, args, invocation):
+            assert args.unpack() == ('AirDrop', 'folder-download', 1)
+            path = f'/JobViewServer/Job{len(jobs) + 1}'
+            jobs[path] = {'path': path}
+            bus.register_object(path, job_info, job_method, None, None)
+            invocation.return_value(GLib.Variant('(o)', (path,)))
+        server_xml = '<node><interface name="org.kde.JobViewServer"><method name="requestView"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="i" direction="in"/><arg type="o" direction="out"/></method></interface></node>'
+        bus.register_object('/JobViewServer', Gio.DBusNodeInfo.new_for_xml(server_xml).interfaces[0], request_job, None, None)
+        bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'RequestName', GLib.Variant('(su)', ('org.kde.JobViewServer', 0)), None, Gio.DBusCallFlags.NONE, 3000, None)
+        def job_for(label):
+            return next((j for j in jobs.values() if label in j.get('setDescriptionField', ('', '', ''))[2]), None)
+        def cancel_job(job):
+            bus.emit_signal(None, job['path'], job_interface, 'cancelRequested', None)
+            bus.flush_sync(None)
+        client = send('job-out-cancel')
+        wait(lambda: popup('job-out-cancel', 'accept'))
+        job = wait(lambda: job_for('job-out-cancel'))
+        cancel_job(job)
+        finish(client, False)
+        wait(lambda: job.get('terminate'))
+        assert job['terminate'][0]
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            for mode in ['complete', 'cancel', 'fallback']:
+                name = f'job-{mode}.bin'
+                proceed, half = threading.Event(), threading.Event()
+                future = pool.submit(raw_transfer, name, proceed, half, mode != 'complete')
+                incoming = wait(lambda: popup(name, 'accept'))
+                assert job_for(name) is None
+                click(incoming, 'accept')
+                wait(half.is_set)
+                job = wait(lambda: job_for(name))
+                wait(lambda: job.get('setPercent') == (50,))
+                assert job['setProcessedAmount'][0] > 0
+                assert job['setTotalAmount'][0] > job['setProcessedAmount'][0]
+                wait(lambda: incoming['id'] not in notices)
+                assert not popup(name, 'cancel'), 'duplicate progress notification'
+                if mode == 'fallback':
+                    job['broken'] = True
+                    click(wait(lambda: popup(name, 'cancel')), 'cancel')
+                elif mode == 'cancel':
+                    cancel_job(job)
+                proceed.set()
+                wait(future.done)
+                future.result()
+                if mode != 'fallback':
+                    wait(lambda: job.get('terminate'))
+                    assert bool(job['terminate'][0]) == (mode == 'cancel')
+                if mode == 'complete':
+                    assert job['setPercent'] == (100,)
+                    assert not any(name in n['body'] and not n['actions'] for n in notices.values())
+        client = send('job-shutdown')
+        shutdown_job = wait(lambda: job_for('job-shutdown'))
         tray_click('Quit AirDrop')
         wait(lambda: daemon.poll() is not None)
         assert daemon.returncode == 0
+        wait(lambda: shutdown_job.get('terminate'))
         wait(lambda: not notices)
         passed = True
-        print('PASS: KSNI menu/CLI synchronization and Quit, notification approvals, decline, stale action/CLI race, outgoing cancel, CLI cancel, incoming progress/cancel, escaped text, dismissal, completion, shutdown')
+        print('PASS: KSNI menu/CLI synchronization and Quit, notification approvals, decline, stale action/CLI race, outgoing cancel, CLI cancel, incoming progress/cancel, escaped text, dismissal, completion, JobView progress/cancel/fallback, shutdown')
     finally:
         for client in clients:
             if client.poll() is None:

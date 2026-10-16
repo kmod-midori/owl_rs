@@ -20,8 +20,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tray")]
-#[path = "notifications.rs"]
-mod notifications;
+#[path = "desktop/mod.rs"]
+mod desktop;
 use airdrop_client::control::read_line;
 pub use airdrop_client::control::{
     Command, ContactAction, Options, client, current_user, default_run_dir,
@@ -1090,7 +1090,7 @@ pub async fn run(opts: Options) -> Result<()> {
     });
     let signal = tokio::spawn(signals(cancel.clone(), opts.duration));
     #[cfg(feature = "tray")]
-    let notifications = tokio::spawn(notifications::run(daemon.clone()));
+    let desktop = tokio::spawn(desktop::run(daemon.clone()));
     #[cfg(feature = "tray")]
     let _tray = crate::tray::start(
         &opts.name,
@@ -1117,14 +1117,14 @@ pub async fn run(opts: Options) -> Result<()> {
     let _ = signal.await;
     #[cfg(feature = "tray")]
     {
-        // A missing or unresponsive notification server must not delay shutdown.
-        let mut notifications = notifications;
-        if tokio::time::timeout(Duration::from_secs(2), &mut notifications)
+        // A missing or unresponsive desktop service must not delay shutdown.
+        let mut desktop = desktop;
+        if tokio::time::timeout(Duration::from_secs(2), &mut desktop)
             .await
             .is_err()
         {
-            notifications.abort();
-            let _ = notifications.await;
+            desktop.abort();
+            let _ = desktop.await;
         }
     }
     let _ = std::fs::remove_file(&socket_path);

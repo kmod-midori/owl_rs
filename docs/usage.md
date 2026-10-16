@@ -55,14 +55,17 @@ The desktop notification service displays them and delivers action clicks;
 notifications work independently of the tray host. See [Build](../README.md#build)
 for backend selection.
 
-Notifications offer **Accept** and **Decline**, then show transfer progress and
-**Cancel**. These use the same approval state as the CLI: acting in either place
+Notifications offer **Accept** and **Decline**. When KDE JobView is available,
+outgoing and accepted incoming transfers use its progress view and **Cancel**
+action. Otherwise, progress and cancellation appear in regular notifications.
+Desktop actions use the same approval state as the CLI: acting in either place
 resolves the offer once.
 Dismissing a notification does not accept, decline or cancel a transfer.
 `--auto-accept` skips approval, and CLI commands work when desktop notifications
 are unavailable.
 
-Progress notifications update in place. Sending counts compressed archive bytes
+Progress updates in place. If a JobView fails, the transfer falls back to a
+regular notification. Sending counts compressed archive bytes
 passed to HTTP and waits for the receiver's response before reporting completion.
 Receiving shows wire bytes and, when HTTP supplies a length, a percentage. Offered
 file sizes describe decoded data and are not used as a compressed-stream total.

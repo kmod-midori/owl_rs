@@ -68,7 +68,8 @@ just daemon --name 'Example Computer'
 ```
 
 The tray provides receiving-mode controls and Quit. Transfer notifications offer
-accept, decline, cancel and progress through the desktop’s notification service.
+accept and decline through the desktop’s notification service. Transfer progress
+and cancellation use KDE JobView when available, with notifications as a fallback.
 Receiving starts **off**. CLI commands use the same state and work without desktop
 integration; see [Usage](docs/usage.md#transfers). The tray requires a
 StatusNotifierItem host, such as KDE Plasma, Waybar’s `tray` module, or GNOME’s

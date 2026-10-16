@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Tray icon and menu controls via KSNI or GTK on a dedicated worker.
-//! Transfer notifications use a separate D-Bus client in notifications.rs.
+//! Transfer reporting uses separate D-Bus clients in the desktop module.
 use crate::visibility::{Control, Visibility};
 #[cfg(feature = "tray-gtk")]
 use anyhow::Context;

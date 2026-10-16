@@ -26,8 +26,12 @@ flowchart LR
 
 `airdropd` exposes its tray icon and menu through `tray-icon`, using the default
 `tray-ksni` or optional `tray-gtk` backend. Both enable the shared `tray` feature,
-which also enables a separate `zbus` client for `org.freedesktop.Notifications`.
-The tray worker and notification task independently apply actions to daemon state.
+which also enables a separate `zbus` client for `org.freedesktop.Notifications`
+and optional `org.kde.JobViewV2` transfer progress.
+The desktop task feeds incoming and outgoing snapshots to a per-transfer
+`ProgressReporter`, which selects JobView or notification progress and manages
+approval handoff, fallback and cleanup. Each backend owns its display resources
+and actions. The tray and desktop tasks apply actions to the same daemon state.
 
 ## Link ownership
 

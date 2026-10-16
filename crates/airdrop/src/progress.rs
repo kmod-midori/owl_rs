@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Outgoing operation state shared by CLI status and desktop notifications.
+//! Outgoing operation state shared by CLI status and desktop progress reporters.
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
