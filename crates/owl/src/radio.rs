@@ -633,12 +633,15 @@ impl Radio {
         Ok(())
     }
     pub async fn shutdown(&mut self) -> Result<()> {
+        tracing::info!(station = %self.state.station, "tearing down AWDL radio");
         restore(&self.state).await?;
         match std::fs::remove_file(&self.journal) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
         }
+        tracing::info!(station = %self.state.station, "AWDL radio torn down; WLAN restored");
+        Ok(())
     }
 }
 async fn restore(state: &Journal) -> Result<()> {

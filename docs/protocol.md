@@ -811,15 +811,16 @@ This is the user daemon's local control protocol, separate from the owld link
 lease protocol and Apple's wire protocol. A Unix socket at
 `<run-dir>/control.sock` has mode 0600; peer credentials restrict clients to the
 daemon owner or root. A connection sends one newline-terminated JSON command,
-limited to 1 MiB, then receives one newline-terminated result:
+limited to 1 MiB, then receives newline-terminated results (one per request,
+or repeated snapshots for `watch-peers`):
 
 ```json
 {"command":"transfers"}
 {"ok":[{"offer":{"id":"...","sender":"Example Phone","items":[],"urls":[]},"state":"pending","bytes":0,"output":null,"error":null}]}
 ```
 
-Commands are `status`, `peers`, `transfers`, `discoverable`, `accept`, `reject`,
-`cancel`, `stop`, `contact`, `send-paths` and `send`. BLE wake requests activate
+Commands are `status`, `peers`, `watch-peers`, `transfers`, `discoverable`,
+`accept`, `reject`, `cancel`, `stop`, `contact`, `send-paths` and `send`. BLE wake requests activate
 receiving sessions. For example:
 
 ```json
@@ -860,6 +861,11 @@ may hold the link. `cancel SESSION_ID` stops all session work; `stop` ends the d
 prepares file archives. `contact` supplies an `action` object (`list`, `add` or
 `remove`, with `identifiers` for edits) and an optional absolute `contacts_file`.
 The default is the daemon's selected receiving list.
+
+`watch-peers` accepts session `options`, starts outgoing discovery, and streams
+newline-delimited `{"ok":[{"id":"…","name":"…","address":"…"}]}` snapshots.
+Names may be null. Closing the connection releases its discovery lease; other
+session users continue. Errors use `{"error":"…"}` and end the stream.
 
 For prebuilt archives, `send` declares `to`, optional scoped `direct`, `items`, `urls`,
 `bytes`, optional thumbnail `icon`, and discovery `timeout`. Exactly `bytes` raw

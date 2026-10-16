@@ -180,7 +180,8 @@ impl State {
                 self.receiver.decide(&id, false).await?;
                 Ok(serde_json::json!({"rejected":id}))
             }
-            Command::SendPaths { .. }
+            Command::WatchPeers { .. }
+            | Command::SendPaths { .. }
             | Command::Contact { .. }
             | Command::Cancel { .. }
             | Command::Stop
@@ -687,8 +688,9 @@ impl Daemon {
                 *daemon.active.lock().await = None;
                 let error = result.err().map(|error| format!("{error:#}"));
                 if let Some(error) = &error {
-                    tracing::warn!(%error, "AirDrop session stopped");
+                    tracing::warn!(id = %worker.id, %error, "AirDrop session stopped");
                 }
+                tracing::info!(id = %worker.id, failed = error.is_some(), "AirDrop session ended");
                 worker.phase.send_replace(Phase::Stopped(error));
                 worker.cancel.cancel();
             });
@@ -970,6 +972,75 @@ impl Daemon {
             command => self.live().await?.command(command, archive).await,
         }
     }
+    async fn watch_peers(&self, socket: UnixStream, options: serde_json::Value) -> Result<()> {
+        use futures_util::StreamExt;
+        use std::collections::{BTreeMap, BTreeSet};
+        let (mut reader, mut writer) = socket.into_split();
+        let operation = async {
+            let (active, _lease) = self.activate(&options, None, true).await?;
+            let discover = async {
+                let state = active.ready().await?;
+                let _wake = if !active.opts.no_bluetooth && !active.opts.no_radio {
+                    match Wake::start(
+                        active.opts.bluetooth_adapter.as_deref(),
+                        [0; 8],
+                        active.opts.timeouts,
+                    )
+                    .await
+                    {
+                        Ok(wake) => Some(wake),
+                        Err(error) => {
+                            tracing::warn!("BLE wake unavailable: {error:#}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut targets = BTreeMap::new();
+                loop {
+                    let deadline = tokio::time::Instant::now() + state.sender.timeouts.name_probe;
+                    let probes = state.probe_receivers(deadline).await;
+                    tokio::pin!(probes);
+                    let mut seen = BTreeSet::new();
+                    while let Some((peer, name)) = probes.next().await {
+                        seen.insert(peer.id.clone());
+                        targets.insert(
+                            peer.id.clone(),
+                            airdrop_client::control::Target {
+                                id: peer.id,
+                                name,
+                                address: peer.address,
+                            },
+                        );
+                        write_peers(&mut writer, &targets).await?;
+                    }
+                    targets.retain(|id, _| seen.contains(id));
+                    write_peers(&mut writer, &targets).await?;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            };
+            let result: Result<()> = tokio::select! {
+                result = discover => result,
+                _ = active.cancel.cancelled() => bail!("AirDrop session stopped"),
+            };
+            result
+        };
+        let mut byte = [0];
+        let result = tokio::select! {
+            result = operation => result,
+            _ = reader.read(&mut byte) => return Ok(()),
+            _ = self.cancel.cancelled() => return Ok(()),
+        };
+        if let Err(error) = result {
+            let mut message =
+                serde_json::to_vec(&serde_json::json!({"error":format!("{error:#}")}))?;
+            message.push(b'\n');
+            writer.write_all(&message).await?;
+        }
+        Ok(())
+    }
+
     async fn connection(&self, socket: UnixStream, uid: u32) -> Result<()> {
         let peer = socket.peer_cred()?;
         ensure!(
@@ -981,6 +1052,9 @@ impl Daemon {
             &tokio::time::timeout(self.opts.timeouts.control_request, read_line(&mut reader))
                 .await??,
         )?;
+        if let Command::WatchPeers { options } = command {
+            return self.watch_peers(reader.into_inner(), options).await;
+        }
         let archive = if let Command::Send {
             bytes,
             items,
@@ -1044,6 +1118,17 @@ impl Daemon {
         Ok(())
     }
 }
+async fn write_peers(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    targets: &std::collections::BTreeMap<String, airdrop_client::control::Target>,
+) -> Result<()> {
+    let mut message =
+        serde_json::to_vec(&serde_json::json!({"ok": targets.values().collect::<Vec<_>>()}))?;
+    message.push(b'\n');
+    writer.write_all(&message).await?;
+    Ok(())
+}
+
 pub async fn run(opts: Options) -> Result<()> {
     opts.validate()?;
     ensure!(
@@ -1449,6 +1534,68 @@ mod tests {
         assert_ne!(active.id, next.id);
         daemon.visibility.set(Visibility::Off, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), next.stopped())
+            .await
+            .unwrap()
+            .unwrap();
+        // Interactive discovery starts an idle daemon even with receiving off,
+        // streams additions/removals, and releases only its own session lease.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let watch_task = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { daemon.connection(server, current_user().unwrap().0).await }
+        });
+        client
+            .write_all(b"{\"command\":\"watch-peers\"}\n")
+            .await
+            .unwrap();
+        let mut client = BufReader::new(client);
+        let update = tokio::time::timeout(
+            Duration::from_secs(5),
+            airdrop_client::control::peer_update(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(update.is_empty());
+        let browsing = daemon.active.lock().await.clone().unwrap();
+        let live = browsing.ready().await.unwrap();
+        let mut target =
+            crate::discovery::Peer::from_awdl(Mac([2, 0, 0, 0, 0, 2]), 0, Duration::from_secs(30));
+        target.address = remote_address;
+        live.discovery
+            .peers
+            .write()
+            .await
+            .insert(target.id.clone(), target.clone());
+        let update = tokio::time::timeout(
+            Duration::from_secs(5),
+            airdrop_client::control::peer_update(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(update[0].id, target.id);
+        assert_eq!(update[0].name.as_deref(), Some("fixture"));
+        live.discovery.peers.write().await.clear();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !airdrop_client::control::peer_update(&mut client)
+                .await
+                .unwrap()
+                .is_empty()
+            {}
+        })
+        .await
+        .unwrap();
+        let other_user = browsing.activity.acquire().unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), watch_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!browsing.activity.closed());
+        drop(other_user);
+        tokio::time::timeout(Duration::from_secs(5), browsing.stopped())
             .await
             .unwrap()
             .unwrap();

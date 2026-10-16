@@ -79,7 +79,9 @@ Only `owld` runs with sudo. Unlock the iPhone and set AirDrop to
 **Everyone for 10 Minutes**, then send as your regular user:
 
 ```sh
-just send 'Example Phone' /path/to/photo.png
+just send /path/to/photo.png
+# Or select a receiver explicitly:
+just send --to 'Example Phone' /path/to/photo.png
 ```
 
 To receive, keep both daemons running. In another terminal, enable receiving

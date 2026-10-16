@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 cms = "0.2"
 cpio-archive = "0.10"
 crc32fast = "1"
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
 etherparse = "0.19"
 flate2 = "1"
 fs2 = "0.4"

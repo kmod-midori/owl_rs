@@ -106,6 +106,11 @@ pub enum Command {
         #[serde(default)]
         contacts_file: Option<PathBuf>,
     },
+    /// Stream discovered targets while holding an outgoing discovery session.
+    WatchPeers {
+        #[serde(default)]
+        options: serde_json::Value,
+    },
     Peers {
         timeout: u64,
     },
@@ -155,6 +160,41 @@ pub async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Resul
         }
     }
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Target {
+    pub id: String,
+    pub name: Option<String>,
+    pub address: SocketAddrV6,
+}
+
+/// The socket owns the discovery lifetime; closing it releases the session.
+pub async fn watch_peers(
+    run_dir: &Path,
+    options: serde_json::Value,
+) -> Result<BufReader<UnixStream>> {
+    let mut socket = UnixStream::connect(run_dir.join("control.sock"))
+        .await
+        .context("connect to airdropd")?;
+    socket
+        .write_all(&serde_json::to_vec(&Command::WatchPeers { options })?)
+        .await?;
+    socket.write_all(b"\n").await?;
+    Ok(BufReader::new(socket))
+}
+
+pub async fn peer_update(reader: &mut BufReader<UnixStream>) -> Result<Vec<Target>> {
+    let value: serde_json::Value = serde_json::from_slice(&read_line(reader).await?)?;
+    if let Some(error) = value.get("error") {
+        bail!("{}", error.as_str().unwrap_or("daemon error"));
+    }
+    Ok(serde_json::from_value(
+        value
+            .get("ok")
+            .context("invalid discovery response")?
+            .clone(),
+    )?)
+}
+
 pub async fn client(
     run_dir: &Path,
     command: Command,

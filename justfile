@@ -26,7 +26,7 @@ daemon *ARGS: build
 discoverable MODE *ARGS:
     target/release/catdrop discoverable "$@"
 
-send TO *FILES: build
+send *ARGS: build
     target/release/catdrop send "$@"
 
 contact *ARGS: build

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #![forbid(unsafe_code)]
+mod picker;
 use airdrop_client::{
     control::{self, Command, ContactAction as ContactCommand, Options},
     timeouts::{AirDropTimeouts, Timeouts},
@@ -111,8 +112,9 @@ enum Action {
     Send {
         #[command(flatten)]
         options: Box<Options>,
-        /// AirDrop computer name or advertised service ID.
-        to: String,
+        /// AirDrop name or service ID; omit to choose interactively.
+        #[arg(long)]
+        to: Option<String>,
         files: Vec<PathBuf>,
         /// Send a link instead of files (can be repeated).
         #[arg(long, conflicts_with = "files")]
@@ -120,6 +122,7 @@ enum Action {
         /// Bypass mDNS with an IPv6 socket address, including %scope for link-local.
         #[arg(long)]
         direct: Option<SocketAddrV6>,
+        /// Maximum seconds to discover or interactively select a receiver.
         #[arg(long, default_value_t = 60, value_parser=clap::value_parser!(u64).range(1..=86400))]
         timeout: u64,
     },
@@ -206,7 +209,7 @@ fn main() -> Result<()> {
                     to,
                     files,
                     url,
-                    direct,
+                    mut direct,
                     timeout,
                 } => {
                     options.timeouts = cli.timeouts.into();
@@ -214,6 +217,20 @@ fn main() -> Result<()> {
                         !files.is_empty() || !url.is_empty(),
                         "choose files or --url"
                     );
+                    let overrides = overrides(&options, session_matches.unwrap())?;
+                    let mut discovery = None;
+                    let to = match to {
+                        Some(to) => to,
+                        None if direct.is_some() => direct.unwrap().to_string(),
+                        None => {
+                            let (target, session) =
+                                picker::choose(&options.run_dir, overrides.clone(), timeout)
+                                    .await?;
+                            direct = Some(target.address);
+                            discovery = Some(session);
+                            target.name.unwrap_or(target.id)
+                        }
+                    };
                     let command = Command::SendPaths {
                         to,
                         direct,
@@ -223,9 +240,10 @@ fn main() -> Result<()> {
                             .collect::<std::io::Result<_>>()?,
                         urls: url,
                         timeout,
-                        options: overrides(&options, session_matches.unwrap())?,
+                        options: overrides,
                     };
                     let value = foreground_client(&options.run_dir, command).await?;
+                    drop(discovery);
                     println!("{}", serde_json::to_string_pretty(&value)?);
                     return Ok(());
                 }
@@ -297,6 +315,7 @@ mod tests {
                 Cli::try_parse_from([
                     "catdrop",
                     "send",
+                    "--to",
                     "fixture",
                     "--url",
                     "https://example.com",
@@ -312,6 +331,7 @@ mod tests {
                 "--ble-idle-timeout",
                 "12.5",
                 "send",
+                "--to",
                 "fixture",
                 "--url",
                 "https://example.com/",

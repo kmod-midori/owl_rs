@@ -16,10 +16,23 @@ just daemon --name 'Example Computer'
 Keep the phone unlocked with AirDrop set to Everyone for 10 Minutes. To send:
 
 ```sh
-just send 'Example Phone' /path/to/photo.png
-just send 'Example Phone' /path/to/folder /path/to/another-file
-just send 'Example Phone' --url https://example.com
+just send --to 'Example Phone' /path/to/photo.png
+just send --to 'Example Phone' /path/to/folder /path/to/another-file
+just send --to 'Example Phone' --url https://example.com
 ```
+
+Omit `--to` to choose a receiver from a live terminal picker:
+
+```sh
+just send /path/to/photo.png
+just send --url https://example.com
+```
+
+Use arrow keys and Enter to select; Esc, q, or Ctrl+C cancels. The daemon starts
+discovery and updates the list as targets appear or expire. `--timeout` bounds
+the wait for selection (60 seconds by default). Scripts and redirected input
+must specify `--to RECEIVER` or `--direct ADDRESS`. The picker uses the terminal
+on stderr, so stdout can still be redirected for the send result.
 
 Files and recursive folders are supported; symlinks and special files are refused.
 Received links are saved as inert `.url` files and never opened automatically.

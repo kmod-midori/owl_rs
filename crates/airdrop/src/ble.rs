@@ -136,9 +136,34 @@ impl Wake {
             tag,
         })
     }
+    fn stop_advertising(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            tracing::info!(
+                adapter = self.power.adapter.name(),
+                "stopping AirDrop BLE wake-up advertising"
+            );
+            drop(handle);
+        }
+    }
     pub async fn stop(&mut self) {
-        self.handle.take();
+        self.stop_advertising();
         self.power.release().await;
+    }
+}
+impl Drop for Wake {
+    fn drop(&mut self) {
+        self.stop_advertising();
+    }
+}
+
+struct Listening<'a> {
+    adapter: &'a str,
+    state: &'a tokio::sync::watch::Sender<bool>,
+}
+impl Drop for Listening<'_> {
+    fn drop(&mut self) {
+        tracing::info!(adapter = self.adapter, "stopping AirDrop BLE wake scanning");
+        self.state.send_replace(false);
     }
 }
 
@@ -228,7 +253,8 @@ pub(crate) async fn listen(
             let mut watched = HashSet::new();
             let mut changes = SelectAll::new();
             listening.send_replace(true);
-            tracing::info!("listening for AirDrop BLE wake requests");
+            let _listening = Listening { adapter: adapter.name(), state: &listening };
+            tracing::info!(adapter = adapter.name(), "listening for AirDrop BLE wake requests");
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -270,7 +296,6 @@ pub(crate) async fn listen(
             Ok::<_, anyhow::Error>(())
         }.await;
         // Dropping the discovery stream releases bluer's BlueZ discovery token.
-        listening.send_replace(false);
         power.release().await;
         result?;
         if cancel.is_cancelled() {
