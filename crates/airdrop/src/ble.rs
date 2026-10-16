@@ -236,10 +236,20 @@ pub(crate) async fn listen(
                         if !policy.borrow().mode.enabled() { break; }
                     }
                     event = devices.next() => match event.context("BLE discovery stopped")? {
-                        AdapterEvent::DeviceAdded(address) if watched.len() < 512 && watched.insert(address) => {
-                            let device = adapter.device(address)?;
-                            let events = device.events().await?;
-                            changes.push(events.map(move |event| (address, event)).boxed());
+                        AdapterEvent::DeviceAdded(address) if watched.len() < 512 && !watched.contains(&address) => {
+                            // Devices can disappear between discovery and subscription.
+                            // A per-device failure must not release the adapter's scan.
+                            let events = match adapter.device(address) {
+                                Ok(device) => device.events().await,
+                                Err(error) => Err(error),
+                            };
+                            match events {
+                                Ok(events) => {
+                                    watched.insert(address);
+                                    changes.push(events.map(move |event| (address, event)).boxed());
+                                }
+                                Err(error) => tracing::debug!(%address, %error, "BLE device subscription unavailable"),
+                            }
                         }
                         AdapterEvent::DeviceRemoved(address) => { watched.remove(&address); }
                         _ => (),

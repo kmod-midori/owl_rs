@@ -46,10 +46,9 @@ direct loopback HTTPS receivers through the library API.
 
 The lifecycle test uses Cargo's daemon binary path and needs no prior CLI build.
 
-The optional desktop regression checks the KSNI tray menu and a separate fake
-notification server on a private D-Bus session, with real loopback HTTPS transfers.
-It checks tray/CLI synchronization, Quit, notification actions, CLI approval races,
-per-transfer cancellation, progress, dismissal and notification cleanup.
+The optional desktop integration test exercises the KSNI tray menu with mock
+notification and JobView services and loopback HTTPS transfers on a private
+D-Bus session. It covers actions, progress, fallback and cleanup.
 It requires the default `tray-ksni` build, Python PyGObject/Gio and
 `dbus-run-session`, with no display or radio:
 
@@ -147,13 +146,8 @@ and the [source map](protocol.md#source-map) for subsystem implementations.
 Radio/link operations use bounded `wl-nl80211`/`rtnetlink` requests.
 NetworkManager ownership and saved-AP restoration use the system D-Bus API.
 
-Hardware setup checks cover active monitors, 80/40/20 MHz tuning on channels
-149/44, channel 6 at 20 MHz, TAP MTU/IPv6 readiness, neighbors, rollback,
-passive observation, SIGKILL recovery and stale-socket restart. Split-process
-checks cover user TCP/UDP on the leased TAP, mDNS membership/submission, release
-and disconnect cleanup. These restored managed Wi-Fi and preserved Ethernet.
-See [transfer evidence](protocol.md#observed-interoperability-and-remaining-scope)
-for throughput and interoperability limits.
+See [compatibility and limitations](protocol.md#compatibility-and-limitations)
+for validated hardware and implementation scope.
 
 The optional [radio service](../examples/owld.service) runs as root; the
 [AirDrop service](../examples/airdropd.service) runs in the user manager.
@@ -165,9 +159,7 @@ This project ports the patched OWL backend from `omdrop-owl`, based on
 Open Wireless Link / Milan Stute attribution and GPL-3.0-or-later license are
 retained; see [COPYING](../COPYING).
 
-The port includes TX-rate selection, MAC override, fixed radio, metric-first
-election and fixed-channel pinning. Unicast ACK policy follows the driver
-profile; Intel and MT76x2U use NOACK workarounds. It also adapts
+The port also adapts
 [omdrop-owl PR #11](https://github.com/t4t5/omdrop-owl/pull/11) for nonblocking
 injection backpressure, data-refreshed peer liveness and DAD-free TAP setup, and
 [omdrop-plugin PR #41](https://github.com/brentkearney/omdrop-plugin/pull/41)

@@ -58,7 +58,7 @@ See [Bluetooth wake-up](#bluetooth-wake-up) for wake admission.
 
 Successful file/link connections flush their reply and close a final TCP descriptor
 in a blocking worker with a ten-second linger bound. Refusals and failures skip
-this success-only linger. Completion grace starts after TCP drain, not a TAP write.
+this success-only linger. Completion grace starts after TCP drain.
 
 Teardown stops transport, sends mDNS goodbyes and unregisters BLE advertising.
 The radio drains queued replies, FINs and goodbyes until traffic is quiet for
@@ -107,8 +107,7 @@ converts the station to a passive monitor with the same MAC, setting type and
 flags in one netlink request because drivers may reject a separate flags update.
 In exclusive mode, the daemon stays on `--primary-channel 6|44|149` (default 149)
 and advertises that channel in all 16 slots throughout the active session.
-Peer schedules and activity changes do not replace it. Clock synchronization
-still follows the elected sync parent.
+Clock synchronization follows the elected sync parent.
 
 The advertised width reflects successful tuning. Synchronization channel fields
 describe the selected physical channel. Injection pauses during an outstanding
@@ -294,8 +293,7 @@ VHT also uses the peer's operating classes and acknowledged local channel
 width. Static/dynamic SMPS peers are limited to one stream because injection
 does not arrange RTS/CTS wake-up. Unsupported short GI becomes long GI.
 VHT requests bound MCS, streams and width. A transmit-policy ceiling of MCS8
-applies to automatic and explicit requests after MCS9 stalled injected
-uploads. Advertisement and reception use the hardware capability maps. Missing
+applies to automatic and explicit requests. Advertisement and reception use the hardware capability maps. Missing
 capabilities fall back to 12 Mbps. Actions and automatic/VHT multicast discovery
 also use 12 Mbps.
 CLI syntax and overrides are documented in [Radio configuration](radio.md#transmit-rates).
@@ -310,8 +308,8 @@ retuning or capability changes refresh only the radiotap transmission header. Th
 encoder can combine queued packets in A-MSDUs as described below.
 
 Unicast hardware ACK handling is independent of fixed-channel scheduling.
-The driver profile's `tx_noack` workaround defaults to false and is overridden
-with `--tx-ack normal|noack`. Injection also requests NOSEQNO so a matching
+The daemon defaults to `--tx-ack noack`; `--tx-ack auto` uses the driver
+profile's `tx_noack` setting, which defaults to false. Injection also requests NOSEQNO so a matching
 shared station cannot rewrite sequence numbers used for completion correlation.
 The MT76x2U profile uses NOACK to avoid a driver TX-status cleanup stall after
 channel changes; the Intel profile uses NOACK as a firmware workaround.
@@ -340,8 +338,8 @@ FCS presence and radiotap padding are handled explicitly.
 
 ### Block Ack negotiation
 
-By default, `owld` declines IEEE 802.11 ADDBA requests addressed to its MAC by
-validated AWDL peers with status 37. The experimental profile option
+With `rx_ampdu` disabled, `owld` declines IEEE 802.11 ADDBA requests addressed
+to its MAC by validated AWDL peers with status 37. The profile option
 `rx_ampdu = true` enables acceptance on exclusive active-monitor backends with
 `mon_mac = "station"`. It requires hardware/firmware that generates Block Ack
 responses in this mode; userspace does not send these time-critical replies.
@@ -388,8 +386,7 @@ for Linux to process FEC. The later VHT field replaces the temporary HT rate
 while retaining `IEEE80211_TX_CTL_LDPC`. This field is injection metadata and
 is removed before transmission; the requested PHY is VHT.
 The [MT76x2 driver](https://github.com/openwrt/mt76/blob/master/mt76x02_mac.c)
-then sets its hardware LDPC descriptor bit. This path needs on-air validation
-on the installed kernel before enabling it by default.
+then sets its hardware LDPC descriptor bit. The requested coding is not proof of on-air encoding.
 
 The codec leaves VHT's separate LDPC extra-OFDM-symbol field unknown; symbol
 padding is a hardware decision. Cached frames include both rate and coding in
@@ -485,7 +482,7 @@ ambiguous TLVs do not wake Wi-Fi. Duplicate-data events are requested so repeate
 live advertisements can be observed. Identical live payloads are eligible
 to refresh the idle deadline; there is no per-tag deduplication or global wake
 cooldown. A bounded queue coalesces bursts while the daemon reuses one session.
-Addresses and hash hints are never logged.
+Hash hints are never logged.
 
 In Contacts mode, the four two-byte hash slots are compared against prefixes of
 current known-sender SHA-256 hashes before waking or refreshing the timer. Missing, unreadable or invalid
@@ -502,9 +499,7 @@ a second session while busy. The receiver advertises its own wake payload while
 enabled; Off unregisters it. Adapter power is restored when an owned scanner or
 advertiser releases an adapter it had powered on. Scanning and advertising share
 power leases so switching receiving Off cannot power down an outgoing sender.
-BlueZ errors are logged and retried. This path has synthetic/parser and
-loopback lifecycle coverage. Live iPhone testing also verified BLE wake-up,
-automatic exclusive-mode setup and Contacts Only reception.
+BlueZ errors are logged and retried.
 
 ## Service discovery
 
@@ -527,7 +522,7 @@ An active session publishes:
 `137` is `0x89`; bit `0x80` indicates Discover support and bit `0x01` supports
 links in the inherited implementation. The remaining bit is preserved without
 assigning an undocumented meaning. NSEC tells Apple's resolver that an IPv4 A
-record is absent; omitting it delayed or prevented visibility in live testing.
+record is absent.
 Unique records use the mDNS cache-flush bit.
 
 mDNS uses UDP port 5353, multicast IPv6 `ff02::fb`, Ethernet destination
@@ -544,8 +539,7 @@ than packet-relative mDNS compression. The outgoing implementation uses `c0 07`
 for the AirDrop service, `c0 0c` for `.local`, and `c0 00` as the PTR terminator.
 Each type-2 TLV contains little-endian owner-name length, encoded owner, DNS type
 byte, little-endian RDATA length, two reserved bytes and RDATA. SRV priority,
-weight and port are big-endian DNS fields. These records complement mDNS;
-publishing only IPv6 mDNS was insufficient for receiver visibility in testing.
+weight and port are big-endian DNS fields. These records complement IPv6 mDNS.
 
 The radio runtime also sends a scoped unicast ICMPv6 echo to each valid AWDL neighbor
 roughly every three seconds. This stimulates neighbor learning on Apple peers.
@@ -667,13 +661,6 @@ lets the sender finish without waiting for the server's idle-header timeout;
 the shared transport continues on other connections. The completed connection
 holds its session lease through the final reply and TCP drain.
 
-An earlier keep-alive reply left the connection open for 20 seconds after a
-2,041,711-byte JPEG had been committed. The phone showed a finishing delay.
-Closing the completed connection while retaining the empty, untyped reply was
-then tested with an 8,727,870-byte MOV, which the phone reported as Sent. Earlier
-Content-Type and keep-alive changes were tested together; this comparison
-preserves the body and Content-Type behavior while changing connection closure.
-
 A complete archive can end before HTTP's closing zero chunk arrives. Reception
 feeds a blocking archive decoder through a bounded queue, using a 64 KiB DVZip
 input buffer and incremental zlib state. CPIO files stream into destination-local
@@ -690,24 +677,6 @@ stops the worker and removes its temporary directory, even after the HTTP task
 ends; completed transfers are preserved. Hyper retains partial chunk framing
 while decoding, and `--upload-idle-timeout` rejects stalled incomplete uploads.
 See [DVZip and CPIO](#dvzip-and-cpio) for archive limits.
-
-The earlier disk-backed incremental validator was tested with a live 14.76 MiB
-image receive without an HTTP terminator:
-HTTP 200 was ready 89 ms after the final upload TCP packet, and the phone sent
-FIN after 265 ms. The phone reported Sent and the extracted file matched its
-source hash. A preceding quiet-period receive took 4.06 seconds from the final
-upload packet to the phone's FIN; the radio environments were not controlled.
-
-This is the same recovery principle as
-[omdrop-plugin PR #41](https://github.com/brentkearney/omdrop-plugin/pull/41).
-The missing HTTP zero chunk is framing, rather than file data: no missing file
-bytes are invented or accepted. The focused HTTPS regression pauses inside a
-chunk-size line and inside a chunk body, then sends a complete archive without
-the closing zero chunk and requires an empty 200 reply and session teardown.
-
-A saved file alone is not sufficient evidence of protocol success. Verification
-requires the sender to receive its final HTTP success and the phone to finish
-without changing to Failed.
 
 ## Contacts Only receiving
 
@@ -783,10 +752,6 @@ Discovery results are never cached as transfer authorization. Identifiers,
 accounts and their hashes are omitted from contact-policy logs.
 
 The receiver needs no local Apple-issued identity to enforce this policy.
-Contacts Only receiving has synthetic CA/CMS and TLS-metadata regression
-coverage. A live iPhone transfer also verified a BER-encoded Apple-signed record,
-certificate-bound authorization and successful reception of a 1,868,495-byte
-image after BLE wake-up.
 
 ## DVZip and CPIO
 
@@ -806,15 +771,11 @@ CPIO trailer delimit the transfer.
 Apple's compressed blocks may expand to more than the decoder's 64 KiB output
 buffer. Decompression must continue until zlib StreamEnd, verify all compressed
 bytes were consumed, and reject truncated streams or trailing compressed data.
-Using FlushDecompress::Finish with a limited output buffer rejected valid Apple
-blocks; streaming with FlushDecompress::None fixed the captured archive.
 
 Outgoing archives use portable ASCII/ODC CPIO (`070707`). Each member has a
 76-byte ASCII header, a NUL-terminated name, and file data. Names are
-`./<basename>` or `./<folder>/<relative path>`. **Regular file names must not have
-a trailing slash.** A live iPhone reset Rust's upload when the file was encoded
-as `./photo.png/`; correcting that path made the same transfer succeed.
-Directories use mode `040755`, files `100644`, and members end with
+`./<basename>` or `./<folder>/<relative path>`. Regular file names must not have
+a trailing slash. Directories use mode `040755`, files `100644`, and members end with
 `TRAILER!!!`. No symlinks, special files or hard-link entries are sent.
 
 Receiving supports ODC and new ASCII CPIO (`070701`, four-byte alignment).
@@ -848,8 +809,8 @@ limited to 1 MiB, then receives one newline-terminated result:
 ```
 
 Commands are `status`, `peers`, `transfers`, `discoverable`, `accept`, `reject`,
-`cancel`, `stop` and `send`. There is no public receive control request; the
-internal BLE callback starts receiving. For example:
+`cancel`, `stop`, `contact`, `send-paths` and `send`. BLE wake requests activate
+receiving sessions. For example:
 
 ```json
 {"command":"discoverable","mode":"contacts","contacts_file":null}
@@ -884,85 +845,24 @@ Additional sends share the session. Client disconnect or Ctrl+C cancels only tha
 send. Success means transfer completion, not session shutdown: other work or grace
 may hold the link. `cancel SESSION_ID` stops all session work; `stop` ends the daemon.
 
-For `send`, the JSON declares `to`, optional scoped `direct`, `items`, `urls`,
+`catdrop` uses `send-paths`, supplying `to`, optional scoped `direct`, absolute
+`files` paths or `urls`, discovery `timeout`, and optional `options`. The daemon
+prepares file archives. `contact` supplies an `action` object (`list`, `add` or
+`remove`, with `identifiers` for edits) and an optional absolute `contacts_file`.
+The default is the daemon's selected receiving list.
+
+For prebuilt archives, `send` declares `to`, optional scoped `direct`, `items`, `urls`,
 `bytes`, optional thumbnail `icon`, and discovery `timeout`. Exactly `bytes` raw
-archive bytes follow the newline for a file transfer. The client builds the
-archive; airdropd receives its bytes, while owld only handles the link lease.
-`stop` acknowledges before triggering shutdown so the client does not see an
-unexpected EOF; the daemon waits for any active session's restoration before
-exiting.
+archive bytes follow the newline for a file transfer. The daemon receives the archive bytes; owld handles the link lease.
+`stop` acknowledges the request, restores any active radio session and exits.
 
-## Observed interoperability and remaining scope
+## Compatibility and limitations
 
-The split has completed name-based large-image sends and Contacts Only
-receiving through user-owned UDP mDNS and HTTPS with root-owned radio leases.
-A contact BLE wake activated the receiver in 1.19 seconds. A 14.76 MiB image
-upload completed in 46.1 seconds with normal HTTP termination and HTTP 200;
-the phone reported Sent, and the received image matched its source SHA-256.
-Turning visibility off released the radio lease and restored managed Wi-Fi.
-Initial attempts failed during monitor channel setup with `EBUSY`; a retry
-succeeded. That intermittent setup failure is unresolved. The earlier
-receive measurements below predate the process split.
-
-MT7612U/mt76x2u active-monitor tests completed native Rust image transfers in
-both directions, including name-based sending. Large image and approximately
-8 MiB video receives completed with matching offered sizes and valid media.
-The original Python sender/receiver and Rust also interoperated in local HTTPS
-tests for files, folders and links. Focused tests cover malformed frames,
-timing rollover, encapsulation, archive bounds and connection-bound consent.
-The HTTPS regression uses an 8 MiB incompressible synthetic file.
-
-Early channel-6 video uploads took roughly 83–114 seconds from offer to file
-commit. Separating discovery on 6 from transmission on 149 at HT20 reduced
-bulk upload of a 7.44 MiB video to 29.3 seconds, averaging 0.25 MiB/s.
-
-After hardware-derived HT/VHT advertising and wider tuning, a Contacts Only
-receive of a comparable-size video completed with a 12.1-second bulk upload at
-0.61 MiB/s. The receiver was tuned to 149 at 80 MHz; the phone predominantly
-transmitted two-stream VHT at 40 MHz. The complete saved media passed a full
-decode check and the phone reported Sent. This attempt omitted HTTP termination,
-so validated archive completion added approximately two seconds after the final
-large payload. BLE wake to radio readiness was 1.69 seconds, versus 1.09 seconds
-in the earlier HT20 receive; this evidence does not establish faster discovery.
-
-A 14.76 MiB synthetic PNG sent through name-based discovery completed in
-45.9 seconds at 0.32 MiB/s, using the then-default 12 Mbps data injection rate.
-The phone returned HTTP 200 and opened the image correctly. Both latest tests
-reported no transmit queue drops or backpressure, and normal teardown restored
-managed Wi-Fi. These observations are not controlled benchmarks; throughput
-also depends on the radio environment and advertised peer schedule.
-
-Post-split tests sent the same 14.76 MiB synthetic image with discovery on
-channel 6 and the radio tuned to channel 149 at 80 MHz. Payload PHY widths
-are listed separately; each successful image opened correctly on the phone.
-
-| Transmit mode | A-MSDU aggregation | Upload result |
-| --- | --- | --- |
-| Legacy 54 Mbps | Disabled | 41.5 s |
-| HT MCS15, 20 MHz, short GI | Enabled | 25.3 s |
-| VHT MCS7, two streams, 20 MHz, short GI | Enabled | 14.4 s |
-| VHT MCS7, two streams, 80 MHz, short GI | Enabled | 21.5 s |
-| VHT MCS8, two streams, 80 MHz, short GI | Enabled | 24.9 s |
-| VHT MCS9, two streams, 80 MHz, either GI | Enabled | Long stalls; cancelled |
-
-These comparisons preceded the MCS8 transmit ceiling. The phone was
-unlocked during the fixed-rate MCS9 failures. They narrow the problem to
-MCS9 in this setup, but do not distinguish radio margin from a driver or
-firmware issue. Advertised capability alone does not establish a reliable
-injection rate. Automatic rate selection uses correlated TX-completion feedback
-when the driver supplies it; explicit rates do not adapt.
-Captures, device identifiers and test filenames are stored in ignored local directories.
-
-The bounded TCP drain and five-second grace period allowed final success-reply
-and FIN acknowledgments before teardown. Sessions then removed owned
-AWDL/monitor interfaces, restored managed WLAN and unregistered BLE advertising.
-Normal HTTP termination and recovery from missing termination are separately
-verified; incomplete archives are rejected.
-
-Native Rust IBSS/shared-mode AirDrop, Contacts Only sending, Apple identity acquisition, broad OS-version compatibility and all media conversions are not
-validated or implemented by this evidence. A different phone failing to see a
-receiver is not automatically an identity problem: the exclusive schedule,
-service TLVs, NSEC, BLE presence and neighbor learning all affect visibility.
+MT7612U/mt76x2u active-monitor operation has been validated with Apple devices
+for sending and Everyone/Contacts Only receiving. Native IBSS/shared-mode
+AirDrop and broad Apple OS-version compatibility are not validated.
+Contacts Only sending, Apple identity acquisition and general media conversion
+are not implemented.
 
 ## Source map
 

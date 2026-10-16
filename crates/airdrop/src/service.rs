@@ -447,7 +447,7 @@ impl Daemon {
         let scanner = tokio::spawn({
             let adapter = self.opts.bluetooth_adapter.clone();
             let timeouts = self.opts.timeouts;
-            let policy = self.visibility.tx.subscribe();
+            let mut policy = self.visibility.tx.subscribe();
             let cancel = self.cancel.clone();
             async move {
                 loop {
@@ -466,8 +466,14 @@ impl Daemon {
                     if let Err(error) = result {
                         tracing::warn!("BLE wake listener unavailable: {error:#}");
                     }
+                    // Changes already handled by listen must not bypass backoff.
+                    // Off returns to the listener's policy wait immediately.
+                    if !policy.borrow_and_update().mode.enabled() {
+                        continue;
+                    }
                     tokio::select! {
                         _ = cancel.cancelled() => break,
+                        _ = visibility::changed(&mut policy) => (),
                         _ = tokio::time::sleep(timeouts.ble_retry) => (),
                     }
                 }

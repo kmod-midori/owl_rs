@@ -25,15 +25,10 @@ Shared mode preserves AP association, stays on the AP's current channel and
 advertises all 16 slots on that channel with the AP's width. It ignores the
 exclusive-mode primary-channel preference and does not retune the radio.
 
-Exclusive mode waits for NetworkManager to release the station and for same-PHY
-P2P devices and active non-monitor interfaces to disappear or go down before
-converting the station. Transient interface/channel `EBUSY` responses are retried
-every 100 ms up to `--netlink-timeout`, retaining ownership throughout the retries.
-Final failure restores the saved state.
-
 Exclusive mode disconnects Wi-Fi and journals NetworkManager ownership, station
-MAC/up state and any connected AP's UUID for restoration. Setup waits for
-NetworkManager to release the station. With no AP, disconnect/reconnect is skipped.
+MAC/up state and any connected AP's UUID for restoration. It acquires exclusive
+control of the PHY before setup and restores the saved state on failure.
+With no AP, disconnect/reconnect is skipped.
 Each `owld` start generates a random locally administered unicast MAC reused by
 its exclusive sessions. The backend supplies channel context:
 
@@ -92,7 +87,7 @@ See [Radio context and IPv6](protocol.md#radio-context-and-ipv6).
 `--rate auto` starts at the fastest mutually supported VHT or HT20 rate and
 adapts using correlated hardware TX failures/retries. Without completion reports
 it uses capability-based selection. Explicit rates do not adapt.
-VHT TX is capped at **MCS8** after MCS9 stalled test uploads; hardware-supported
+VHT TX is capped at **MCS8**; hardware-supported
 MCS9 reception and advertisements are allowed.
 
 | Override | Selection |
@@ -158,14 +153,6 @@ Custom profiles can enable it for exclusive active-monitor mode with
 installs no driver patches. See
 [Block Ack negotiation](protocol.md#block-ack-negotiation) for limits and counters.
 
-Upstream PRs [#58](https://github.com/t4t5/omdrop-owl/pull/58) and
-[#59](https://github.com/t4t5/omdrop-owl/pull/59) report MT7612U support;
-[#62](https://github.com/t4t5/omdrop-owl/pull/62) reports faster patched-MT7921
-transfers with Block Ack and wide channels combined. Local MT7612U receives
-completed with A-MSDU-in-A-MPDU at 40 MHz.
-Two 80 MHz receive attempts suffered severe retries and rate fallback;
-40 MHz is the default cap. These captures do not identify the driver/RF cause.
-
 ## Election experiments
 
 `--election-metric N` and `--election-counter N` change local election preference
@@ -188,11 +175,9 @@ just recover --run-dir /run/owld-example
 
 Recovery refuses to interrupt a live owner. If auto-selection reports no managed
 Wi-Fi interface after a killed session, recover before starting another session.
-Rapid radio restart can also encounter a kernel tuning rejection; the underlying
-netlink error is reported and saved WLAN state is restored.
 
 The application does not configure firewall or VPN routing. The user daemon
 uses interface-scoped UDP for mDNS and TCP for HTTPS; host routing and filtering
 apply. `owld` generates Ethernet neighbor-learning probes on its owned
-link. See [observed interoperability](protocol.md#observed-interoperability-and-remaining-scope)
+link. See [compatibility and limitations](protocol.md#compatibility-and-limitations)
 for tested hardware and remaining limits.

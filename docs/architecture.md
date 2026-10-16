@@ -66,9 +66,8 @@ cannot satisfy this wait. `--channel-ready-timeout` (15 seconds) and link closur
 bound it. Readiness confirms local tuning; peer slot gating also applies.
 
 Periodic State messages refresh the lease; snapshots do not. Stale generations or
-malformed/oversized messages terminate it. Framing is cancellation-safe, limited
-to 1 MiB. Startup/release deadlines include writes; shutdown cancels connections
-awaiting their first request.
+malformed/oversized messages terminate it. Control messages are limited to 1 MiB;
+startup and release use bounded deadlines.
 
 ## Networking and cleanup
 

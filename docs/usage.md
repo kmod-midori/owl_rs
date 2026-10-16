@@ -96,7 +96,8 @@ are rejected when their policy changes. `off` leaves outgoing sends available.
 outgoing operation IDs. `--no-bluetooth` disables automatic receiving; `--no-radio` also
 disables real BLE scanning for local tests. A Bluetooth adapter supporting LE
 scanning is required for automatic receiving; failed listeners retry with a
-warning. Scanner activation and advertisement withdrawal are asynchronous.
+warning. Scanning runs while receiving is enabled, independently of Wi-Fi
+sessions. Scanner activation and advertisement withdrawal are asynchronous.
 
 ## Contacts Only receiving
 
